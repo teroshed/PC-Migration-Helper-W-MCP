@@ -10,7 +10,7 @@ A Windows desktop app for deciding what to take to a new PC, recording the reaso
   <a href="#get-started">Get started</a> ·
   <a href="#review-and-copy">Review and copy</a> ·
   <a href="docs/MCP.md">MCP setup</a> ·
-  <a href="LICENSE">MIT license</a>
+  <a href="LICENSE">Project license</a>
 </p>
 
 <table>
@@ -102,4 +102,4 @@ npm test
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-The frontend and MCP bridge tests use simulated data. Native tests use isolated temporary folders and exercise Windows file handling, persisted decisions, and guarded copy behavior. The app source is available under the [MIT license](LICENSE).
+The frontend and MCP bridge tests use simulated data. Native tests use isolated temporary folders and exercise Windows file handling, persisted decisions, and guarded copy behavior. The app source is available under the [project license](LICENSE).
