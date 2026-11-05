@@ -1,0 +1,89 @@
+.copy-queue {
+  position: relative;
+  z-index: 5;
+  border: 1px solid #3d5574;
+  border-radius: 8px;
+  background: #152438;
+  margin-bottom: 8px;
+  padding: 7px 9px;
+}
+
+.copy-queue-toolbar,
+.copy-queue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.copy-queue-toolbar { justify-content: space-between; }
+
+.copy-queue-count,
+.copy-queue-actions button,
+.copy-queue-item button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #436184;
+  border-radius: 6px;
+  background: #1d304a;
+  color: #e4efff;
+  padding: 5px 7px;
+  font-size: 12px;
+  min-height: 30px;
+}
+
+.copy-queue-count { color: #cfdeff; background: #253c5b; }
+.copy-queue button:hover:not(:disabled) { background: #344f72; }
+.copy-queue button:disabled { opacity: .6; }
+
+.copy-queue-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  padding: 4px;
+}
+
+.copy-queue-auto input { accent-color: #a9c8ff; }
+.copy-queue-auto:focus-within { outline: 2px solid #a9c8ff; border-radius: 5px; }
+
+.copy-queue-status,
+.copy-queue-problem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  margin: 5px 0 0;
+}
+
+.copy-queue-status span,
+.copy-queue-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-queue-problem { color: #ffd894; }
+
+.copy-queue-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  border: 1px solid #536c91;
+  border-radius: 8px;
+  background: #152033;
+  box-shadow: 0 12px 22px #0008;
+  color: #dee9fa;
+  padding: 10px;
+}
+
+.copy-queue-destination p { margin: 4px 0; font-size: 12px; color: #b7c9e6; }
+.copy-queue-list-frame { position: relative; }
+.copy-queue-list { overflow: auto; max-height: min(37vh, 330px); padding: 4px; }
+.copy-queue-list h3 { font-size: 13px; margin: 8px 0 3px; }
+.copy-queue-list p, .copy-queue-item { font-size: 12px; }
+.copy-queue-item { display: flex; justify-content: space-between; gap: 8px; padding: 4px 1px; align-items: center; }
+.copy-queue-item small { color: #b7c9e6; }
+.status-badge.status-rollup-mixed { color: #c6c8ff; background: #323255; border-color: #696da0; }
+
+@media (max-height: 700px) {
+  .copy-queue { padding: 4px 6px; margin-bottom: 5px; }
+  .copy-queue-toolbar, .copy-queue-actions { gap: 4px 6px; }
+}

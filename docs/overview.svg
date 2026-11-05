@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="302" viewBox="0 0 1000 302" role="img" aria-labelledby="title description">
+  <title id="title">PC Migration Helper W/MCP</title>
+  <desc id="description">A Windows folder review from source inventory through saved decisions to a controlled copy queue.</desc>
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#15243a"/>
+      <stop offset="1" stop-color="#0a1526"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0v24" fill="none" stroke="#afcdf9" stroke-opacity=".08"/>
+    </pattern>
+    <clipPath id="clip"><rect x="1" y="1" width="998" height="300" rx="20"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect width="1000" height="302" fill="url(#panel)"/>
+    <rect x="525" width="475" height="302" fill="url(#grid)"/>
+    <path d="M557 27v248" stroke="#304763"/>
+    <path d="M0 0h1000v3H0" fill="#9bc8f4" opacity=".65"/>
+  </g>
+  <rect x="1" y="1" width="998" height="300" rx="20" fill="none" stroke="#38506e"/>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+    <g transform="translate(45 43)">
+      <rect width="47" height="47" rx="12" fill="#243a56" stroke="#577da7"/>
+      <path d="M11 17h11l4 4h11v13H11zM11 17v-4h13l4 4h9v4" fill="none" stroke="#afd6f8" stroke-width="1.8" stroke-linejoin="round"/>
+      <text x="61" y="29" fill="#abceec" font-size="13" font-weight="650" letter-spacing="2.1">WINDOWS DESKTOP UTILITY</text>
+    </g>
+    <text x="44" y="144" fill="#f1f6ff" font-size="47" font-weight="680" letter-spacing="-1.75">PC Migration Helper</text>
+    <text x="46" y="184" fill="#a8d3f4" font-size="28" font-weight="640" letter-spacing="1">W/MCP</text>
+    <text x="46" y="222" fill="#aebfd5" font-size="16">Review your drives. Keep the decisions.</text>
+    <text x="46" y="246" fill="#aebfd5" font-size="16">Copy the files you choose.</text>
+    <g transform="translate(589 39)">
+      <path d="M32 51v69m0 3v69" fill="none" stroke="#647f9d" stroke-width="1.5" stroke-dasharray="4 5"/>
+      <g>
+        <rect width="371" height="60" rx="10" fill="#17293e" stroke="#435f7d"/>
+        <circle cx="32" cy="30" r="13" fill="#253f5a" stroke="#77a9d8"/>
+        <path d="M27 31h3v-6h3v10h4" fill="none" stroke="#b0d8fa" stroke-width="1.5" stroke-linecap="round"/>
+        <text x="56" y="26" fill="#e6effd" font-size="15" font-weight="650">Source inventory</text>
+        <text x="56" y="44" fill="#a8bcd6" font-size="12">Allocated size · SHA-256 · coverage</text>
+        <text x="339" y="34" fill="#9cb7d6" font-size="11">01</text>
+      </g>
+      <g transform="translate(0 82)">
+        <rect width="371" height="60" rx="10" fill="#1d2941" stroke="#516288"/>
+        <circle cx="32" cy="30" r="13" fill="#34415f" stroke="#9b9fd0"/>
+        <path d="M27 30l3 4 7-8" fill="none" stroke="#d0d1f9" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="56" y="26" fill="#e6effd" font-size="15" font-weight="650">Decision journal</text>
+        <text x="56" y="44" fill="#a8bcd6" font-size="12">Folder previews · notes · local MCP</text>
+        <text x="339" y="34" fill="#b8b5d7" font-size="11">02</text>
+      </g>
+      <g transform="translate(0 164)">
+        <rect width="371" height="60" rx="10" fill="#172d36" stroke="#416a76"/>
+        <circle cx="32" cy="30" r="13" fill="#24454d" stroke="#6baab5"/>
+        <path d="M26 30h11m-4-4 4 4-4 4" fill="none" stroke="#ade1e6" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="56" y="26" fill="#e6effd" font-size="15" font-weight="650">Controlled copy queue</text>
+        <text x="56" y="44" fill="#a8bcd6" font-size="12">Separate destination · recorded outcomes</text>
+        <text x="339" y="34" fill="#a3c7cc" font-size="11">03</text>
+      </g>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,28 @@
+{
+  "name": "migration-master",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "test": "node --experimental-strip-types --test tests/audit.test.ts tests/gateway-client.test.mjs tests/model.test.ts tests/overflow.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@tauri-apps/api": "2.12.4",
+    "lucide-react": "^0.577.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.0",
+    "vite": "8.3.5"
+  },
+  "license": "MIT"
+}

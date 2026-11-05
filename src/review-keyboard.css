@@ -1,0 +1,78 @@
+.review-filter {
+  position: relative;
+  flex: 0 1 167px;
+  min-width: 128px;
+}
+
+.review-filter-trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 36px;
+  text-align: left;
+}
+
+.review-filter-trigger > span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.review-filter-trigger > svg {
+  flex-shrink: 0;
+}
+
+.review-filter-options {
+  position: absolute;
+  inset: calc(100% + 5px) 0 auto auto;
+  z-index: 15;
+  width: max(100%, 180px);
+  max-height: 42vh;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid #60769a;
+  border-radius: 8px;
+  background: #172338;
+  box-shadow: 0 12px 32px #0008;
+}
+
+.review-filter-options > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 34px;
+  gap: 6px;
+  border-color: transparent;
+  text-align: left;
+}
+
+.review-filter-options > button[aria-selected="true"] {
+  background: #274361;
+}
+
+.review-filter-options > button:focus-visible {
+  outline-offset: -2px;
+}
+
+.known-search-button[aria-disabled="true"] {
+  cursor: default;
+  opacity: .65;
+}
+
+@media (max-height: 740px) and (max-width: 1000px) {
+  .browser-tools > .review-filter {
+    order: 3;
+    flex: 0 1 149px;
+    min-width: 116px;
+  }
+
+  .review-filter-trigger {
+    min-height: 32px;
+    padding: 5px 7px;
+    font-size: 11px;
+  }
+}

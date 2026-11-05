@@ -1,0 +1,116 @@
+.overflow-indicators {
+  position: absolute;
+  z-index: 3;
+  display: block;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  contain: layout paint;
+  color: #cee4ff;
+}
+
+.overflow-indicators *,
+.overflow-indicators *::before,
+.overflow-indicators *::after {
+  pointer-events: none;
+}
+
+.overflow-edge {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.overflow-edge > span {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 12px;
+  border: 1px solid #7096c58c;
+  border-radius: 6px;
+  background: #10243bed;
+  color: #d9eaff;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 10px;
+  text-shadow: 0 0 4px #89baff77;
+}
+
+.overflow-edge-top,
+.overflow-edge-bottom {
+  right: 0;
+  left: 0;
+  height: 18px;
+}
+
+.overflow-edge-top {
+  top: 0;
+  align-items: flex-start;
+  border-top: 1px solid #8cb8f28c;
+  background: linear-gradient(to bottom, #76b1ff42, #76b1ff00);
+}
+
+.overflow-edge-bottom {
+  bottom: 0;
+  align-items: flex-end;
+  border-bottom: 1px solid #8cb8f28c;
+  background: linear-gradient(to top, #76b1ff42, #76b1ff00);
+}
+
+.overflow-edge-left,
+.overflow-edge-right {
+  top: 0;
+  bottom: 0;
+  width: 18px;
+}
+
+.overflow-edge-left > span,
+.overflow-edge-right > span {
+  width: 12px;
+  height: 22px;
+  line-height: 20px;
+}
+
+.overflow-edge-left {
+  left: 0;
+  justify-content: flex-start;
+  border-left: 1px solid #8cb8f28c;
+  background: linear-gradient(to right, #76b1ff42, #76b1ff00);
+}
+
+.overflow-edge-right {
+  right: 0;
+  justify-content: flex-end;
+  border-right: 1px solid #8cb8f28c;
+  background: linear-gradient(to left, #76b1ff42, #76b1ff00);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overflow-indicators,
+  .overflow-indicators * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .overflow-indicators {
+    color: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .overflow-edge {
+    border-color: Highlight;
+    background: none;
+  }
+
+  .overflow-edge > span {
+    border-color: Highlight;
+    background: Canvas;
+    color: CanvasText;
+    text-shadow: none;
+  }
+}
