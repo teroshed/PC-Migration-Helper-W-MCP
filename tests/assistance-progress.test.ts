@@ -20,13 +20,11 @@ test('older snapshots do not present a missing queue count as zero', () => {
 });
 
 test('malformed counters and times are not shown as valid progress', () => {
-  const progress = parseInventoryProgress({ processed: -1, active: 2.3, workers: '4', files: NaN,
-    currentBytes: Infinity, startedAt: 'not a date', currentPath: false });
-  assert.equal(progress.processed, 0);
-  assert.equal(progress.active, 0);
-  assert.equal(progress.workers, 0);
-  assert.equal(progress.files, 0);
-  assert.equal(progress.bytes, 0);
+  for (const counters of [{ processed: -1 }, { active: 2.3 }, { workers: '4' }, { files: NaN }, { currentBytes: Infinity }, { pending: -1 }]) {
+    assert.throws(() => parseInventoryProgress(counters), /invalid progress counter/);
+  }
+  assert.throws(() => parseInventoryProgress({ files: Number.MAX_SAFE_INTEGER, currentFiles: 1 }), /integer range/);
+  const progress = parseInventoryProgress({ startedAt: 'not a date', currentPath: false });
   assert.equal(progress.startedAt, null);
   assert.equal(progress.currentPath, null);
 });

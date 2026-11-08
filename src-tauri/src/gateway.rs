@@ -818,7 +818,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
             Ok(details)
         },
         "get_status"=>status_service(state),
-        "get_assisted_review"=>crate::assistance::snapshot(state,&crate::document(state)?),
+        "get_assisted_review"=>crate::assisted_review_service(state),
         "read_review_text"=>read_review_text(state,params),
         "audit_status"=>crate::audit_status_service(state),
         "audit_control"=>crate::audit_control_service(state,&text(params,"action",None)?,&text(params,"scope",Some("all"))?,params.get("path").and_then(Value::as_str)),
@@ -854,7 +854,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
                 "decision":current_decision,"operationReceipt":receipt.map(|receipt|{let mut cut=false;let mut budget=32;project_metadata(receipt,3,&mut budget,&mut cut)}),"decisionCount":doc["decisions"].as_object().map_or(0,|m|m.len()),
                 "suggestionCount":doc["suggestions"].as_array().map_or(0,|a|a.len()),"truncation":{"projection":true,"notesLimitBytes":16*1024,"storedOriginalPreserved":true}}))
         },
-        _=>Err("Unknown local RPC method. Recovery and filesystem execution are not available through MCP.".into()),
+        _=>Err("Unknown local RPC method. Read the advertised API capabilities for supported operations.".into()),
     }
 }
 

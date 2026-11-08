@@ -47,6 +47,18 @@ export interface Document {
   view: ViewState;
   [key: string]: unknown;
 }
+interface RollupCoverage {
+  complete: boolean;
+  leafCount: number;
+  emptyFolderCount: number;
+  undecidedCount: number;
+  unknownBranches: number;
+  coverageGaps: number;
+  statusCounts: Partial<Record<Status, number>>;
+  problem: string | null;
+}
+type Rollup = { childCount: number; coverage?: RollupCoverage } &
+  ({ kind: 'unanimous'; status: Status } | { kind: 'mixed' } | { kind: 'unknown' });
 export interface Effective {
   status: Status;
   own: boolean;
@@ -54,7 +66,7 @@ export interface Effective {
   stale: boolean;
   mixed: number;
   originalStatus: string | null;
-  rollup?: { kind: 'unanimous'; status: Status; childCount: number } | { kind: 'mixed'; childCount: number };
+  rollup?: Rollup;
 }
 export interface Entry {
   path: string;
@@ -157,20 +169,38 @@ export function closePreviewBranch(columns: readonly PreviewColumn[], depth: num
   if (!Number.isSafeInteger(depth) || depth < 1 || depth > columns.length) throw new Error('Invalid preview depth.');
   return columns.slice(0, depth - 1);
 }
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+function parseRollup(value: unknown): Rollup | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return;
+  const summary = record(value);
+  const { kind, childCount, status, coverageComplete, leafCount, emptyFolderCount, undecidedCount, unknownBranches, coverageGaps } = summary;
+  if (!isCount(childCount)) return;
+  let coverage: RollupCoverage | undefined;
+  if (typeof coverageComplete === 'boolean' && isCount(leafCount) && isCount(emptyFolderCount) &&
+      isCount(undecidedCount) && isCount(unknownBranches) && isCount(coverageGaps)) {
+    const statusCounts: RollupCoverage['statusCounts'] = {};
+    const rawCounts = summary.statusCounts;
+    const entries = typeof rawCounts === 'object' && rawCounts !== null && !Array.isArray(rawCounts)
+      ? Object.entries(record(rawCounts)) : [];
+    for (const [mark, count] of entries) {
+      if (isStatus(mark) && isCount(count) && count > 0) statusCounts[mark] = count;
+    }
+    coverage = { complete: coverageComplete && unknownBranches === 0 && coverageGaps === 0,
+      leafCount, emptyFolderCount, undecidedCount, unknownBranches,
+      coverageGaps, statusCounts, problem: typeof summary.problem === 'string' ? summary.problem : null };
+  }
+  const counts = { childCount, ...(coverage ? { coverage } : {}) };
+  if (kind === 'unknown') return { kind, ...counts };
+  if (childCount === 0) return;
+  if (kind === 'mixed') return { kind, ...counts };
+  if (kind === 'unanimous' && isStatus(status)) return { kind, status, ...counts };
+}
 export function parseEffective(value: unknown): Effective {
   const v = record(value);
   if (!isStatus(v.status) || typeof v.own !== 'boolean' || typeof v.stale !== 'boolean' || typeof v.mixed !== 'number') throw new Error('Invalid native classification response.');
-  let rollup: Effective['rollup'];
-  if (v.rollup) {
-    const summary = record(v.rollup);
-    const childCount = summary.childCount;
-    if (typeof childCount === 'number' && Number.isSafeInteger(childCount) && childCount > 0) {
-      if (summary.kind === 'mixed') rollup = { kind: 'mixed', childCount };
-      if (summary.kind === 'unanimous' && isStatus(summary.status)) {
-        rollup = { kind: 'unanimous', status: summary.status, childCount };
-      }
-    }
-  }
+  const rollup = parseRollup(v.rollup);
   return { status: v.status, own: v.own, stale: v.stale, mixed: v.mixed, inheritedFrom: typeof v.inheritedFrom === 'string' ? v.inheritedFrom : null, originalStatus: typeof v.originalStatus === 'string' ? v.originalStatus : null, rollup };
 }
 export function parseListing(value: unknown): Listing {

@@ -21,6 +21,7 @@ pub struct Index {
     pub running: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
     refresh_locks: Arc<[Mutex<()>; 64]>,
+    worker_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 impl Index {
     pub fn open(path: PathBuf) -> Result<Self, String> {
@@ -30,6 +31,7 @@ impl Index {
             running: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             refresh_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            worker_handle: Arc::new(Mutex::new(None)),
         };
         let db = s.connect()?;
         db.execute_batch("PRAGMA journal_mode=WAL;
@@ -39,6 +41,11 @@ impl Index {
             CREATE TABLE IF NOT EXISTS listing_entries(parent TEXT COLLATE NOCASE,generation TEXT,path TEXT COLLATE NOCASE,name TEXT,kind TEXT,size INTEGER,modified TEXT,fingerprint TEXT,problem TEXT,PRIMARY KEY(parent,generation,path));
             CREATE INDEX IF NOT EXISTS listing_order ON listing_entries(parent,generation,kind,name COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS listing_heads(parent TEXT PRIMARY KEY COLLATE NOCASE,generation TEXT,observed_at TEXT);
+            CREATE TABLE IF NOT EXISTS observation_members(parent TEXT,generation TEXT,name TEXT COLLATE BINARY,folded_name TEXT,kind TEXT,fingerprint TEXT,problem TEXT,PRIMARY KEY(parent,generation,name));
+            CREATE INDEX IF NOT EXISTS observation_lookup ON observation_members(parent,generation,folded_name);
+            CREATE TABLE IF NOT EXISTS observation_heads(parent TEXT PRIMARY KEY,source_path TEXT,generation TEXT,fingerprint TEXT,identity TEXT,observed_at TEXT,problem TEXT);
+            CREATE TABLE IF NOT EXISTS observation_versions(parent TEXT PRIMARY KEY,sequence INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS derived_status_summaries(path TEXT PRIMARY KEY,epoch TEXT NOT NULL,counts TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS queue(path TEXT PRIMARY KEY COLLATE NOCASE,state TEXT);
             CREATE TABLE IF NOT EXISTS scan_progress(path TEXT PRIMARY KEY COLLATE NOCASE,files INTEGER NOT NULL,bytes INTEGER NOT NULL);
             DELETE FROM scan_progress;
@@ -47,6 +54,7 @@ impl Index {
             CREATE INDEX IF NOT EXISTS queue_order ON queue(state,length(path),path);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
             INSERT OR IGNORE INTO meta VALUES('scan','{}');
+            INSERT OR IGNORE INTO meta VALUES('observationSequence','0');
             UPDATE meta SET value=json_set(value,'$.status','paused') WHERE key='scan' AND json_extract(value,'$.status')='running';").map_err(error)?;
         Ok(s)
     }
@@ -55,6 +63,52 @@ impl Index {
         c.busy_timeout(std::time::Duration::from_secs(15))
             .map_err(error)?;
         Ok(c)
+    }
+    pub fn join_stopped(&self) -> Result<(), String> {
+        let mut worker = self.worker_handle.lock().map_err(error)?;
+        if self.running.load(Ordering::SeqCst) {
+            return Err("Inventory is still stopping".into());
+        }
+        if let Some(handle) = worker.take() {
+            handle
+                .join()
+                .map_err(|_| "Inventory coordinator panicked during shutdown".to_owned())?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn checkpoint(&self) -> Result<(), String> {
+        self.checkpoint_with_timeout(std::time::Duration::from_secs(15))
+    }
+    pub fn checkpoint_with_timeout(&self, timeout: std::time::Duration) -> Result<(), String> {
+        if self.running.load(Ordering::SeqCst) {
+            return Err("Inventory must stop before checkpointing".into());
+        }
+        let db = self.connect()?;
+        db.busy_timeout(timeout).map_err(error)?;
+        db.execute_batch("PRAGMA synchronous=FULL;")
+            .map_err(error)?;
+        let (busy, log, saved): (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(FULL)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(error)?;
+        if busy != 0 || log != saved {
+            return Err(
+                "Inventory checkpoint is waiting for another database reader; the app remains open"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn has_observations(&self) -> Result<bool, String> {
+        self.connect()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM directories WHERE observed_at IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(error)
     }
     pub fn scan_status(&self) -> Result<Value, String> {
         let mut db = self.connect()?;
@@ -118,11 +172,21 @@ impl Index {
         self.connect()?.query_row("SELECT observed_at,files,folders,bytes,problem,signature,(SELECT observed_at FROM listing_heads WHERE parent=?1) FROM directories WHERE path=?1",[path],|r|Ok(json!({"observedAt":r.get::<_,Option<String>>(0)?,"files":optional_count(r,1)?,"folders":optional_count(r,2)?,"bytes":optional_count(r,3)?,"problem":r.get::<_,Option<String>>(4)?,"signature":r.get::<_,Option<String>>(5)?,"listingObservedAt":r.get::<_,Option<String>>(6)?}))).optional().map_err(error)
     }
     pub fn record_gap(&self, path: &str, problem: &str) -> Result<(), String> {
-        self.connect()?.execute("INSERT INTO directories(path,problem,observed_at,changed_at) VALUES(?1,?2,?3,?3) ON CONFLICT(path) DO UPDATE SET problem=?2,observed_at=?3,changed_at=CASE WHEN coalesce(problem,'')<>?2 THEN ?3 ELSE changed_at END",params![path,problem,now()]).map_err(error)?;
+        let mut db = self.connect()?;
+        let tx = db.transaction().map_err(error)?;
+        tx.execute("INSERT INTO directories(path,problem,observed_at,changed_at) VALUES(?1,?2,?3,?3) ON CONFLICT(path) DO UPDATE SET problem=?2,observed_at=?3,changed_at=CASE WHEN coalesce(problem,'')<>?2 THEN ?3 ELSE changed_at END",params![path,problem,now()]).map_err(error)?;
+        tx.execute(
+            "UPDATE observation_heads SET problem=?2 WHERE parent=?1",
+            params![path.to_lowercase(), problem],
+        )
+        .map_err(error)?;
+        touch_observations(&tx, path)?;
+        tx.commit().map_err(error)?;
         Ok(())
     }
     // Only immediate children are enumerated. A staged generation becomes visible atomically.
-    // Background inventory persists directory summaries, never every file entry.
+    // Browser payloads and lightweight metadata membership are separate. Membership
+    // supports derived status counts, never frozen backup or copying authority.
     pub fn refresh(
         &self,
         path: &str,
@@ -142,6 +206,9 @@ impl Index {
             if e != "Paused" {
                 self.record_gap(path, e)?;
             }
+            // Unpublished generations are never visible, even when cleanup
+            // itself is interrupted; a later complete refresh can reclaim them.
+            self.clean_observation_generations(&self.connect()?, path)?;
         }
         result
     }
@@ -152,7 +219,24 @@ impl Index {
         cancel: Option<&AtomicBool>,
         cache_files: bool,
     ) -> Result<(), String> {
+        self.refresh_observing(path, volumes, cancel, cache_files, || {})
+    }
+
+    fn refresh_observing(
+        &self,
+        path: &str,
+        volumes: &[Volume],
+        cancel: Option<&AtomicBool>,
+        cache_files: bool,
+        before_publication: impl FnOnce(),
+    ) -> Result<(), String> {
         let (p, _path_guards) = filesystem::guard_path(path, volumes, false)?;
+        let before = filesystem::inspect(&p);
+        let identity = crate::audit::handle_identity(
+            _path_guards
+                .last()
+                .ok_or("Missing observed directory handle")?,
+        )?;
         let listing = fs::read_dir(&p).map_err(error)?;
         let generation = format!(
             "{}-{}",
@@ -216,8 +300,17 @@ impl Index {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err("Paused".into());
         }
+        before_publication();
+        let (current, guards) = filesystem::guard_path(path, volumes, false)?;
+        if filesystem::inspect(&current).fingerprint != before.fingerprint
+            || crate::audit::handle_identity(
+                guards.last().ok_or("Missing current directory handle")?,
+            )? != identity
+        {
+            return Err("Directory changed during enumeration; the previous observation was retained and a fresh enumeration is required".into());
+        }
         let signature = hash(format!("{:?}|{files}|{folders}|{bytes}|{errors}", hashes).as_bytes());
-        let problem = if errors == 0 {
+        let mut problem = if errors == 0 {
             None
         } else {
             Some(format!(
@@ -239,6 +332,13 @@ impl Index {
             files,
             bytes,
         )?;
+        let ambiguous: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observation_members WHERE parent=?1 AND generation=?2 GROUP BY folded_name HAVING count(*)>1)",
+            params![path.to_lowercase(),generation], |r|r.get(0),
+        ).map_err(error)?;
+        if ambiguous {
+            problem = Some("Names collide under the review identity rules; membership remains unknown until this scope is resolved".into());
+        }
         let observed = now();
         let (files_sql, folders_sql, bytes_sql) = (
             sqlite_count(files)?,
@@ -260,11 +360,14 @@ impl Index {
                 tx.execute("UPDATE directories SET problem=?1,observed_at=?2,changed_at=?2 WHERE (path=?3 OR substr(lower(path),1,length(?4))=lower(?4)) AND coalesce(problem,'')<>?1",params![MISSING,observed,absent,prefix]).map_err(error)?;
             }
         }
-        if cache_files && errors == 0 {
+        if cache_files && errors == 0 && !ambiguous {
             tx.execute("INSERT INTO listing_heads VALUES(?1,?2,?3) ON CONFLICT(parent) DO UPDATE SET generation=?2,observed_at=?3",params![path,generation,observed]).map_err(error)?;
         }
+        tx.execute("INSERT INTO observation_heads VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(parent) DO UPDATE SET source_path=?2,generation=?3,fingerprint=?4,identity=?5,observed_at=?6,problem=?7",params![path.to_lowercase(),path,generation,before.fingerprint,identity,observed,problem]).map_err(error)?;
+        touch_observations(&tx, path)?;
         tx.commit().map_err(error)?;
-        if errors > 0 && cache_files {
+        self.clean_observation_generations(&db, path)?;
+        if (errors > 0 || ambiguous) && cache_files {
             return Err(format!(
                 "Directory listing incomplete: {}. Previous complete listing retained.",
                 problem.unwrap_or_default()
@@ -332,6 +435,19 @@ impl Index {
     ) -> Result<(), String> {
         let observed = now();
         for e in entries {
+            tx.execute(
+                "INSERT OR REPLACE INTO observation_members VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    path.to_lowercase(),
+                    generation,
+                    e.name,
+                    e.name.to_lowercase(),
+                    e.kind,
+                    e.fingerprint,
+                    e.problem
+                ],
+            )
+            .map_err(error)?;
             if cache_files {
                 tx.execute(
                     "INSERT OR REPLACE INTO listing_entries VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -386,6 +502,15 @@ impl Index {
             }
             std::thread::yield_now();
         }
+    }
+    fn clean_observation_generations(&self, db: &Connection, path: &str) -> Result<(), String> {
+        loop {
+            let removed=db.execute("DELETE FROM observation_members WHERE rowid IN (SELECT rowid FROM observation_members WHERE parent=?1 AND generation<>coalesce((SELECT generation FROM observation_heads WHERE parent=?1),'') LIMIT 500)",[path.to_lowercase()]).map_err(error)?;
+            if removed == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
     // Callback can stop early; this never allocates a complete-directory Vec.
     pub fn each_entry(
@@ -452,6 +577,15 @@ impl Index {
         volumes: Vec<Volume>,
         resume: bool,
     ) -> Result<(), String> {
+        let mut coordinator = self.worker_handle.lock().map_err(error)?;
+        if self.running.load(Ordering::SeqCst) {
+            return Err("An inventory is already running".into());
+        }
+        if let Some(handle) = coordinator.take() {
+            handle
+                .join()
+                .map_err(|_| "Previous inventory coordinator panicked".to_owned())?;
+        }
         if !resume {
             for root in &roots {
                 filesystem::identify(root, &volumes)?;
@@ -501,6 +635,7 @@ impl Index {
             running: self.running.clone(),
             cancel: self.cancel.clone(),
             refresh_locks: self.refresh_locks.clone(),
+            worker_handle: self.worker_handle.clone(),
         };
         let spawn = std::thread::Builder::new().name("migration-inventory".into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&volumes)))
@@ -513,12 +648,15 @@ impl Index {
             }
             worker.running.store(false, Ordering::SeqCst);
         });
-        if let Err(e) = spawn {
-            self.running.store(false, Ordering::SeqCst);
-            if let Ok(db) = self.connect() {
-                let _ = db.execute("UPDATE meta SET value=json_set(value,'$.status','error','$.error',?1) WHERE key='scan'", [error(&e)]);
+        match spawn {
+            Ok(handle) => *coordinator = Some(handle),
+            Err(e) => {
+                self.running.store(false, Ordering::SeqCst);
+                if let Ok(db) = self.connect() {
+                    let _ = db.execute("UPDATE meta SET value=json_set(value,'$.status','error','$.error',?1) WHERE key='scan'", [error(&e)]);
+                }
+                return Err(error(e));
             }
-            return Err(error(e));
         }
         Ok(())
     }
@@ -636,6 +774,133 @@ impl Index {
             tx.execute("UPDATE meta SET value=json_set(value,'$.processed',coalesce(json_extract(value,'$.processed'),0)+1,'$.files',coalesce(json_extract(value,'$.files'),0)+CASE WHEN ?2 THEN coalesce((SELECT files FROM directories WHERE path=?1),0) ELSE 0 END,'$.bytes',coalesce(json_extract(value,'$.bytes'),0)+CASE WHEN ?2 THEN coalesce((SELECT bytes FROM directories WHERE path=?1),0) ELSE 0 END) WHERE key='scan'",params![path,result.is_ok()]).map_err(error)?;
             tx.commit().map_err(error)?;
         }
+    }
+}
+fn touch_observations(db: &Connection, path: &str) -> Result<(), String> {
+    db.execute(
+        "UPDATE meta SET value=cast(value AS INTEGER)+1 WHERE key='observationSequence'",
+        [],
+    )
+    .map_err(error)?;
+    let seq: i64 = db
+        .query_row(
+            "SELECT cast(value AS INTEGER) FROM meta WHERE key='observationSequence'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(error)?;
+    let mut write=db.prepare_cached("INSERT INTO observation_versions VALUES(?1,?2) ON CONFLICT(parent) DO UPDATE SET sequence=?2").map_err(error)?;
+    for ancestor in std::path::Path::new(path)
+        .ancestors()
+        .take_while(|p| p.has_root())
+    {
+        write
+            .execute(params![ancestor.to_string_lossy().to_lowercase(), seq])
+            .map_err(error)?;
+    }
+    Ok(())
+}
+pub(crate) fn observation_version(db: &Connection, path: &str) -> Result<i64, String> {
+    db.query_row(
+        "SELECT coalesce((SELECT sequence FROM observation_versions WHERE parent=?1),0)",
+        [path.to_lowercase()],
+        |r| r.get(0),
+    )
+    .map_err(error)
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    fn generation(db: &Connection, path: &str) -> String {
+        db.query_row(
+            "SELECT generation FROM observation_heads WHERE parent=?1",
+            [path.to_lowercase()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn staged_members_are_not_published_by_a_paused_refresh() {
+        let s = crate::tests::fixture();
+        let dir = PathBuf::from(&s.volumes[0].root).join("Work").join("Child");
+        let file = dir.join("observed.txt");
+        fs::write(&file, b"known member").unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        s.index.refresh(&path, &s.volumes, None, false).unwrap();
+        let db = s.index.connect().unwrap();
+        let published = generation(&db, &path);
+        let mut staged = filesystem::inspect(&file);
+        staged.name = "staged-only.txt".into();
+        staged.path = dir.join(&staged.name).to_string_lossy().into_owned();
+        s.index
+            .flush_chunk(&path, "test-unpublished", &[staged], false, false, 1, 1)
+            .unwrap();
+        let visible: Vec<String> = {
+            let mut q=db.prepare("SELECT name FROM observation_members WHERE parent=?1 AND generation=(SELECT generation FROM observation_heads WHERE parent=?1)").unwrap();
+            q.query_map([path.to_lowercase()], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(visible, vec!["observed.txt"]);
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            s.index
+                .refresh(&path, &s.volumes, Some(&cancelled), false)
+                .unwrap_err(),
+            "Paused"
+        );
+        assert_eq!(generation(&db, &path), published);
+        let remaining: i64 = db
+            .query_row(
+                "SELECT count(*) FROM observation_members WHERE parent=?1",
+                [path.to_lowercase()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn directory_changed_before_publication_keeps_previous_membership() {
+        use std::{
+            fs::{FileTimes, OpenOptions},
+            os::windows::fs::OpenOptionsExt,
+            time::Duration,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+        let s = crate::tests::fixture();
+        let dir = PathBuf::from(&s.volumes[0].root).join("Work").join("Child");
+        fs::write(dir.join("before.txt"), b"original").unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        s.index.refresh(&path, &s.volumes, None, false).unwrap();
+        let db = s.index.connect().unwrap();
+        let published = generation(&db, &path);
+        let before = fs::metadata(&dir).unwrap().modified().unwrap();
+        let failure = s
+            .index
+            .refresh_observing(&path, &s.volumes, None, false, || {
+                fs::write(dir.join("added-during-enumeration.txt"), b"new member").unwrap();
+                OpenOptions::new()
+                    .access_mode(FILE_WRITE_ATTRIBUTES)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(&dir)
+                    .unwrap()
+                    .set_times(FileTimes::new().set_modified(before + Duration::from_secs(2)))
+                    .unwrap();
+            })
+            .unwrap_err();
+        assert!(failure.contains("changed during enumeration"), "{failure}");
+        assert_eq!(generation(&db, &path), published);
+        s.index.refresh(&path, &s.volumes, None, false).unwrap();
+        assert_ne!(generation(&db, &path), published);
+        let visible:i64=db.query_row("SELECT count(*) FROM observation_members WHERE parent=?1 AND generation=(SELECT generation FROM observation_heads WHERE parent=?1)",[path.to_lowercase()],|r|r.get(0)).unwrap();
+        assert_eq!(visible, 2);
     }
 }
 fn sqlite_count(value: u64) -> Result<i64, String> {
@@ -858,12 +1123,24 @@ mod tests {
                 i.running.store(true, Ordering::Relaxed);
                 let started = std::time::Instant::now();
                 i.run_with_workers(&v, workers).unwrap();
+                let elapsed_ms = started.elapsed().as_millis();
+                i.running.store(false, Ordering::Relaxed);
+                i.checkpoint().unwrap();
+                let size = fs::metadata(&i.path).unwrap().len();
+                let members: i64 = db
+                    .query_row("SELECT count(*) FROM observation_members", [], |r| r.get(0))
+                    .unwrap();
+                let heads: i64 = db
+                    .query_row("SELECT count(*) FROM observation_heads", [], |r| r.get(0))
+                    .unwrap();
+                let listings: i64 = db
+                    .query_row("SELECT count(*) FROM listing_entries", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!((members, heads, listings), (6560, 161, 0));
                 eprintln!(
-                    "INVENTORY_BENCH workers={workers} attempt={attempt} elapsed_ms={} status={}",
-                    started.elapsed().as_millis(),
+                    "INVENTORY_BENCH workers={workers} attempt={attempt} elapsed_ms={elapsed_ms} checkpointed_index_bytes={size} members={members} heads={heads} listing_rows={listings} status={}",
                     i.scan_status().unwrap()
                 );
-                i.running.store(false, Ordering::Relaxed);
                 assert_eq!(i.scan_status().unwrap()["processed"], 161);
                 assert_eq!(i.scan_status().unwrap()["files"], 6400);
             }

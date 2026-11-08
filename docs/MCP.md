@@ -94,7 +94,29 @@ Use `control_ui` with the current native/ UI session identities, revision, stabl
 
 Read-only `listPending` and `readPendingText` commands inspect retained mutations and buffered notes/view/path drafts without flushing them. Both bind the full `pendingFingerprint`. Lists return at most 32 metadata entries; text returns 4–16,384 UTF-8 bytes with a full JSON hash and next offset. Source changes reject the read. Saved journal text uses `read_review_text` with `recordId`, collection and field; subsequent chunks require its revision and text hash.
 
-UI reports are capped at 2 MiB and acknowledgement results at 64 KiB. Reports contain compact queue metadata; complete pending JSON remains available through chunks. Status projects the latest 32 receipts with results for the newest eight. Exact replay retrieves an existing retained result without executing it again. Completed read-only inspection results may expire under pressure, with explicit `resultExpired` and an ID/payload tombstone. A fresh fingerprint-fenced read can continue. Mutating command receipts are not evicted to make a repeated effect possible.
+UI reports are capped at 2 MiB and acknowledgement results at 64 KiB. Reports contain compact queue metadata; complete pending JSON remains available through chunks. Status projects the latest 32 in-memory receipts with results for the newest eight and reports the archived receipt count. Under pressure, terminal receipts move to a local, session-scoped archive. An exact retry in that same instance and UI session returns the original outcome with `archived: true` and, when applicable, `resultExpired: true`. The archive does not store the original request, draft or result. A fresh fingerprint-fenced inspection can read current data. A changed payload with the same ID is refused; an unavailable archive blocks new admission rather than allowing duplicate effects.
+
+### Graceful window close and exit
+
+The production-roadmap candidate adds `control_ui` actions `closeWindow`,
+`exitApp`, `retryExit` and `cancelExit`. Read `get_ui_state` first. `state.close`
+contains the renderer's close phase and ticket; the request also rechecks the
+native lifecycle state. `closeWindow`, `exitApp` and `retryExit` require
+`confirmed: true`. Retry and cancel commands include the exact
+`expectedExitTicket` inside `command`.
+
+Normal close flushes retained drafts, freezes admission, requests worker
+cancellation, joins workers and checkpoints results before exit. Optional
+background mode changes window close into a guarded hide; `exitApp` still
+requests an actual graceful exit. A pending attempt must be retried or canceled
+with its ticket. Starting another generic close cannot replace that attempt.
+After a stop timeout, admission remains frozen until an explicit retry or cancel.
+
+Acceptance is not proof of shutdown. An actual exit can stop the gateway before
+the UI channel can return an applied acknowledgement. Treat that as an uncertain
+acknowledgement, inspect process/checkpoint state and reconcile on reopen; do not
+invent completion or automatically submit a new operation ID. No operation
+force-terminates the app or rolls back already-published files.
 
 ## Restricted recovery
 

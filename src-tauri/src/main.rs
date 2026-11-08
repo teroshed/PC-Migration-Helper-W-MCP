@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use store::{error, now, Store};
-use tauri::{Manager, State};
+use tauri::State;
 
 struct AppState {
     background: background::Control,
@@ -81,7 +81,7 @@ fn ensure_gateway(state: &Shared) {
     }
 }
 
-fn ensure_watcher(state: &Shared) {
+fn ensure_watcher(state: &AppState) {
     if healthy_owner(state).is_err() {
         return;
     }
@@ -117,7 +117,7 @@ fn ensure_watcher(state: &Shared) {
         .filter(|volume| volume.available)
         .map(|volume| volume.root.clone())
         .collect();
-    let prior_observations = state
+    let prior_observations = state.index.has_observations().unwrap_or(true) || state
         .audit
         .status()
         .is_ok_and(|status| status["phase"] != "idle")
@@ -233,8 +233,7 @@ fn recorded_effective_cached(
     } else {
         format!("{}\\", relative.to_lowercase())
     };
-    let mixed = doc["decisions"]
-        .as_object()
+    let mixed = (e.kind == "folder").then(|| doc["decisions"].as_object()).flatten()
         .map(|m| {
             m.values()
                 .filter(|d| {
@@ -253,7 +252,8 @@ fn recorded_effective_cached(
 }
 
 fn effective(s: &AppState, doc: &Value, entry: &Entry) -> Value {
-    effective_cached(s, doc, entry, &manual_backup::ConfirmationCache::default())
+    let rollups = rollup::Context::new(s, doc).ok();
+    effective_cached(s, doc, entry, &manual_backup::ConfirmationCache::default(), rollups.as_ref())
 }
 
 fn effective_cached(
@@ -261,11 +261,12 @@ fn effective_cached(
     doc: &Value,
     entry: &Entry,
     confirmations: &manual_backup::ConfirmationCache,
+    rollups: Option<&rollup::Context<'_>>,
 ) -> Value {
     let mut decision = recorded_effective_cached(s, doc, entry, confirmations);
-    if let Some(summary) = rollup::derive(entry, &decision, doc, &s.volumes, |child| {
+    if let Some(summary) = rollups.and_then(|context| context.derive(entry, &decision, |child| {
         recorded_effective_cached(s, doc, child, confirmations)
-    }) {
+    })) {
         if summary["kind"] == "unanimous" {
             decision["status"] = summary["status"].clone();
             decision["mixed"] = json!(0);
@@ -330,7 +331,10 @@ fn poll_review_activity(state: State<'_, Shared>, after: u64) -> Result<Value, S
 #[tauri::command]
 async fn plan_review_reveal(state: State<'_, Shared>, path: String) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || review::plan(&s, path))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _observation = s.background.observe()?;
+        review::plan(&s, path)
+    })
         .await
         .map_err(error)?
 }
@@ -338,7 +342,10 @@ async fn plan_review_reveal(state: State<'_, Shared>, path: String) -> Result<Va
 #[tauri::command]
 async fn get_review_entry(state: State<'_, Shared>, path: String) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || review::entry(&s, path))
+    tauri::async_runtime::spawn_blocking(move || {
+        let _observation = s.background.observe()?;
+        review::entry(&s, path)
+    })
         .await
         .map_err(error)?
 }
@@ -351,6 +358,7 @@ fn list_folder_service(
     filter: String,
     page: usize,
 ) -> Result<Value, String> {
+    let _observation = s.background.observe()?;
     let path = filesystem::normalize(&path)?;
     filesystem::safe(&path, &s.volumes, false).inspect_err(|e| {
         let _ = s.index.record_gap(&path, e);
@@ -364,8 +372,9 @@ fn list_folder_service(
     let mut attention = 0usize;
     let mut counts = serde_json::Map::new();
     let confirmations = manual_backup::ConfirmationCache::default();
+    let rollups = rollup::Context::new(s, &doc).ok();
     s.index.each_entry(&path, &search, |entry| {
-        let result = effective_cached(&s, &doc, &entry, &confirmations);
+        let result = effective_cached(&s, &doc, &entry, &confirmations, rollups.as_ref());
         let status = review_status(&result);
         let n = counts.get(status).and_then(Value::as_u64).unwrap_or(0) + 1;
         counts.insert(status.into(), json!(n));
@@ -416,6 +425,7 @@ async fn list_folder(
 }
 
 fn details_service(s: &AppState, path: String) -> Result<Value, String> {
+    let _observation = s.background.observe()?;
     let path = filesystem::normalize(&path)?;
     let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
     let doc = document(&s)?;
@@ -611,6 +621,7 @@ fn run_mutation_as(
     op: Value,
     origin: MutationOrigin,
 ) -> Result<Value, String> {
+    let _admission = s.background.edit_guard()?;
     let operation_type = op["type"].as_str().ok_or("Missing operation type")?;
     origin.validate(operation_type)?;
     if operation_id.len() > 200 || operation_id.is_empty() {
@@ -961,9 +972,10 @@ async fn control_copy_queue(
 fn audit_status_service(s: &AppState) -> Result<Value, String> {
     // Retain missed-event coverage in memory if its database write fails. A later
     // successful poll persists a root-wide gap before clearing this warning.
+    let observation = s.background.observe().ok();
     let mut fault = s.watcher_fault.lock().map_err(error)?;
     if let Some(problem) = fault.as_ref() {
-        if s.audit.record_watch_gap("", problem).is_ok() {
+        if observation.is_some() && s.audit.record_watch_gap("", problem).is_ok() {
             *fault = None;
         }
     }
@@ -1007,6 +1019,7 @@ fn audit_control_service(
         }
         _ => return Err("Unknown checksum scan action".into()),
     }
+    drop(_start);
     audit_status_service(s)
 }
 
@@ -1045,6 +1058,7 @@ fn audit_notifications_service(s: &AppState, limit: usize, offset: usize) -> Res
 }
 
 fn audit_read_service(s: &AppState, ids: &[String], all: bool) -> Result<Value, String> {
+    let observation = s.background.observe()?;
     healthy_owner(s)?;
     if ids.len() > 1000 {
         return Err("Too many notification IDs".into());
@@ -1060,6 +1074,7 @@ fn audit_read_service(s: &AppState, ids: &[String], all: bool) -> Result<Value, 
         return Err("Invalid notification ID".into());
     }
     s.audit.mark_read(&parsed, all)?;
+    drop(observation);
     audit_status_service(s)
 }
 
@@ -1173,14 +1188,18 @@ fn next_attention_service(
     path: String,
     after: Option<String>,
 ) -> Result<Option<Value>, String> {
+    let _observation = s.background.observe()?;
     filesystem::identify(&path, &s.volumes)?;
     let doc = document(&s)?;
+    let confirmations = manual_backup::ConfirmationCache::default();
+    let rollups = rollup::Context::new(s, &doc).ok();
     let mut first = None;
     let mut next = None;
     let mut passed = after.is_none();
     let mut position = 0usize;
     s.index.each_entry(&path, "", |e| {
-        if review_status(&effective(&s, &doc, &e)) == "attention" {
+        let result = effective_cached(s, &doc, &e, &confirmations, rollups.as_ref());
+        if review_status(&result) == "attention" {
             if first.is_none() && after.as_ref() != Some(&e.path) {
                 first = Some((e.path.clone(), position / 100));
             }
@@ -1209,7 +1228,8 @@ fn next_attention_service(
             return true;
         }
         let e = filesystem::inspect(std::path::Path::new(&dir));
-        if review_status(&effective(&s, &doc, &e)) == "attention" {
+        let result = effective_cached(s, &doc, &e, &confirmations, rollups.as_ref());
+        if review_status(&result) == "attention" {
             let parent = std::path::Path::new(&dir)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -1220,6 +1240,10 @@ fn next_attention_service(
         true
     })?;
     Ok(candidate)
+}
+fn assisted_review_service(s: &AppState) -> Result<Value, String> {
+    let _observation = s.background.observe()?;
+    assistance::snapshot(s, &document(s)?)
 }
 #[tauri::command]
 async fn next_attention(
@@ -1319,7 +1343,7 @@ fn main() {
         fixture.is_some(),
     );
     let state = Arc::new(AppState {
-        background: background::Control::new(fixture.is_none() || args.iter().any(|arg| arg == "--fixture-tray")),
+        background: background::Control::new(args.iter().any(|arg| matches!(arg.as_str(), "--background" | "--fixture-tray"))),
         store: Mutex::new(store),
         startup_problem: problem,
         volumes: roots,
@@ -1340,14 +1364,11 @@ fn main() {
     });
     tauri::Builder::default()
         .manage(state.clone())
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.state::<Shared>();
-                if state.background.enabled {
-                    // The frontend flushes drafts before calling background_hide.
-                    // Never pause workers merely because the window is closed.
-                    api.prevent_close();
-                }
+                // The frontend obtains an exit ticket, flushes buffered edits,
+                // then invokes the shared drain. Explicit tray mode may hide.
+                api.prevent_close();
             }
         })
         .setup(move |app| {
@@ -1375,6 +1396,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             background::background_status,
+            background::background_begin_exit,
             background::background_hide,
             background::background_request_exit,
             background::background_cancel_exit,
@@ -1557,6 +1579,9 @@ mod tests {
             apply(&s, &format!("pending-{name}"), json!({"type":"classify","path":path.to_string_lossy(),"status":"manual-pending"}));
         }
         let path = parent.to_string_lossy().into_owned();
+        let unobserved = details_service(&s, path.clone()).unwrap();
+        assert_eq!(unobserved["effective"]["rollup"]["kind"], "unknown");
+        s.index.refresh(&path, &s.volumes, None, false).unwrap();
         let rolled = details_service(&s, path.clone()).unwrap();
         assert_eq!(rolled["effective"]["rollup"]["kind"], "unanimous");
         assert_eq!(rolled["effective"]["status"], "manual-pending");

@@ -70,6 +70,7 @@ pub struct CopyQueue {
     progress: Mutex<Progress>,
     destination_gate: Mutex<()>,
     cancel: AtomicBool,
+    worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
     #[cfg(test)]
     worker_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
@@ -111,6 +112,7 @@ impl CopyQueue {
             }),
             destination_gate: Mutex::new(()),
             cancel: AtomicBool::new(false),
+            worker_handle: Mutex::new(None),
             #[cfg(test)]
             worker_barrier: Mutex::new(None),
         })
@@ -209,6 +211,19 @@ impl CopyQueue {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    pub fn join_stopped(&self) -> Result<(), String> {
+        let mut worker = self.worker_handle.lock().map_err(error)?;
+        if self.status()?["running"] == true {
+            return Err("Copy coordinator is still stopping".into());
+        }
+        if let Some(handle) = worker.take() {
+            handle
+                .join()
+                .map_err(|_| "Copy coordinator panicked during shutdown".to_owned())?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn hold_next_worker(&self, barrier: Arc<std::sync::Barrier>) {
         *self.worker_barrier.lock().unwrap() = Some(barrier);
@@ -274,6 +289,15 @@ impl CopyQueue {
         job_id: &str,
         launch: Option<mpsc::Receiver<()>>,
     ) -> Result<Value, String> {
+        let mut coordinator = self.worker_handle.lock().map_err(error)?;
+        if self.status()?["running"] == true {
+            return Err("A copy pass is already running".into());
+        }
+        if let Some(handle) = coordinator.take() {
+            handle
+                .join()
+                .map_err(|_| "Previous copy coordinator panicked".to_owned())?;
+        }
         let parsed_mode = Mode::parse(mode)?;
         let scope = self.validate_start_request(&volumes, &destination, mode, scope)?;
         {
@@ -294,7 +318,7 @@ impl CopyQueue {
         let queue = self.clone();
         #[cfg(test)]
         let barrier = self.worker_barrier.lock().map_err(error)?.take();
-        if let Err(problem) =
+        let spawned =
             thread::Builder::new()
                 .name("migration-copy".into())
                 .spawn(move || {
@@ -321,10 +345,13 @@ impl CopyQueue {
                     }))
                     .unwrap_or_else(|_| Err("The copy worker stopped unexpectedly".into()));
                     queue.finish(result);
-                })
-        {
-            self.finish(Err(error(problem)));
-            return Err("Could not start the copy worker".into());
+                });
+        match spawned {
+            Ok(handle) => *coordinator = Some(handle),
+            Err(problem) => {
+                self.finish(Err(error(problem)));
+                return Err("Could not start the copy worker".into());
+            }
         }
         self.status()
     }

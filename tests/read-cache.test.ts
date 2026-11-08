@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
-import { ReadCache, folderQueryKey, reviewContentKey } from '../src/read-cache.ts';
+import { ReadCache, StaleReadError, folderQueryKey, reviewContentKey } from '../src/read-cache.ts';
 
 test('repeated navigation reuses pages and concurrent reads share one native call', async () => {
   const cache = new ReadCache<object>();
@@ -21,10 +21,32 @@ test('scope changes, explicit refresh and late completions cannot repopulate old
   await Promise.resolve();
   cache.setScope('new journal/audit/source');
   assert.equal(await cache.read('A', async () => 'new'), 'new');
-  complete('old'); await old;
+  const canceled = assert.rejects(old, StaleReadError);
+  complete('old'); await canceled;
   assert.equal(cache.peek('A'), 'new');
   cache.clear();
   assert.equal(cache.peek('A'), undefined);
+});
+
+test('a superseded request rejects before its loader starts', async () => {
+  const cache = new ReadCache<string>();
+  let nativeCalls = 0;
+  const old = cache.read('A', async () => { nativeCalls += 1; return 'obsolete'; });
+  cache.clear();
+  await assert.rejects(old, StaleReadError);
+  assert.equal(nativeCalls, 0);
+});
+
+test('progress expires future cache reuse without starving a coherent in-flight source read', async () => {
+  const cache = new ReadCache<string>();
+  let complete: (value: string) => void = () => {};
+  const pending = cache.read('A', () => new Promise(resolve => { complete = resolve; }));
+  await Promise.resolve();
+  cache.expireValues();
+  complete('observed snapshot');
+  assert.equal(await pending, 'observed snapshot');
+  assert.equal(cache.peek('A'), undefined);
+  assert.equal(await cache.read('A', async () => 'current progress'), 'current progress');
 });
 
 test('expired, evicted and oversized values are not reused; errors can be retried', async () => {
@@ -77,6 +99,102 @@ test('synthetic 30-navigation fixture measures eliminated repeated read work', a
 
 import { FolderReadCache } from '../src/folder-read-cache.ts';
 import { parseAuditStatus } from '../src/audit-model.ts';
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => { throw new Error('Deferred promise is not initialized'); };
+  const promise = new Promise<T>(complete => { resolve = complete; });
+  return { promise, resolve };
+}
+const listing = (path: string, total: number) => ({ path, entries: [], total, attention: 0, counts: {}, observedAt: 'source metadata' });
+
+test('a watcher generation cannot share or display an older in-flight listing', async () => {
+  const oldNative = deferred<ReturnType<typeof listing>>();
+  let calls = 0;
+  const cache = new FolderReadCache(async request => ++calls === 1 ? oldNative.promise : listing(request.path, 2));
+  const query = { path: 'A', search: '', filter: 'all', page: 0 };
+  const old = cache.listing(query);
+  await Promise.resolve();
+  cache.setSourceScope('new watcher generation');
+  const fresh = await cache.listing(query);
+  assert.equal(fresh.total, 2);
+  const canceled = assert.rejects(old, StaleReadError);
+  oldNative.resolve(listing('A', 1)); await canceled;
+  assert.equal(cache.peekListing(query)?.total, 2);
+  assert.equal(calls, 2);
+});
+
+test('different filters share directory enumeration but obtain their own derived result', async () => {
+  const metadata = deferred<ReturnType<typeof listing>>();
+  const calls: boolean[] = [];
+  const cache = new FolderReadCache(async request => {
+    calls.push(request.refresh);
+    return request.refresh ? metadata.promise : listing(request.path, 3);
+  });
+  const query = { path: 'A', search: '', filter: 'all', page: 0 };
+  const all = cache.listing(query);
+  const attention = cache.listing({ ...query, filter: 'attention' });
+  await Promise.resolve();
+  assert.deepEqual(calls, [true]);
+  metadata.resolve(listing('A', 7));
+  assert.equal((await all).total, 7);
+  assert.equal((await attention).total, 3);
+  assert.deepEqual(calls, [true, false]);
+});
+
+test('refreshing A supersedes old A without canceling or evicting independent B', async () => {
+  const firstA = deferred<ReturnType<typeof listing>>();
+  const firstB = deferred<ReturnType<typeof listing>>();
+  const cache = new FolderReadCache(async request => request.path === 'B' ? firstB.promise : request.filter === 'all' ? firstA.promise : listing('A', 3));
+  const A = { path: 'A', search: '', filter: 'all', page: 0 };
+  const B = { ...A, path: 'B' };
+  const old = cache.listing(A);
+  const independent = cache.listing(B);
+  await Promise.resolve();
+  const refreshed = await cache.listing({ ...A, filter: 'attention' }, true);
+  firstB.resolve(listing('B', 2));
+  assert.equal((await independent).total, 2);
+  const canceled = assert.rejects(old, StaleReadError);
+  firstA.resolve(listing('A', 1)); await canceled;
+  assert.equal(refreshed.total, 3);
+  assert.equal(cache.peekListing(B)?.total, 2);
+});
+
+test('TTL expiry cannot reuse a derived-only request started from older metadata', async () => {
+  let now = 0;
+  const oldDerived = deferred<ReturnType<typeof listing>>();
+  const requests: boolean[] = [];
+  const cache = new FolderReadCache(async request => {
+    requests.push(request.refresh);
+    return !request.refresh ? oldDerived.promise : listing(request.path, requests.length);
+  }, () => now);
+  const query = { path: 'A', search: '', filter: 'all', page: 0 };
+  await cache.listing(query);
+  now = 14_000; cache.setScope('changed review');
+  const old = cache.listing(query); await Promise.resolve();
+  now = 15_001;
+  assert.equal((await cache.listing(query)).total, 3);
+  const canceled = assert.rejects(old, StaleReadError);
+  oldDerived.resolve(listing('A', 99)); await canceled;
+  assert.deepEqual(requests, [true, false, true]);
+});
+
+test('a decision change reuses in-flight metadata but recomputes effective decisions', async () => {
+  const source = deferred<ReturnType<typeof listing>>();
+  const requests: boolean[] = [];
+  const cache = new FolderReadCache(async request => {
+    requests.push(request.refresh);
+    return request.refresh ? source.promise : listing(request.path, 2);
+  });
+  const query = { path: 'A', search: '', filter: 'all', page: 0 };
+  const old = cache.listing(query); await Promise.resolve();
+  cache.setScope('new decision');
+  const current = cache.listing(query);
+  const canceled = assert.rejects(old, StaleReadError);
+  source.resolve(listing('A', 1));
+  await canceled;
+  assert.equal((await current).total, 2);
+  assert.deepEqual(requests, [true, false]);
+});
 
 test('source metadata refresh is separate from view, decision and hash-progress invalidation', async () => {
   let now = 0;

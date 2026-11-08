@@ -69,6 +69,7 @@ pub fn control(s: &Shared, request: &Value, origin: MutationOrigin) -> Result<Va
     };
     let payload = json!({"originalSha256":original,"backupSha256":backup,"confirmed":true,"actor":identity});
     let payload_hash = hash(&serde_json::to_vec(&canonical_json(&payload)).map_err(error)?);
+    let _admission = s.background.edit_guard()?;
     let mut locked = s.store.lock().map_err(error)?;
     let store = locked.as_mut().ok_or("This instance does not own the journal")?;
     if let Some(receipt) = store.doc["recoveryOperations"].get(operation_id) {

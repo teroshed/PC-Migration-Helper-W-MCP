@@ -1,8 +1,14 @@
 /** Session-only LRU: never persists source observations or changes their freshness labels. */
+export class StaleReadError extends Error {
+  constructor() { super('This read belongs to an older folder context.'); this.name = 'StaleReadError'; }
+}
+export function isStaleRead(cause: unknown): cause is StaleReadError { return cause instanceof StaleReadError; }
+
 export class ReadCache<T> {
   private values = new Map<string, { value: T; expires: number; bytes: number }>();
   private pending = new Map<string, Promise<T>>();
   private generation = 0;
+  private retentionGeneration = 0;
   private scope = '';
   private bytes = 0;
   private maxEntries: number;
@@ -26,6 +32,17 @@ export class ReadCache<T> {
       if (matches(key)) { this.values.delete(key); this.bytes -= entry.bytes; }
     }
   }
+  expireValues(): void {
+    // Progress counters can supersede cached derived statistics without making
+    // an already-running source observation invalid for its current caller.
+    this.retentionGeneration += 1;
+    this.values.clear();
+    this.bytes = 0;
+  }
+  invalidate(matches: (key: string) => boolean): void {
+    this.evictValues(matches);
+    for (const key of this.pending.keys()) if (matches(key)) this.pending.delete(key);
+  }
   peek(key: string): T | undefined {
     const entry = this.values.get(key);
     if (!entry) return undefined;
@@ -40,8 +57,13 @@ export class ReadCache<T> {
     const pending = this.pending.get(key);
     if (pending) return pending;
     const generation = this.generation;
-    const promise = Promise.resolve().then(loader).then(value => {
-      if (generation !== this.generation) return value;
+    const retentionGeneration = this.retentionGeneration;
+    const promise = Promise.resolve().then(() => {
+      if (generation !== this.generation || this.pending.get(key) !== promise) throw new StaleReadError();
+      return loader();
+    }).then(value => {
+      if (generation !== this.generation || this.pending.get(key) !== promise) throw new StaleReadError();
+      if (retentionGeneration !== this.retentionGeneration) return value;
       // UTF-16 estimate bounds retained payloads as well as page count.
       const bytes = JSON.stringify(value).length * 2;
       if (bytes <= this.maxBytes) {
@@ -50,7 +72,9 @@ export class ReadCache<T> {
         while (this.values.size > this.maxEntries || this.bytes > this.maxBytes) {
           const oldest = this.values.keys().next().value;
           if (oldest === undefined) break;
-          this.bytes -= this.values.get(oldest)!.bytes;
+          const oldestEntry = this.values.get(oldest);
+          if (!oldestEntry) break;
+          this.bytes -= oldestEntry.bytes;
           this.values.delete(oldest);
         }
       }
@@ -81,6 +105,7 @@ export class FolderObservations {
   private observed = new Map<string, number>();
   private scope = '';
   private generation = 0;
+  private pathTokens = new Map<string, object>();
   private now: () => number;
   private ttlMs: number;
   constructor(now = Date.now, ttlMs = 15_000) { this.now = now; this.ttlMs = ttlMs; }
@@ -88,15 +113,31 @@ export class FolderObservations {
     if (scope === this.scope) return;
     this.scope = scope; this.clear();
   }
-  clear(): void { this.generation++; this.observed.clear(); }
-  token(): number { return this.generation; }
+  clear(): void { this.generation++; this.observed.clear(); this.pathTokens.clear(); }
+  invalidate(path: string): void { this.observed.delete(path); this.pathTokens.delete(path); }
+  token(path: string): { generation: number; path: object } {
+    let token = this.pathTokens.get(path);
+    if (!token) { token = {}; this.pathTokens.set(path, token); }
+    return { generation: this.generation, path: token };
+  }
+  current(path: string, token: { generation: number; path: object }): boolean {
+    return token.generation === this.generation && token.path === this.pathTokens.get(path);
+  }
+  discard(path: string, token: { generation: number; path: object }): void {
+    if (this.current(path, token) && !this.observed.has(path)) this.pathTokens.delete(path);
+  }
   fresh(path: string): boolean {
     const at = this.observed.get(path);
     return at !== undefined && this.now() - at < this.ttlMs;
   }
-  record(path: string, token: number): void {
-    if (token !== this.generation) return;
+  record(path: string, token: { generation: number; path: object }): void {
+    if (!this.current(path, token)) return;
     this.observed.delete(path); this.observed.set(path, this.now());
-    while (this.observed.size > 256) this.observed.delete(this.observed.keys().next().value!);
+    while (this.observed.size > 256) {
+      const oldest = this.observed.keys().next().value;
+      if (oldest === undefined) break;
+      this.observed.delete(oldest);
+      this.pathTokens.delete(oldest);
+    }
   }
 }

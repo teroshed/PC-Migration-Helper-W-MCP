@@ -1,4 +1,4 @@
-use crate::{document, filesystem, store::error, AppState, Shared};
+use crate::{filesystem, store::error, AppState, Shared};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -741,7 +741,7 @@ pub fn update(s: &AppState, doc: &mut Value, op: &Value) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_assisted_review(state: tauri::State<'_, Shared>) -> Result<Value, String> {
     let app = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || snapshot(&app, &document(&app)?))
+    tauri::async_runtime::spawn_blocking(move || crate::assisted_review_service(&app))
         .await
         .map_err(error)?
 }
@@ -749,6 +749,7 @@ pub async fn get_assisted_review(state: tauri::State<'_, Shared>) -> Result<Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document;
 
     #[test]
     fn source_observations_fence_prepared_questions_until_a_fresh_inventory() {

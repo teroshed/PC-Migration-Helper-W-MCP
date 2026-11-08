@@ -33,6 +33,7 @@ pub struct Audit {
     running: AtomicBool,
     cancel: AtomicBool,
     stats_cache: Mutex<HashMap<String, (i64, Value)>>,
+    worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 #[derive(Clone)]
 struct Observation {
@@ -108,6 +109,7 @@ impl Audit {
             running: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             stats_cache: Mutex::new(HashMap::new()),
+            worker_handle: Mutex::new(None),
         });
         let db = audit.connect()?;
         db.execute_batch("PRAGMA journal_mode=WAL;
@@ -208,6 +210,44 @@ impl Audit {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+    pub(crate) fn evidence_sequences(&self) -> Result<(i64, i64), String> {
+        self.connect()?.query_row("SELECT (SELECT cast(value AS INTEGER) FROM meta WHERE key='changeSequence'),(SELECT cast(value AS INTEGER) FROM meta WHERE key='watcherChangeSequence')",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(error)
+    }
+    pub fn join_stopped(&self) -> Result<(), String> {
+        let mut worker = self.worker_handle.lock().map_err(error)?;
+        if self.is_running() {
+            return Err("Checksum audit is still stopping".into());
+        }
+        if let Some(handle) = worker.take() {
+            handle
+                .join()
+                .map_err(|_| "Checksum coordinator panicked during shutdown".to_owned())?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn checkpoint(&self) -> Result<(), String> {
+        self.checkpoint_with_timeout(Duration::from_secs(15))
+    }
+    pub fn checkpoint_with_timeout(&self, timeout: Duration) -> Result<(), String> {
+        if self.is_running() {
+            return Err("Checksum audit must stop before checkpointing".into());
+        }
+        let db = self.connect_hash_checkpoint()?;
+        db.busy_timeout(timeout).map_err(error)?;
+        let (busy, log, saved): (i64, i64, i64) = db
+            .query_row("PRAGMA wal_checkpoint(FULL)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(error)?;
+        if busy != 0 || log != saved {
+            return Err(
+                "Checksum checkpoint is waiting for another database reader; the app remains open"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
     pub fn start(
         self: &Arc<Self>,
         roots: Vec<String>,
@@ -215,6 +255,15 @@ impl Audit {
         resume: bool,
         workers: usize,
     ) -> Result<(), String> {
+        let mut coordinator = self.worker_handle.lock().map_err(error)?;
+        if self.is_running() {
+            return Err("A size and checksum audit is already running.".into());
+        }
+        if let Some(handle) = coordinator.take() {
+            handle
+                .join()
+                .map_err(|_| "Previous checksum coordinator panicked".to_owned())?;
+        }
         if self.running.swap(true, Ordering::SeqCst) {
             return Err("A size and checksum audit is already running.".into());
         }
@@ -293,7 +342,7 @@ impl Audit {
             }
         };
         let audit = self.clone();
-        if let Err(e) = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("migration-audit-manager".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -316,10 +365,13 @@ impl Audit {
                     }
                 }
                 audit.running.store(false, Ordering::SeqCst);
-            })
-        {
-            self.running.store(false, Ordering::SeqCst);
-            return Err(error(e));
+            });
+        match spawned {
+            Ok(handle) => *coordinator = Some(handle),
+            Err(e) => {
+                self.running.store(false, Ordering::SeqCst);
+                return Err(error(e));
+            }
         }
         Ok(())
     }
@@ -1127,7 +1179,18 @@ impl Audit {
         path: &str,
         count: i64,
     ) -> Result<(), String> {
-        self.connect()?.execute("INSERT INTO notifications(event_key,kind,title,message,path,created_at,change_count) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(event_key) DO UPDATE SET message=?4,created_at=?6,read_at=NULL,change_count=change_count+?7",params![key,kind,title,message,path,now(),count]).map_err(error)?;
+        Self::notify_in(&self.connect()?, key, kind, title, message, path, count)
+    }
+    fn notify_in(
+        db: &Connection,
+        key: &str,
+        kind: &str,
+        title: &str,
+        message: &str,
+        path: &str,
+        count: i64,
+    ) -> Result<(), String> {
+        db.execute("INSERT INTO notifications(event_key,kind,title,message,path,created_at,change_count) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(event_key) DO UPDATE SET message=?4,created_at=?6,read_at=NULL,change_count=change_count+?7",params![key,kind,title,message,path,now(),count]).map_err(error)?;
         Ok(())
     }
     pub fn record_watch_change(&self, path: &str, kind: &str) -> Result<(), String> {
@@ -1149,6 +1212,14 @@ impl Audit {
         self.notify(&format!("watch|{parent}"),"source-change","Source changes need checksum verification","Filesystem change events were observed. These are pending verification, not proof of changed content or a completed backup.",&parent,1)
     }
     pub fn record_watch_gap(&self, root: &str, reason: &str) -> Result<(), String> {
+        self.record_watch_gap_with_timeout(root, reason, Duration::from_secs(15))
+    }
+    pub fn record_watch_gap_with_timeout(
+        &self,
+        root: &str,
+        reason: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let roots = if root.is_empty() {
             self.volumes()?
                 .into_iter()
@@ -1161,16 +1232,14 @@ impl Audit {
             return Ok(());
         }
         let mut db = self.connect()?;
+        db.busy_timeout(timeout).map_err(error)?;
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(error)?;
         for path in &roots {
             tx.execute("INSERT INTO watch_changes VALUES(?1,?2,'coverage-gap') ON CONFLICT(path) DO UPDATE SET changed_at=?2,kind='coverage-gap'",params![path,now()]).map_err(error)?;
-        }
-        touch_watcher(&tx)?;
-        tx.commit().map_err(error)?;
-        for path in &roots {
-            self.notify(
+            Self::notify_in(
+                &tx,
                 &format!("watch-gap|{path}"),
                 "coverage-gap",
                 "Live change coverage needs a rescan",
@@ -1179,7 +1248,8 @@ impl Audit {
                 1,
             )?;
         }
-        Ok(())
+        touch_watcher(&tx)?;
+        tx.commit().map_err(error)
     }
     fn watch_changed(&self, path: &str, since: &str) -> Result<bool, String> {
         let db = self.connect()?;
@@ -1258,7 +1328,7 @@ fn stamp(metadata: &fs::Metadata) -> String {
         metadata.creation_time()
     )
 }
-fn handle_identity(file: &File) -> Result<String, String> {
+pub(crate) fn handle_identity(file: &File) -> Result<String, String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,

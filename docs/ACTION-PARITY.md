@@ -56,6 +56,7 @@ confirmation, fencing, retries and asynchronous status.
 | Inspect pending saves, buffered notes/view/path drafts and save/conflict state | `get_ui_state`; `control_ui`: `listPending` / `readPendingText` | `get_ui_state` / `control_ui` |
 | Flush pending saves, safely retry a failed save, compare a conflict, apply exact retained edits to a reviewed revision | `control_ui`: `flushPending` / `retryPending` / `compareConflict` / `retryReviewed` | `control_ui` |
 | Dismiss status or error feedback while retaining user work | `control_ui`: `dismissFeedback` | `control_ui` |
+| Gracefully close the window, explicitly exit, or retry/cancel a waiting exit ticket | `control_ui`: `closeWindow` / `exitApp` / `retryExit` / `cancelExit` | `control_ui` |
 | Inspect a damaged journal and a valid recovery backup | `get_recovery_state` | `get_recovery_state` |
 | Explicitly restore that reviewed backup, preserving the displaced original | `recover_review` | `recover_review` |
 
@@ -102,9 +103,10 @@ bounds rather than exposing arbitrary raw journal files.
 UI reports contain compact pending-request metadata. Fingerprint-fenced
 `listPending` and `readPendingText` inspect complete retained request JSON and
 unsent drafts without submitting them. Reports are limited to 2 MiB and command
-results to 64 KiB. Receipt status includes omission/expiry information; an expired
-read result can be read again under a fresh inspection ID. Protected mutation
-receipts are not evicted to permit duplicate effects.
+results to 64 KiB. Terminal receipts may be compacted to local session-scoped
+storage; exact replay retains the outcome and explicitly reports expired results.
+An expired read can be repeated under a fresh inspection ID and current fences.
+Archiving does not permit a previous effect to run again.
 
 ## Authority and input-mechanics boundaries
 

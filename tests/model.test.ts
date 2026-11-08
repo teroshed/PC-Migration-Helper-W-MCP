@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MutationQueue, parseDocument, parentPath, normalizeReviewPath, parseGateway, previewBranch, closePreviewBranch } from '../src/model.ts';
+import { MutationQueue, parseDocument, parentPath, normalizeReviewPath, parseEffective, parseGateway, previewBranch, closePreviewBranch } from '../src/model.ts';
 import type { Document, Operation } from '../src/model.ts';
 import { inspectPending, pendingFingerprint, pendingJSON, pendingMetadata, textChunk, textHash } from '../src/pending-inspection.ts';
 import type { PendingSnapshot } from '../src/pending-inspection.ts';
@@ -8,6 +8,35 @@ import type { PendingSnapshot } from '../src/pending-inspection.ts';
 function doc(revision = 1): Document {
   return parseDocument({ schemaVersion: 1, revision, history: [], decisions: {}, futureField: { preserved: true }, view: { path: 'E:\\', selectedPath: null, search: '', filter: 'all', page: 0, scrollTop: 0, recentPaths: [] } });
 }
+
+test('folder rollups preserve zero-entry coverage gaps without becoming saved marks', () => {
+  const result = parseEffective({
+    status: 'attention', own: false, stale: false, mixed: 0,
+    rollup: { kind: 'unknown', childCount: 0, leafCount: 0, emptyFolderCount: 0, undecidedCount: 0,
+      unknownBranches: 1, coverageGaps: 1, statusCounts: {}, coverageComplete: false, problem: 'Membership needs a fresh observation' },
+  });
+  assert.equal(result.status, 'attention');
+  assert.equal(result.own, false);
+  assert.equal(result.rollup?.kind, 'unknown');
+  assert.equal(result.rollup?.childCount, 0);
+  assert.deepEqual(result.rollup?.coverage, {
+    complete: false, leafCount: 0, emptyFolderCount: 0, undecidedCount: 0, unknownBranches: 1, coverageGaps: 1,
+    statusCounts: {}, problem: 'Membership needs a fresh observation',
+  });
+});
+
+test('observed undecided entries remain distinct from unknown branches and legacy summaries still parse', () => {
+  const base = { status: 'attention', own: false, stale: false, mixed: 0 };
+  const observed = { kind: 'unknown', childCount: 3, leafCount: 2, emptyFolderCount: 1, undecidedCount: 2,
+    unknownBranches: 0, coverageGaps: 0, statusCounts: { 'migrate-now': 1, erase: -1, unsupported: 2 }, coverageComplete: true };
+  const coverage = parseEffective({ ...base, rollup: observed }).rollup?.coverage;
+  assert.equal(coverage?.complete, true);
+  assert.equal(coverage?.undecidedCount, 2);
+  assert.deepEqual(coverage?.statusCounts, { 'migrate-now': 1 });
+  assert.equal(parseEffective({ ...base, rollup: { ...observed, coverageGaps: 1 } }).rollup?.coverage?.complete, false);
+  assert.equal(parseEffective({ ...base, rollup: { ...observed, leafCount: -1 } }).rollup?.coverage, undefined);
+  assert.deepEqual(parseEffective({ ...base, rollup: { kind: 'mixed', childCount: 2 } }).rollup, { kind: 'mixed', childCount: 2 });
+});
 
 test('large pending queues retain all text while reports and UTF-8 inspection stay bounded', async () => {
   const requests = Array.from({ length: 24 }, (_, index) => ({ id: 'retained-' + index, operation: {

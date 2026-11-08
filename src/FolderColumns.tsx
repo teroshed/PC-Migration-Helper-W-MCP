@@ -6,6 +6,7 @@ import { Check, ChevronLeft, ChevronRight, File, Folder, FolderOpen, Link2, Load
 import { baseName, parentPath, parseEntry, STATUSES } from './model';
 import type { Entry, Listing, PreviewColumn, Status } from './model';
 import type { FolderReadCache } from './folder-read-cache';
+import { isStaleRead } from './read-cache';
 import { DESCRIPTIONS, ICONS, LABELS, reviewStatusLabel, StatusBadge } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
@@ -215,7 +216,7 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
     void props.cache.listing(query, force).then(result => {
       if (!active) return;
       loadedContext.current = contextKey; setListing(result); setLoading(false); setError(null);
-    }).catch(cause => { if (active) { if (foreground) setListing(null); setError(String(cause)); setLoading(false); } }).finally(() => props.onReadPendingChange(-1));
+    }).catch(cause => { if (active) { if (!isStaleRead(cause)) { if (foreground) setListing(null); setError(String(cause)); } setLoading(false); } }).finally(() => props.onReadPendingChange(-1));
     return () => { active = false; };
   }, [props.column.path, props.column.page, props.refreshToken, refresh]);
   return <DirectoryColumn {...props} path={props.column.path} width={props.column.width ?? 360} page={props.column.page} scrollTop={props.column.scrollTop} listing={listing} loading={loading} error={error} listRef={listRef} onScroll={scrollTop => props.onChange({ scrollTop })} onPage={page => props.onChange({ page, scrollTop: 0 })} onRefresh={() => { forceRefresh.current = true; setRefresh(value => value + 1); }}/>

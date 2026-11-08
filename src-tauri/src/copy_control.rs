@@ -198,7 +198,7 @@ fn control_inner(
     if !matches!(action, "start" | "resume" | "pause") {
         return Err("Unknown copy control action".into());
     }
-    let _start = if action != "pause" { Some(s.background.start_guard()?) } else { None };
+    let _admission = if action == "pause" { s.background.edit_guard()? } else { s.background.start_guard()? };
     let operation_id = text(request, "operationId")?;
     if operation_id.len() > 200 {
         return Err("Invalid operation identifier".into());

@@ -84,12 +84,21 @@ export function AssistanceInterview({ currentPath, revision, readOnly, onEdit, c
   const [actionProblem, setActionProblem] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [overrideQuestion, setOverrideQuestion] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const inFlight = useRef(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const override = useRef<HTMLFieldSetElement>(null);
   const question = interview?.question;
   const questionId = question?.id;
   const choosing = questionId !== undefined && overrideQuestion === questionId;
+  const scanStartedAt = interview?.progress.startedAt;
+  useEffect(() => {
+    if (!scanStartedAt || !['scanning', 'paused'].includes(interview?.phase ?? '')) return;
+    setNowMs(Date.now());
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [scanStartedAt, interview?.phase]);
+  const elapsed = inventoryElapsed(scanStartedAt ?? null, nowMs);
   function chooseOverride(open: boolean): void {
     if (open && (!questionId || readOnly || reading || working || problem)) throw new Error('The current question is not available for override.');
     setOverrideQuestion(open ? questionId ?? null : null);
@@ -194,7 +203,7 @@ export function AssistanceInterview({ currentPath, revision, readOnly, onEdit, c
       <p>{interview.progress.files.toLocaleString()} files found · {readableBytes(interview.progress.bytes)} logical size</p>
       {interview.progress.currentPath && <p className="assistance-progress-path" title={interview.progress.currentPath}>
         {interview.progress.currentPath}</p>}
-      <small>{inventoryElapsed(interview.progress.startedAt, Date.now()) && <>{inventoryElapsed(interview.progress.startedAt, Date.now())} since scan started · </>}
+      <small>{elapsed && <>{elapsed} since scan started · </>}
         {interview.progress.gaps > 0 && <>{interview.progress.gaps.toLocaleString()} recorded coverage gaps · </>}
         The total grows as folders are discovered. A reliable percentage and ETA are not available yet.</small>
       <small>Metadata inventory only. It does not hash file contents or verify a backup.</small>

@@ -12,17 +12,25 @@ export interface InventoryProgress {
   startedAt: string | null;
 }
 
-const count = (value: unknown): number =>
-  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+function count(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error('The inventory returned an invalid progress counter.');
+  return value;
+}
+function total(completed: unknown, active: unknown): number {
+  const result = count(completed) + count(active);
+  if (!Number.isSafeInteger(result)) throw new Error('The inventory progress total exceeds the supported integer range.');
+  return result;
+}
 
 export function parseInventoryProgress(input: unknown): InventoryProgress {
   const scan = record(input);
   return {
     processed: count(scan.processed),
-    pending: scan.pending === undefined ? null : count(scan.pending),
+    pending: scan.pending === undefined || scan.pending === null ? null : count(scan.pending),
     active: count(scan.active), workers: count(scan.workers),
-    files: count(scan.files) + count(scan.currentFiles),
-    bytes: count(scan.bytes) + count(scan.currentBytes),
+    files: total(scan.files, scan.currentFiles),
+    bytes: total(scan.bytes, scan.currentBytes),
     gaps: count(scan.gaps),
     currentPath: typeof scan.currentPath === 'string' ? scan.currentPath : null,
     startedAt: typeof scan.startedAt === 'string' && Number.isFinite(Date.parse(scan.startedAt)) ? scan.startedAt : null,

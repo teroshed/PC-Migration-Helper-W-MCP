@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { listen } from '@tauri-apps/api/event';
 import {
   ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, Check, CheckCircle2,
   ChevronLeft, ChevronRight, Clock3, Database, Download, ExternalLink,
@@ -11,13 +12,13 @@ import {
 } from 'lucide-react';
 import {
   MutationQueue, STATUSES, baseName, parentPath, parseDetails, parseDocument,
-  parseListing, parseEntry, parseView, readableBytes, record, normalizeReviewPath, isStatus, resolveDecisionPath, parseGateway, previewBranch, closePreviewBranch,
+  parseEntry, parseView, readableBytes, record, normalizeReviewPath, isStatus, resolveDecisionPath, parseGateway, previewBranch, closePreviewBranch,
 } from './model';
 import type {
   AppStatus, Boot, Decision, Details, Document, Effective, Entry, Listing,
   Operation, QueueState, ScanStatus, Status, ViewState, Volume, GatewayStatus, PreviewColumn, ReviewLayout,
 } from './model';
-import { DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, StatusBadge } from './classifications';
+import { DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
 import { DirectoryColumn, PreviewFolderColumn, RowClassificationMenu } from './FolderColumns';
 import type { RowMenuTarget } from './FolderColumns';
 import { OverflowIndicators } from './OverflowIndicators';
@@ -27,7 +28,7 @@ import { CopyQueue } from './CopyQueue';
 import { AssistanceInterview } from './Assistance';
 import { ResizeGrip, ReviewSidebar } from './ReviewLayout';
 import { FolderReadCache } from './folder-read-cache';
-import { reviewContentKey } from './read-cache';
+import { isStaleRead, reviewContentKey } from './read-cache';
 import { auditRefreshKey } from './audit-model';
 import './copy-queue.css';
 import './review-layout.css';
@@ -41,6 +42,8 @@ import { useUiBridge } from './UIBridge';
 import type { UiParticipant, UiCommand, UiRequest } from './UIBridge';
 import { inspectPending, pendingFingerprint, pendingMetadata } from './pending-inspection';
 import type { PendingSnapshot } from './pending-inspection';
+import { assertNewCloseAllowed, CloseSession } from './close-session';
+import type { CloseState } from './close-session';
 
 const EMPTY_STATUS: AppStatus = { scan: { pending: 0 }, gaps: [], decisionCount: 0 };
 const FOLLOW_PREFERENCE = 'migration-master.follow-ai';
@@ -105,6 +108,8 @@ export default function App() {
   const [showDecisionPicker, setShowDecisionPicker] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [showMcp, setShowMcp] = useState(false);
+  const [closeState, setCloseState] = useState<CloseState>({ phase: 'idle', ticket: null });
+  const [lifecycleSnapshot, setLifecycleSnapshot] = useState<Record<string, unknown> | null>(null);
   const [gatewayDetailsOpen, setGatewayDetailsOpen] = useState(false);
   const [showAssistance, setShowAssistance] = useState(false);
   const [observedRevision, setObservedRevision] = useState(0);
@@ -163,9 +168,9 @@ export default function App() {
   const keyboard = useReviewKeyboardFocus(columnStripRef);
   const breadcrumbRef = useRef<HTMLElement>(null);
   const revealPreviewDepth = useRef<number | null>(null);
-  const folderReads = useRef(new FolderReadCache());
+  const [folderReads] = useState(() => new FolderReadCache());
   const mounted = useRef(true);
-  const closeAllowed = useRef(false);
+  const closeSession = useRef<CloseSession | null>(null);
   const loadedDetailsPath = useRef<string | null>(null);
   const loadedListingContext = useRef<string | null>(null);
   const activeAuditReads = useRef(0);
@@ -175,7 +180,7 @@ export default function App() {
   const requestedFill = view?.layout?.fillDepth;
   const fillDepth = requestedFill != null && requestedFill <= (view?.previewColumns.length ?? 0)
     ? requestedFill : null;
-  const readOnly = Boolean(boot?.problem);
+  const readOnly = Boolean(boot?.problem) || closeState.phase !== 'idle';
   const audit = useAuditStatus(Boolean(boot), () => {
     if (activeAuditReads.current > 0 || Date.now() < holdMarkRowsUntil.current || isEditingField() || rowMenuRef.current || window.document.querySelector('dialog[open], [data-notifications-preview="true"]')) return false;
     setAuditDataTick(value => value + 1);
@@ -185,12 +190,17 @@ export default function App() {
   // Observe watcher/audit changes even while visible-row refresh is deferred during
   // editing. A later navigation must never reuse the superseded snapshot.
   const folderReadScope = JSON.stringify([boot?.dataPath, boot?.volumes, reviewContent,
-    dataTick, auditDataTick, refreshTick, appStatus.scan.status, appStatus.scan.processed, appStatus.scan.files, appStatus.scan.bytes, appStatus.scan.pending, appStatus.scan.error, audit.status ? auditRefreshKey(audit.status) : null, audit.problem]);
-  folderReads.current.setScope(folderReadScope);
+    dataTick, auditDataTick, refreshTick, appStatus.scan.status, appStatus.scan.error, audit.problem]);
   // A source event or missed-watcher interval requires fresh immediate metadata,
   // while hashes and decision edits only need the derived listing recomputed.
-  folderReads.current.setSourceScope(JSON.stringify([boot?.dataPath, boot?.volumes,
-    audit.status?.watcherChangeSequence, audit.status?.reconciliationRequired, audit.problem]));
+  const folderSourceScope = JSON.stringify([boot?.dataPath, boot?.volumes,
+    audit.status?.watcherChangeSequence, audit.status?.reconciliationRequired, audit.problem]);
+  useLayoutEffect(() => {
+    folderReads.configure({ derived: folderReadScope, source: folderSourceScope });
+  }, [folderReads, folderReadScope, folderSourceScope]);
+  const folderProgressScope = JSON.stringify([appStatus.scan.processed, appStatus.scan.files,
+    appStatus.scan.bytes, appStatus.scan.pending, audit.status ? auditRefreshKey(audit.status) : null]);
+  useLayoutEffect(() => { folderReads.expireValues(); }, [folderReads, folderProgressScope]);
   const folderRefreshToken = JSON.stringify([reviewContent, dataTick, auditDataTick, refreshTick, appStatus.scan.status]);
   const reviewActivity = useReviewActivity(Boolean(boot), receiveReviewActivity);
   useReviewSurface(columnStripRef, view && document ? { view, appliedRevision: document.revision, followAi, following: localFollowView.current, knownSearch, loading } : null);
@@ -555,7 +565,7 @@ export default function App() {
     const previous = context(current);
     const valid = (): boolean => stillHere() && context(viewRef.current) === previous;
     async function read(filter: string, refresh = false): Promise<Listing> {
-      return parseListing(await invoke<unknown>('list_folder', { path: folder, refresh, search: '', filter, page: 0 }));
+      return folderReads.listing({ path: folder, search: '', filter, page: 0 }, refresh);
     }
     try {
       let attention = await read('attention');
@@ -598,7 +608,7 @@ export default function App() {
       keyboard.requestFocus({ depth: targetDepth, folder, target: 'row', path: target.path });
       if (!first) setMessage('No entries need attention. Focused the first available row.');
     } catch (cause) {
-      if (valid()) report(cause);
+      if (valid() && !isStaleRead(cause)) report(cause);
     }
   }
   function openRowMenu(target: RowMenuTarget): void { rowMenuRef.current = target; setRowMenu(target); }
@@ -734,18 +744,19 @@ export default function App() {
     const force = refreshRequested.current;
     refreshRequested.current = false;
     const query = { path, search: view.search, filter: view.filter, page: view.page };
-    const cached = !force ? folderReads.current.peekListing(query) : undefined;
+    const cached = !force ? folderReads.peekListing(query) : undefined;
     if (cached) { loadedListingContext.current = contextKey; setListing(cached); setLoading(false); return; }
     if (foreground) setLoading(true);
     const timeout = setTimeout(() => {
       activeAuditReads.current += 1;
-      void folderReads.current.listing(query, force).then(result => {
+      void folderReads.listing(query, force).then(result => {
         if (!active) return;
         loadedListingContext.current = contextKey;
         setListing(result);
         setLoading(false);
       }).catch(cause => {
         if (!active) return;
+        if (isStaleRead(cause)) { setLoading(false); return; }
         if (foreground) setListing(null);
         setLoading(false);
         report(cause);
@@ -770,21 +781,40 @@ export default function App() {
   useEffect(() => {
     if (!boot) return;
     let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void getCurrentWindow().onCloseRequested(async event => {
-      if (closeAllowed.current) return;
-      flushBuffers();
-      try {
-        await queue.current?.flush();
-      } catch (cause) {
-        event.preventDefault();
+    const stops: (() => void)[] = [];
+    const session = new CloseSession({
+      status: async () => {
+        const state = record(await invoke('background_status'));
+        if (!disposed) setLifecycleSnapshot({ ...state, observedAtMs: Date.now() });
+        return { enabled: state.enabled === true, ready: state.ready === true };
+      },
+      begin: async () => {
+        const result = record(await invoke('background_begin_exit'));
+        if (typeof result.ticket !== 'number' || !Number.isSafeInteger(result.ticket) || result.ticket < 1) throw new Error('The app returned an invalid exit ticket.');
+        return result.ticket;
+      },
+      flush: async () => { flushBuffers(); await queue.current?.flush(); },
+      hide: () => invoke('background_hide'),
+      confirm: ticket => invoke('background_confirm_exit', { ticket }),
+      cancel: ticket => invoke('background_cancel_exit', { ticket }),
+    }, state => { if (!disposed) setCloseState(state); });
+    closeSession.current = session;
+    const request = (ticket?: number): void => {
+      void session.request(ticket).catch(cause => {
+        if (disposed) return;
         report(cause);
-        setMessage('The window is staying open because some edits are not saved. Retry saving before closing.');
-        return;
-      }
-      closeAllowed.current = true;
-    }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(report);
-    return () => { disposed = true; unlisten?.(); };
+        setMessage(session.snapshot().phase === 'waiting'
+          ? 'The window stays open while Exit awaits a safe checkpoint. Retry Exit or explicitly cancel it.'
+          : 'The window stays open because closing could not finish. Pending edits remain here.');
+      });
+    };
+    void getCurrentWindow().onCloseRequested(event => { event.preventDefault(); request(); })
+      .then(stop => { if (disposed) stop(); else stops.push(stop); }).catch(report);
+    void listen('background-exit-requested', event => {
+      const ticket = record(event.payload).ticket;
+      if (typeof ticket === 'number' && Number.isSafeInteger(ticket) && ticket > 0) request(ticket);
+    }).then(stop => { if (disposed) stop(); else stops.push(stop); }).catch(report);
+    return () => { disposed = true; for (const stop of stops) stop(); if (closeSession.current === session) closeSession.current = null; };
   }, [boot]);
 
   async function classify(status: Status): Promise<void> {
@@ -841,7 +871,7 @@ export default function App() {
     if (!current || loading) throw new Error('Wait for the current folder read to finish.');
     setLoading(true);
     try {
-      const next = await folderReads.current.listing({ path: current.path, search: current.search, filter: current.filter, page: current.page }, true);
+      const next = await folderReads.listing({ path: current.path, search: current.search, filter: current.filter, page: current.page }, true);
       if (viewRef.current !== current) throw new Error('The review location changed during refresh.');
       setListing(next);
       setRefreshTick(value => value + 1);
@@ -859,7 +889,7 @@ export default function App() {
     const draftNotes = Array.from(noteBuffer.current, ([path, text]) => ({ path, text }));
     const visibleText = selectedPath ? notes[selectedPath] ?? details?.decision?.notes ?? '' : '';
     return {
-      revision: documentRef.current?.revision, readOnly, followAi,
+      revision: documentRef.current?.revision, readOnly, followAi, close: { ...closeState, nativeAtRequest: lifecycleSnapshot },
       panels: { gaps: showGaps, history: showHistory, decision: showDecisionPicker, context: showContext,
         gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict },
       rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || saveState.saving || Boolean(rowMenu.entry.problem) } : null,
@@ -904,6 +934,28 @@ export default function App() {
   async function executeUi(command: UiCommand, request: UiRequest): Promise<unknown> {
     const action = command.action;
     if (action === 'listPending' || action === 'readPendingText') return inspectPending(readPendingSource, command);
+    if (['closeWindow', 'exitApp', 'retryExit', 'cancelExit'].includes(action)) {
+      const session = closeSession.current;
+      if (!session) throw new Error('The close workflow is not ready. Wait for the saved session to load.');
+      if (action === 'closeWindow' || action === 'exitApp') {
+        if (session.snapshot().phase !== 'idle') throw new Error('Exit is already pending. Inspect its ticket and use Retry Exit or Cancel Exit.');
+        const native = record(await invoke('background_status'));
+        assertNewCloseAllowed(session.snapshot(), native);
+      }
+      if (action === 'closeWindow') { await session.request(); return; }
+      if (action === 'exitApp') {
+        const pending = record(await invoke('background_begin_exit'));
+        if (typeof pending.ticket !== 'number' || !Number.isSafeInteger(pending.ticket) || pending.ticket < 1) throw new Error('The app returned an invalid exit ticket.');
+        await session.request(pending.ticket); return;
+      }
+      const native = record(await invoke('background_status'));
+      const current = session.snapshot();
+      if (command.expectedExitTicket !== current.ticket || command.expectedExitTicket !== record(native.pending).ticket || current.phase !== 'waiting') throw new Error('This exit ticket or phase changed. Inspect the current close state before continuing.');
+      if (action === 'cancelExit') { await session.cancel(); setError(null); setMessage('Exit canceled. You can continue reviewing.'); }
+      else await session.request();
+      return;
+    }
+    if (closeState.phase !== 'idle' && action !== 'dismissFeedback') throw new Error('The app is finishing Exit. Pending work remains inspectable; wait or cancel Exit before changing controls.');
     const retainedWorkflow = ['compareConflict', 'retryReviewed', 'retryPending', 'flushPending', 'closePanels', 'dismissFeedback'].includes(action) || action === 'openPanel' && command.panel === 'conflict';
     if (!retainedWorkflow && request.expectedRevision !== documentRef.current?.revision) throw new Error('The displayed revision changed before this UI command could apply. Read the current UI state again.');
     if (action === 'setFollowAI') { changeFollowAi(command.enabled === true); return; }
@@ -1004,7 +1056,16 @@ export default function App() {
   const classificationUnavailable = readOnly || !selectedPath || detailsLoading || !details || details.exists === false || saveState.saving;
   const manualContext = effective.status === 'manual-pending' ? 'Manual backup pending · confirm after copying'
     : effective.status === 'manual-confirmed' ? 'Your manual-backup confirmation · checksum verification separate' : null;
-  const contextSummary = details?.exists === false ? 'Missing or unavailable · notes retained' : effective.stale ? 'Source changed · review again' : effective.inheritedFrom && effective.originalStatus === 'on-external' ? 'Parent’s F: assertion does not cover this child' : effective.inheritedFrom && effective.originalStatus === 'manual-confirmed' ? 'Parent’s manual confirmation · review this child' : manualContext ?? (effective.inheritedFrom ? 'Inherited decision · child override available' : effective.mixed > 0 ? `${effective.mixed} child exceptions · mixed decisions` : effective.status === 'on-external' ? 'Manual F: assertion · completeness unverified' : 'Decisions only · source files stay untouched');
+  const incompleteRollup = effective.rollup?.kind === 'unknown' && !effective.rollup.coverage?.complete;
+  const contextSummary = details?.exists === false ? 'Missing or unavailable · notes retained'
+    : effective.stale ? 'Source changed · review again'
+    : effective.rollup ? reviewStatusLabel(effective)
+    : effective.inheritedFrom && effective.originalStatus === 'on-external' ? 'Parent’s F: assertion does not cover this child'
+    : effective.inheritedFrom && effective.originalStatus === 'manual-confirmed' ? 'Parent’s manual confirmation · review this child'
+    : manualContext ?? (effective.inheritedFrom ? 'Inherited decision · child override available'
+      : effective.mixed > 0 ? `${effective.mixed} child exceptions · mixed decisions`
+      : effective.status === 'on-external' ? 'Manual F: assertion · completeness unverified'
+      : 'Decisions only · source files stay untouched');
   const pathSuggestions = Array.isArray(document.suggestions) ? document.suggestions.flatMap(value => {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
     const suggestion = record(value);
@@ -1052,9 +1113,9 @@ export default function App() {
       <span className="review-only"><ShieldCheck size={15}/>Decision journal · read-only source browsing</span>
       <button className={`mcp-status mcp-${gateway.state}`} aria-haspopup="dialog" onClick={() => setShowMcp(true)} title="Inspect the local MCP gateway; readiness is separate from a Codex connection"><Link2 size={15}/><span>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'MCP needs attention' : 'MCP unavailable'}</span></button>
       <label className="follow-ai-control" title="Reveal folders and files as the agent touches them. Only you can turn this on or off."><input type="checkbox" aria-label="Follow AI’s movement" checked={followAi} onChange={event => changeFollowAi(event.target.checked)}/><span>Follow AI’s movement</span></label>
-      <div className={`save-indicator ${saveError || readOnly ? 'save-error' : ''}`} role="status" aria-live="polite">
-        {saveError || readOnly ? <TriangleAlert size={16}/> : saving ? <LoaderCircle size={16} className="spin"/> : <CheckCircle2 size={16}/>}
-        <span>{saveError ? 'Not saved' : readOnly ? 'Recovery needed' : saving ? 'Saving…' : boot.fixture ? 'Saved in test fixture' : 'Saved locally'}</span>
+      <div className={`save-indicator ${saveError || boot.problem ? 'save-error' : ''}`} role="status" aria-live="polite">
+        {saveError || boot.problem ? <TriangleAlert size={16}/> : saving || closeState.phase !== 'idle' ? <LoaderCircle size={16} className="spin"/> : <CheckCircle2 size={16}/>}
+        <span>{closeState.phase === 'waiting' ? 'Exit waiting' : closeState.phase === 'stopping' ? 'Finishing safe checkpoint…' : closeState.phase !== 'idle' ? 'Saving before close…' : saveError ? 'Not saved' : boot.problem ? 'Recovery needed' : saving ? 'Saving…' : boot.fixture ? 'Saved in test fixture' : 'Saved locally'}</span>
       </div>
       <NotificationBell enabled={Boolean(boot)} unread={audit.status?.notificationsUnread ?? 0} volumes={boot.volumes} onNavigate={navigate} onReadStateChanged={audit.refresh} onError={report} controlRef={notificationControl}/>
     </header>
@@ -1078,6 +1139,12 @@ export default function App() {
     </ReviewSidebar>
     <main className="workspace">
       <CopyQueue revision={document.revision} enabled={!readOnly} controlRef={copyControl} onNativeWrite={runNativeWrite}/>
+      {closeState.phase !== 'idle' && <div className="recovery-banner" role="status"><LoaderCircle size={20} className="spin"/><div>
+        <strong>{closeState.phase === 'waiting' ? 'Exit is waiting for a safe checkpoint' : 'Finishing before closing'}</strong>
+        <p>Pending edits stay in this window until saved. Exit stops background work at a safe checkpoint.</p>
+        {closeState.phase === 'waiting' && <><button onClick={() => { void closeSession.current?.request().catch(report); }}>Retry Exit</button>
+          <button onClick={() => { void closeSession.current?.cancel().then(() => { setError(null); setMessage('Exit canceled. You can continue reviewing.'); }).catch(report); }}>Cancel Exit</button></>}
+      </div></div>}
       <div className="backup-reminder"><Info size={16}/><span><strong>Review journal.</strong> Include migration_master_data.json in your external backup.</span></div>
       {boot.problem && <div className="recovery-banner" role="alert"><TriangleAlert size={20}/><div><strong>Saved data needs recovery</strong><p>{boot.problem}</p>{boot.recoveryAvailable && <button onClick={() => { void invoke<unknown>('recover').then(parseDocument).then(doc => { setDocument(doc); documentRef.current = doc; setView(doc.view); viewRef.current = doc.view; setBoot({ ...boot, document: doc, problem: null }); queue.current = new MutationQueue(doc, (revision, operationId, operation) => invoke('mutate', { expectedRevision: revision, operationId, operation }), receiveDocument); setDataTick(v => v + 1); setMessage('Recovered the last-known-good copy. The malformed original was preserved separately.'); }).catch(report); }}>Recover last-known-good copy</button>}</div></div>}
       {visibleError && <div className="error-banner" role="alert"><TriangleAlert size={17}/><span>{visibleError}{revisionConflict && <small>Your pending edits remain in this window. A newer saved version is protected; nothing will be reapplied automatically.</small>}</span>{revisionConflict ? <button onClick={openConflictReview}>Review conflict</button> : saveError ? <button onClick={() => queue.current?.retry()}>Retry saving</button> : <button aria-label="Dismiss error" onClick={() => setError(null)}><X size={16}/></button>}</div>}
@@ -1127,7 +1194,7 @@ export default function App() {
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
           <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
           {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>The folder arrow previews its contents here. Keep opening arrows for more columns.</p><p>Folder names open the main location. Right-click or use ⋯ to mark a decision.</p></div>}
-          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} cache={folderReads.current} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
+          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} cache={folderReads} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
         </div>
         <OverflowIndicators targetRef={columnStripRef} axis="horizontal" refreshKey={view.previewColumns}/>
         {fillDepth !== null && <button ref={restoreColumnsRef} className="review-restore-columns"
@@ -1148,7 +1215,7 @@ export default function App() {
         <div className="selected-title"><div className="selected-icon">{selectedEntry?.kind === 'file' ? <File size={26}/> : selectedEntry?.kind === 'link' ? <Link2 size={26}/> : <Folder size={26}/>}</div><div><h2 title={selectedPath ?? ''}>{selectedPath ? baseName(selectedPath) : 'Select a folder'}</h2><p title={selectedPath ?? ''}>{selectedPath}</p></div></div>
         <div className="review-location-row">{selectedPath === view.path ? <span>Reviewing this folder itself</span> : <button className="text-button" onClick={() => updateView({ selectedPath: null }, true)}><ArrowLeft size={13}/>Review this folder instead</button>}{detailsLoading && <LoaderCircle size={13} className="spin" aria-label="Reading decision"/>}</div>
         <button className={`decision-picker-trigger status-${effective.status}`} aria-haspopup="dialog" aria-expanded={showDecisionPicker} disabled={classificationUnavailable} onClick={() => setShowDecisionPicker(true)}><ActiveIcon size={20}/><span><strong>{LABELS[effective.status]}{effective.status === 'migrate-now' ? ' · pending' : ''}</strong><small>Change decision · eight color-coded options</small></span><ChevronRight size={17}/></button>
-        <button className={`context-summary ${details?.exists === false || effective.stale ? 'warning' : ''}`} onClick={() => setShowContext(true)} title={contextSummary}><Info size={14}/><span>{contextSummary}</span><ChevronRight size={13}/></button>
+        <button className={`context-summary ${details?.exists === false || effective.stale || incompleteRollup ? 'warning' : ''}`} onClick={() => setShowContext(true)} title={contextSummary}><Info size={14}/><span>{contextSummary}</span><ChevronRight size={13}/></button>
         <div className="notes-section"><label className="notes-label" htmlFor="decision-notes">Notes <span>autosaved</span></label><textarea id="decision-notes" disabled={readOnly || !selectedPath || detailsLoading} placeholder="Exclusions, destination, exports needed…" value={noteText} onChange={event => { if (!selectedPath) return; const text = event.target.value; setNotes(current => ({ ...current, [selectedPath]: text })); noteBuffer.current.set(selectedPath, text); scheduleFlush(); }} rows={2}/></div>
         <div className="detail-actions"><button onClick={() => setShowContext(true)} title={pathSuggestions.length ? `${pathSuggestions.length} assistant proposals; separate from your decisions` : 'Review context and child exceptions'}><ListFilter size={14}/><span>Context{effective.mixed ? ` · ${effective.mixed}` : pathSuggestions.length ? ` · ${pathSuggestions.length} proposals` : ''}</span></button><button onClick={() => setShowHistory(true)}><History size={14}/><span>History</span></button></div>
         <p className="compact-safety">{effective.status === 'manual-pending'
@@ -1169,7 +1236,7 @@ export default function App() {
     {showMcp && <Modal title="Local MCP gateway" compact onClose={() => setShowMcp(false)}><div className={`mcp-state-line mcp-${gateway.state}`}><Link2 size={19}/><strong>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'Gateway needs attention' : 'Gateway unavailable'}</strong></div><p className="modal-intro">Keep the native app open while using an MCP client. This indicator shows the local gateway’s readiness.</p>{gateway.problem && <div className="context-box warning"><TriangleAlert size={16}/><p>{gateway.problem}</p></div>}{gateway.endpoint && <label className="gateway-endpoint">Local endpoint<input aria-label="Local MCP gateway endpoint" readOnly value={gateway.endpoint}/></label>}<p className="modal-intro gateway-instructions">Register the included local stdio server with your MCP client. The bridge shares the app’s saved decisions and revision checks. Agent proposals remain separate from decisions; accepted edits retain their provenance.</p><details className="gateway-diagnostics" open={gatewayDetailsOpen} onToggle={event => setGatewayDetailsOpen(event.currentTarget.open)}><summary>Session details</summary>{gateway.startedAt && <p>Gateway started: {new Date(gateway.startedAt).toLocaleString()}</p>}{gateway.instanceId && <p>Instance: {gateway.instanceId}</p>}<p>Authentication credentials are never displayed here.</p></details></Modal>}
     {showConflict && <Modal title="Saved-state conflict" onClose={closeConflictReview}><p className="modal-intro">Another reviewer saved a newer version while your edit was pending. The newer file was not overwritten. Your pending requests below remain in this window and will not be replayed automatically. Compare both versions, then explicitly choose whether to apply your pending edits to the displayed revision.</p><div className="context-box warning"><TriangleAlert size={17}/><p>Keep this window open while resolving the conflict. Pending edits are still held in memory. You can select and copy this text to preserve a separate record before any manual recovery.</p></div><p className="conflict-revisions">This window last acknowledged revision {queue.current?.revision ?? document.revision}.{externalDocument ? ` The newer saved version is revision ${externalDocument.revision}.` : ' The latest saved revision will be read on the next status check.'}</p><label className="conflict-draft-label">Retained pending requests<textarea aria-label="Retained pending requests" readOnly value={JSON.stringify(queue.current?.retainedOperations ?? [], null, 2)}/></label>{externalDocument && <div className="conflict-saved-summary"><h3>Newer saved decisions for pending paths</h3>{Array.from(new Set((queue.current?.retainedOperations ?? []).flatMap(operation => 'path' in operation ? [operation.path] : []))).map(path => { const decision = Object.values(externalDocument.decisions).find(decision => resolveDecisionPath(decision, boot.volumes).path?.toLowerCase() === path.toLowerCase()); return <article key={path}><strong>{path}</strong><p>{decision ? LABELS[decision.status] : 'No explicit saved decision'}</p>{decision?.notes && <p>{decision.notes}</p>}</article>; })}</div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'view') && <div className="conflict-saved-summary"><h3>Saved review position in this revision</h3><p>{externalDocument.view.path}</p><p>Selection: {externalDocument.view.selectedPath ?? 'folder itself'} · filter: {externalDocument.view.filter} · search: {externalDocument.view.search || '(empty)'}</p></div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') && <ReviewedUndoTarget document={externalDocument}/>}<div className="conflict-recovery-actions"><button disabled={conflictLoading || !queue.current?.state.error} onClick={() => void loadConflictComparison()}><RefreshCw size={14}/>{conflictLoading ? 'Reading saved version…' : 'Refresh comparison'}</button><button className="primary" disabled={conflictLoading || !externalDocument || !queue.current?.state.error || (externalDocument?.revision ?? 0) < (queue.current?.revision ?? 0)} onClick={() => { void applyReviewedPending().catch(() => {}); }}>Apply my pending edits{(queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') ? ' + reviewed Undo' : ''} to revision {externalDocument?.revision ?? '…'}</button></div>{conflictProblem && <div className="context-box warning" role="alert"><TriangleAlert size={17}/><p>{conflictProblem}</p></div>}<p className="modal-intro conflict-footnote">Applying uses the displayed revision and the original request identifiers. Unrelated saved fields stay intact. For fields changed in both versions, this action deliberately chooses your pending edit. If the saved file changes again, the revision check stops the edit for another review.</p><p className="modal-intro">No pending request is discarded and no revision fence is bypassed by closing this panel.</p></Modal>}
     {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{STATUSES.map(status => { const Icon = ICONS[status]; const isSelected = effective.own && effective.status === status; return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); void classify(status); }}><Icon size={18}/><span><strong>{LABELS[status]}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
-    {showContext && <Modal title="Review context & exceptions" onClose={() => setShowContext(false)}><p className="context-path">{selectedPath}</p><StatusBadge effective={effective}/><AuditDetails stats={details?.audit ?? selectedEntry?.audit} logicalFallback={selectedEntry?.kind === 'file' ? selectedEntry.size : undefined}/>{agentDecision && <div className="context-box"><Link2 size={16}/><div><p>Saved through MCP by {typeof activeProvenance?.actor === 'string' ? activeProvenance.actor : 'an agent'}{typeof activeProvenance?.at === 'string' ? ` · ${new Date(activeProvenance.at).toLocaleString()}` : ''}.</p>{typeof activeProvenance?.reason === 'string' && <p>{activeProvenance.reason}</p>}</div></div>}{pathSuggestions.length > 0 && <section className="assistant-proposals"><h3>Assistant proposals · not applied</h3><p>Suggestions are separate from saved decisions. No proposal below changes a classification.</p>{pathSuggestions.map(suggestion => <article key={suggestion.id}><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: suggestion.status }}/><p>{suggestion.reason}</p><small>{suggestion.actor} · MCP suggestion{suggestion.createdAt ? ` · ${new Date(suggestion.createdAt).toLocaleString()}` : ''}</small></article>)}</section>}{effective.inheritedFrom && <div className="context-box"><Info size={16}/>{effective.originalStatus === 'on-external' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has a manual F: assertion. This child needs its own review. Backup assertions are not inherited.</p> : effective.originalStatus === 'manual-confirmed' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has your manual-backup confirmation for that path. Review this child separately.</p> : <p>Inherited from <strong>{effective.inheritedFrom}</strong>. Choosing a decision creates a specific child exception.</p>}</div>}{effective.stale && <div className="context-box warning"><TriangleAlert size={16}/><p>Source metadata changed or new content was discovered after the decision. Review it again. The earlier claim remains in history.</p></div>}{details && !details.exists && <div className="context-box warning"><TriangleAlert size={16}/><p>This path is missing or unavailable. Its saved decision is retained. You can edit notes; classification is unavailable until the path can be read again.</p></div>}{selectedPath !== view.path && !selectedEntry && !loading && <p className="modal-intro">The selected path is outside the current page or filter. Its decision remains open.</p>}{activeDecision?.decidedAt && <p className="decision-date">Decision recorded {new Date(activeDecision.decidedAt).toLocaleString()}</p>}<div className="evidence-note"><ShieldCheck size={18}/><p>Manual marks record your pending copy or your confirmation. Source checksums, destination-copy receipts and restore checks provide separate evidence. The green Already on F: mark retains your manual F: assertion.</p></div>{details && details.overrides.length > 0 ? <div className="overrides"><h3>Specific child decisions · {details.overrides.length} recorded</h3>{details.overrides.map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <div key={`${decision.path}-${index}`}><button disabled={!location.path} title={decision.path} onClick={() => { if (!location.path) return; setShowContext(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}><span className={`decision-dot status-${decision.status}`}/><span>{decision.path}</span><ChevronRight size={13}/></button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}</div>; })}</div> : <p className="modal-intro context-empty">No specific child exceptions are recorded for this path.</p>}</Modal>}
+    {showContext && <Modal title="Review context & exceptions" onClose={() => setShowContext(false)}><p className="context-path">{selectedPath}</p><StatusBadge effective={effective}/><RollupCoverageDetails effective={effective}/><AuditDetails stats={details?.audit ?? selectedEntry?.audit} logicalFallback={selectedEntry?.kind === 'file' ? selectedEntry.size : undefined}/>{agentDecision && <div className="context-box"><Link2 size={16}/><div><p>Saved through MCP by {typeof activeProvenance?.actor === 'string' ? activeProvenance.actor : 'an agent'}{typeof activeProvenance?.at === 'string' ? ` · ${new Date(activeProvenance.at).toLocaleString()}` : ''}.</p>{typeof activeProvenance?.reason === 'string' && <p>{activeProvenance.reason}</p>}</div></div>}{pathSuggestions.length > 0 && <section className="assistant-proposals"><h3>Assistant proposals · not applied</h3><p>Suggestions are separate from saved decisions. No proposal below changes a classification.</p>{pathSuggestions.map(suggestion => <article key={suggestion.id}><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: suggestion.status }}/><p>{suggestion.reason}</p><small>{suggestion.actor} · MCP suggestion{suggestion.createdAt ? ` · ${new Date(suggestion.createdAt).toLocaleString()}` : ''}</small></article>)}</section>}{effective.inheritedFrom && <div className="context-box"><Info size={16}/>{effective.originalStatus === 'on-external' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has a manual F: assertion. This child needs its own review. Backup assertions are not inherited.</p> : effective.originalStatus === 'manual-confirmed' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has your manual-backup confirmation for that path. Review this child separately.</p> : <p>Inherited from <strong>{effective.inheritedFrom}</strong>. Choosing a decision creates a specific child exception.</p>}</div>}{effective.stale && <div className="context-box warning"><TriangleAlert size={16}/><p>Source metadata changed or new content was discovered after the decision. Review it again. The earlier claim remains in history.</p></div>}{details && !details.exists && <div className="context-box warning"><TriangleAlert size={16}/><p>This path is missing or unavailable. Its saved decision is retained. You can edit notes; classification is unavailable until the path can be read again.</p></div>}{selectedPath !== view.path && !selectedEntry && !loading && <p className="modal-intro">The selected path is outside the current page or filter. Its decision remains open.</p>}{activeDecision?.decidedAt && <p className="decision-date">Decision recorded {new Date(activeDecision.decidedAt).toLocaleString()}</p>}<div className="evidence-note"><ShieldCheck size={18}/><p>Manual marks record your pending copy or your confirmation. Source checksums, destination-copy receipts and restore checks provide separate evidence. The green Already on F: mark retains your manual F: assertion.</p></div>{details && details.overrides.length > 0 ? <div className="overrides"><h3>Specific child decisions · {details.overrides.length} recorded</h3>{details.overrides.map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <div key={`${decision.path}-${index}`}><button disabled={!location.path} title={decision.path} onClick={() => { if (!location.path) return; setShowContext(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}><span className={`decision-dot status-${decision.status}`}/><span>{decision.path}</span><ChevronRight size={13}/></button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}</div>; })}</div> : <p className="modal-intro context-empty">No specific child exceptions are recorded for this path.</p>}</Modal>}
     {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>This optional index discovers folder names for navigation. The Count & hash controls run the full allocation and source checksum audit.</p><div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued</p><p className="modal-intro">Protected paths, failed reads and links are recorded here. No ownership or permissions are changed. This shows the latest 200 gaps; the inventory may discover more.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
     {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}
     {showSaved && <Modal title="Saved decisions & notes" onClose={() => setShowSaved(false)}><p className="modal-intro">Every saved record remains here, including paths that were moved, removed or belong to a previous volume. Availability is checked when you open a path. A previous disk’s decision is never applied to a different disk using the same drive letter.</p><div className="saved-tools"><input aria-label="Search saved decisions and notes" placeholder="Search saved paths and notes…" value={savedSearch} onChange={event => { setSavedSearch(event.target.value); setSavedPage(0); }}/><select aria-label="Filter saved records" value={savedFilter} onChange={event => { setSavedFilter(event.target.value); setSavedPage(0); }}><option value="all">All saved records</option>{STATUSES.map(status => <option value={status} key={status}>{LABELS[status]}</option>)}</select></div><p className="saved-result-count">{savedDecisions.length.toLocaleString()} matching saved records · current availability not yet checked</p>{savedDecisions.slice(savedPage * 100, (savedPage + 1) * 100).map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <article className="saved-record" key={`${decision.path}-${index}`}><div><strong>{decision.path}</strong><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: decision.status, own: true }}/>{decision.noteOnly === true && <small>Note only · classification not set</small>}{decision.notes && <p>{decision.notes}</p>}{decision.decidedAt && <small>Recorded {new Date(decision.decidedAt).toLocaleString()}</small>}</div><div className="saved-review-action"><button disabled={!location.path} onClick={() => { if (!location.path) return; setShowSaved(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}>Review path</button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}{location.path && location.path.toLowerCase() !== decision.path.toLowerCase() && <small>Current location: {location.path}</small>}</div></article>; })}{!savedDecisions.length && <div className="empty-state"><Database size={28}/><h3>No matching saved records</h3><p>New decisions and notes are captured as you review folders.</p></div>}<div className="saved-pagination"><button disabled={savedPage === 0} onClick={() => setSavedPage(page => page - 1)}>Previous 100</button><span>Page {savedPage + 1} / {Math.max(1, Math.ceil(savedDecisions.length / 100))}</span><button disabled={(savedPage + 1) * 100 >= savedDecisions.length} onClick={() => setSavedPage(page => page + 1)}>Next 100</button></div></Modal>}
