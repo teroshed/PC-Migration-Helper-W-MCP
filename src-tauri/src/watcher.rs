@@ -107,12 +107,27 @@ pub struct WatchHandle {
     threads: Vec<JoinHandle<()>>,
     dispatcher: Option<JoinHandle<()>>,
 }
+impl WatchHandle {
+    pub fn request_stop(&self) {
+        if !self.stopped.swap(true, Ordering::SeqCst) {
+            unsafe { SetEvent(self.stop.as_raw_handle()) };
+        }
+    }
+
+    /// Drain queued events only after all directory readers have stopped.
+    /// Unlike Drop, this does not wait for an operating-system or database call.
+    pub fn stop_finished(&self) -> bool {
+        self.request_stop();
+        if self.threads.iter().any(|thread| !thread.is_finished()) {
+            return false;
+        }
+        self.dispatcher_stopped.store(true, Ordering::SeqCst);
+        self.dispatcher.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
 impl Drop for WatchHandle {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        unsafe {
-            SetEvent(self.stop.as_raw_handle());
-        }
+        self.request_stop();
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }

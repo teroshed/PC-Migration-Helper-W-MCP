@@ -110,6 +110,9 @@ pub fn cancel_exit(s: &AppState, ticket: u64) -> Result<(), String> {
         return Err("This exit confirmation is no longer current.".into());
     }
     if guard.watcher_stopped {
+        if !join_stopped_watcher(s)? {
+            return Err("Source monitoring is still finishing its last observations. Wait before cancelling Exit; new work remains blocked.".into());
+        }
         crate::ensure_watcher(s);
     }
     guard.watcher_stopped = false;
@@ -117,6 +120,19 @@ pub fn cancel_exit(s: &AppState, ticket: u64) -> Result<(), String> {
     guard.pending = None;
     guard.exit_problem = None;
     Ok(())
+}
+fn join_stopped_watcher(s: &AppState) -> Result<bool, String> {
+    let mut watcher = s.watcher.lock().map_err(error)?;
+    if watcher
+        .as_ref()
+        .is_some_and(|handle| !handle.stop_finished())
+    {
+        return Ok(false);
+    }
+    let finished = watcher.take();
+    drop(watcher);
+    drop(finished);
+    Ok(true)
 }
 pub fn show(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
@@ -287,14 +303,19 @@ pub fn drain_exit(
         s.copy_queue.join_stopped()?;
         // Join watcher dispatch before checkpointing; it writes derived audit
         // observations independently of the inventory/hash coordinators.
-        let watcher = s.watcher.lock().map_err(error)?.take();
-        if watcher.is_some() {
-            {
-                let mut guard = s.background.session.lock().map_err(error)?;
+        {
+            let mut guard = s.background.session.lock().map_err(error)?;
+            if let Some(watcher) = s.watcher.lock().map_err(error)?.as_ref() {
                 guard.watcher_stopped = true;
                 guard.watcher_gap_pending = true;
+                watcher.request_stop();
             }
-            drop(watcher);
+        }
+        while !join_stopped_watcher(s)? {
+            if std::time::Instant::now() >= deadline {
+                return Err("Source monitoring is still finishing its last observations. The app has not exited; new work remains blocked. Retry Exit once monitoring stops.".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let fault_pending = s.watcher_fault.lock().map_err(error)?.is_some();
         let watcher_gap_pending = s
@@ -491,6 +512,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn watcher_dispatch_obeys_exit_budget_and_retries_before_checkpoint() {
+        use std::{
+            fs,
+            path::Path,
+            sync::{mpsc, Arc},
+            time::Duration,
+        };
+
+        let s = crate::tests::fixture();
+        let root = &s.volumes[0].root;
+        let (entered, observed) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let once = Mutex::new(Some(waiting));
+        let audit = s.audit.clone();
+        let watcher = crate::watcher::start(
+            vec![root.clone()],
+            Vec::new(),
+            Arc::new(move |event| {
+                if let crate::watcher::WatchEvent::Changed { path, kind, .. } = event {
+                    if let Some(waiting) = once.lock().unwrap().take() {
+                        let _ = entered.send(());
+                        if waiting.recv_timeout(Duration::from_secs(5)).is_ok() {
+                            audit.record_watch_change(&path, kind.as_str()).unwrap();
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        *s.watcher.lock().unwrap() = Some(watcher);
+        let path = Path::new(root).join("watcher-drain.txt");
+        let before = crate::store::now();
+        fs::write(&path, b"synthetic watcher fixture").unwrap();
+        observed.recv_timeout(Duration::from_secs(4)).unwrap();
+
+        let ticket = begin_exit(&s).unwrap()["ticket"].as_u64().unwrap();
+        let error = drain_exit(&s, ticket, Duration::from_millis(35)).unwrap_err();
+        assert!(error.contains("monitoring is still finishing"), "{error}");
+        assert_eq!(status(&s).unwrap()["pending"]["ticket"], ticket);
+        assert!(cancel_exit(&s, ticket).is_err());
+        assert!(s.background.observe().is_err());
+        release.send(()).unwrap();
+        assert_eq!(
+            drain_exit(&s, ticket, Duration::from_secs(3)).unwrap()["readyToExit"],
+            true
+        );
+        assert!(s.watcher.lock().unwrap().is_none());
+        assert!(s
+            .audit
+            .changed_below(&path.to_string_lossy(), &before)
+            .unwrap());
+        let notices = s.audit.notifications(20, 0).unwrap();
+        let notices = notices["items"].as_array().unwrap();
+        assert!(notices.iter().any(|item| item["kind"] == "source-change"));
+        assert!(notices.iter().any(|item| item["kind"] == "coverage-gap"));
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic watcher fixture");
     }
 
     #[test]
