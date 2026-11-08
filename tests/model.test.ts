@@ -2,12 +2,69 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MutationQueue, parseDocument, parentPath, normalizeReviewPath, parseEffective, parseGateway, previewBranch, closePreviewBranch } from '../src/model.ts';
 import type { Document, Operation } from '../src/model.ts';
+import { changeSelection, latestUndoEvent, loadSelection, reportSelectionTarget, replaceSelection,
+  resolvedSelection, rootForSelection, savedGroup, selectedFoldersWithDescendants, selectedFor,
+  selectionKey, selectionSignature, selectionTarget } from '../src/review-selection.ts';
 import { inspectPending, pendingFingerprint, pendingJSON, pendingMetadata, textChunk, textHash } from '../src/pending-inspection.ts';
 import type { PendingSnapshot } from '../src/pending-inspection.ts';
 
 function doc(revision = 1): Document {
   return parseDocument({ schemaVersion: 1, revision, history: [], decisions: {}, futureField: { preserved: true }, view: { path: 'E:\\', selectedPath: null, search: '', filter: 'all', page: 0, scrollTop: 0, recentPaths: [] } });
 }
+
+test('selection uses volume identity across locations, filters and alternate path casing', () => {
+  const volume = { root: 'E:\\Fixture', id: 'volume-a', label: 'Synthetic', available: true, problem: null };
+  const other = { ...volume, root: 'F:\\', id: 'volume-b' };
+  assert.equal(rootForSelection('E:\\Fixture\\Nested', [volume, other]), volume);
+  assert.equal(rootForSelection('E:\\FixtureOther', [volume, other]), undefined);
+  const file = selectionTarget({ path: 'E:/Fixture/Nested/Test.txt', kind: 'file', fingerprint: 'first', problem: null }, volume)!;
+  assert.deepEqual(file, { path: 'E:\\Fixture\\Nested\\Test.txt', volumeId: 'volume-a', relativePath: 'Nested\\Test.txt', kind: 'file', fingerprint: 'first' });
+  const differentCase = { ...file, relativePath: 'nested\\test.TXT', path: 'E:\\fixture\\nested\\test.TXT' };
+  assert.equal(selectionKey(file), selectionKey(differentCase));
+  const selected = changeSelection([], file);
+  assert.deepEqual(changeSelection(selected, differentCase), []);
+  const sets = replaceSelection(replaceSelection(new Map(), other.id, [{ ...file, volumeId: other.id }]), volume.id, selected);
+  const restored = loadSelection(JSON.stringify(Object.fromEntries(sets)));
+  assert.deepEqual(selectedFor(restored, volume.id), selected);
+  assert.equal(selectedFor(restored, other.id).length, 1);
+  assert.deepEqual(resolvedSelection(selected, other), []);
+  assert.equal(resolvedSelection(selected, { ...volume, root: 'G:\\' })[0]?.path, 'G:\\Nested\\Test.txt');
+  assert.equal(selectionTarget({ ...file, kind: 'link', problem: null }, volume), undefined);
+  assert.equal(selectionTarget({ ...file, path: 'E:\\Fixture\\..\\Test.txt', problem: null }, volume), undefined);
+});
+
+test('selection snapshots bound the target count and preserve reviewed fingerprints and ancestry', () => {
+  const target = { volumeId: 'volume-a', kind: 'file' as const, path: 'E:\\Parent\\a', relativePath: 'Parent\\a', fingerprint: 'first' };
+  const parent = { ...target, kind: 'folder' as const, path: 'E:\\Parent', relativePath: 'Parent' };
+  const sibling = { ...parent, path: 'E:\\ParentElse', relativePath: 'ParentElse' };
+  const targets = [target, parent, sibling];
+  assert.deepEqual([...selectedFoldersWithDescendants(targets)], ['volume-a|parent']);
+  const signature = selectionSignature(target.volumeId, targets);
+  assert.equal(selectionSignature(target.volumeId, [...targets].reverse()), signature);
+  assert.notEqual(selectionSignature(target.volumeId, changeSelection(targets, { ...target, fingerprint: 'changed' }, true)), signature);
+  const atLimit = Array.from({ length: 128 }, (_, index) => ({ ...target, relativePath: 'f-' + index }));
+  assert.throws(() => changeSelection(atLimit, target), /128/);
+  const long = { ...target, path: 'E:\\' + '🙂'.repeat(520) };
+  assert.deepEqual(reportSelectionTarget(long), { volumeId: 'volume-a', kind: 'file', fingerprint: 'first',
+    path: null, relativePath: null, pathOmitted: true });
+  assert.ok(long.path.endsWith('🙂'));
+});
+
+test('schema two preserves exact group history and never treats note-only as a restored mark', () => {
+  const target = { volumeId: 'volume-a', relativePath: 'leaf', kind: 'file', path: 'E:\\leaf', fingerprint: 'current' };
+  const first = { id: 'earlier', type: 'classify' };
+  const group = { id: 'reviewed-group', type: 'bulkClassify', memberCount: 1,
+    members: [{ key: 'volume-a|leaf', target, before: { status: 'attention', noteOnly: true }, after: { status: 'manual-pending' } }] };
+  const document = parseDocument({ ...doc(), schemaVersion: 2, history: [first, group] });
+  assert.equal(document.schemaVersion, 2);
+  assert.deepEqual(latestUndoEvent(document), group);
+  assert.deepEqual(savedGroup(group), { id: 'reviewed-group', memberCount: 1,
+    members: [{ target, before: null, after: 'manual-pending' }] });
+  assert.equal(savedGroup({ ...group, memberCount: 2 }), null);
+  assert.equal(savedGroup({ ...group, undoneAt: 'fixture' }), null);
+  assert.deepEqual(latestUndoEvent({ ...document, history: [first, { ...group, undoneAt: 'fixture' }] }), first);
+  assert.throws(() => parseDocument({ ...document, schemaVersion: 3 }), /Unsupported/);
+});
 
 test('folder rollups preserve zero-entry coverage gaps without becoming saved marks', () => {
   const result = parseEffective({
@@ -104,7 +161,21 @@ test('uncertain native revision reconciliation retains queued edits without repl
   await assert.rejects(queue.flush(), /needs reconciliation/);
   assert.equal(queue.retainedRequests.length, 1);
   assert.deepEqual(revisions, []);
+  assert.equal(queue.reconcileExternal(doc(5)), false);
   assert.throws(() => queue.holdForExternal(), /Finish pending/);
+});
+test('a reread resolves an empty writer after a lost group acknowledgement', async () => {
+  const queue = new MutationQueue(doc(4), async () => { throw new Error('No mutation was expected.'); }, () => undefined);
+  queue.holdForExternal();
+  queue.failExternal('Acknowledgement and journal reread unavailable');
+  assert.equal(queue.needsExternalReconciliation, true);
+  assert.equal(queue.reconcileExternal(doc(3)), false);
+  const recovered = { ...doc(5), schemaVersion: 2, history: [{ id: 'reviewed-group', type: 'bulkClassify' }] };
+  assert.equal(queue.reconcileExternal(recovered), true);
+  assert.equal(queue.revision, 5);
+  assert.equal(queue.idle, true);
+  assert.equal(queue.needsExternalReconciliation, false);
+  await queue.flush();
 });
 test('serial native saves use the last acknowledged revision during rapid edits', async () => {
   const seen: Array<{ revision: number; operation: Operation }> = [];

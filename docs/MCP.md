@@ -86,6 +86,33 @@ The native coordinator records durable intent, prepares the worker, saves the ac
 
 Queue entry arrays are bounded and long path previews are labeled. Use `list_decisions` with status filters and `limit` 1–100 for the complete saved mark set. `recordId` plus `read_review_text` retrieves a full path or note. Sources are preserved, different destination content is refused, and the API exposes no source deletion or wipe action.
 
+## Grouped marking and Undo
+
+Use `read_folder` for each reviewed entry and `get_review_state` for the
+source volume ID and current revision. `mark_review_selection` saves 1–128
+reviewed files or folders from one root in one operation. Pass each exact
+absolute path, volume ID, relative path below the review root, kind and current
+metadata fingerprint. The operation checks every target before saving. A
+changed, unavailable or ambiguous member refuses the whole request. A folder
+mark may apply to unmarked descendants; explicit child exceptions are kept.
+Confirm the folder and Auto-copy effects after review. Each manual confirmation
+remains a separate assertion for its selected path.
+
+`get_review_state.latestUndo` identifies the newest eligible edit. For a
+group, `read_review_group` lists the exact entries, previous and saved marks,
+and per-member text record IDs. Bind the returned revision on subsequent pages.
+`undo_review_group` restores the group only if every target and its saved
+post-state still match. Copies already completed stay on the destination.
+Exact operation-ID replay returns the existing receipt. Ordinary Undo refuses
+to skip a more recent group. The first group promotes the journal and recovery
+copy to version 2 and preserves the original version 1 bytes separately.
+
+Use `get_ui_state.state.selection` for the active selection count, hidden
+count and fingerprint. `control_ui` actions `setEntrySelection`,
+`clearEntrySelection` and `openSelectionReview` bind that fingerprint and the
+current UI session. Changing the selection or opening its review does not save
+a decision. Use the exact grouped operation to save a reviewed selection.
+
 ## Acknowledged window controls and retained work
 
 `get_ui_state` reports the registered `uiSessionId`, native instance/revision, report age, flags, panels, queries, drafts, persistence/conflict state and recent operation receipts. A window reload registers a new native-issued UI session and invalidates previous pending commands. Internal report/registration IPC is not exposed to HTTP/MCP clients.

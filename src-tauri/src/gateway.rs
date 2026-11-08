@@ -520,6 +520,8 @@ fn project_history(event: &Value) -> Value {
         "id",
         "type",
         "key",
+        "recordId",
+        "memberCount",
         "volumeId",
         "relativePath",
         "path",
@@ -619,22 +621,27 @@ fn state_summary(state: &AppState) -> Result<Value, String> {
     let mut view_truncated = false;
     let mut view_budget = 64;
     let view = project_metadata(&doc["view"], 3, &mut view_budget, &mut view_truncated);
+    let undo_target = doc["history"].as_array().and_then(|history| history.iter().rev().find(|event| {
+        matches!(event["type"].as_str(), Some("classify" | "note" | "bulkClassify"))
+            && event["undoneAt"].is_null()
+    })).map(|event| json!({"kind":event["type"],"id":event["id"],"memberCount":event["memberCount"]}));
     Ok(
         json!({"api":api_capabilities(),"revision":doc["revision"],"schemaVersion":doc["schemaVersion"],"view":view,
         "volumes":state.volumes,"dataPath":state.data_path,"fixture":state.fixture,"problem":null,
-        "gateway":gateway,"decisionCount":doc["decisions"].as_object().map_or(0,|m|m.len()),
+        "gateway":gateway,"latestUndo":undo_target,"decisionCount":doc["decisions"].as_object().map_or(0,|m|m.len()),
         "suggestionCount":doc["suggestions"].as_array().map_or(0,|a|a.len()),"historyCount":doc["history"].as_array().map_or(0,|a|a.len()),"backupReminder":doc["backupReminder"],"truncation":{"viewMetadataTruncated":view_truncated,"storedOriginalPreserved":true}}),
     )
 }
 
 pub(crate) fn api_capabilities()->Value {
-    json!({"version":"0.4.0","transport":"authenticated-loopback-rpc","methods":[
+    json!({"version":"0.5.0","transport":"authenticated-loopback-rpc","methods":[
         "get_state","get_review_view","list_folder","get_details","list_decisions","list_suggestions",
-        "read_review_text","get_status","get_assisted_review","next_attention","search_dirs","scan","mutate",
+        "read_review_text","get_review_group","get_status","get_assisted_review","next_attention","search_dirs","scan","mutate",
         "audit_status","audit_control","audit_notifications","audit_read_notifications",
         "copy_queue_snapshot","control_copy_queue","get_ui_state","control_ui","get_recovery_state","recover_review"],
         "recoveryModeMethods":["get_recovery_state","recover_review","get_ui_state","control_ui"],
-        "copyControls":["start","pause","resume"],"sourceDeletion":false,
+        "copyControls":["start","pause","resume"],"groupOperations":["bulkClassify","undoGroup"],
+        "supportedJournalVersions":[1,2],"sourceDeletion":false,
         "uiControl":"registered native UI session; accepted commands require an applied/error acknowledgement",
         "textContinuation":"read_review_text for saved text; control_ui listPending/readPendingText for retained drafts",
         "authority":"Authenticated delegated clients must assert explicit user_instruction. This is actor provenance, not cryptographic human-presence proof."})
@@ -724,12 +731,19 @@ fn read_review_text(state:&AppState,params:&Value)->Result<Value,String> {
     if offset>0 && (params.get("expectedRevision").is_none() || params.get("expectedTextSha256").is_none()) {
         return Err("Continuation requires the revision and text SHA-256 from the first chunk".into());
     }
+    let group_item = if collection == "history" {
+        crate::bulk_mark::history_by_record_id(doc, &record_id)
+    } else {
+        None
+    };
     let item=match collection.as_str() {
         "decisions"=>if let Some(digest)=record_id.strip_prefix("sha256:") {
             doc["decisions"].as_object().and_then(|items|items.iter().find(|(key,_)|crate::store::hash(key.as_bytes())==digest).map(|(_,item)|item))
         }else{doc["decisions"].get(&record_id)},
         "suggestions"=>doc["suggestions"].as_array().and_then(|items|items.iter().rev().find(|item|item["id"].as_str().or_else(||item["path"].as_str())==Some(record_id.as_str()))),
-        "history"=>doc["history"].as_array().and_then(|items|items.iter().rev().find(|item|item["id"]==record_id)),
+        "history" if group_item.is_some() => group_item.as_ref(),
+        "history"=>doc["history"].as_array().and_then(|items|items.iter().rev().find(|item|
+            item["id"]==record_id && !crate::bulk_mark::is_group_event(item))),
         _=>return Err("Unknown review-text collection".into()),
     }.ok_or("Review text record was not found")?;
     let value=match field.as_str() {
@@ -748,6 +762,36 @@ fn read_review_text(state:&AppState,params:&Value)->Result<Value,String> {
     let next=offset+chunk.len();
     Ok(json!({"revision":revision,"collection":collection,"recordId":record_id,"field":field,"text":chunk,
         "offset":offset,"nextOffset":if cut{Some(next)}else{None},"totalBytes":full.len(),"textSha256":digest,"complete":!cut}))
+}
+
+fn review_group(state: &AppState, params: &Value) -> Result<Value, String> {
+    let id = text(params, "groupId", None)?;
+    let offset = params.get("offset").map(|value| value.as_u64().ok_or("Invalid group offset"))
+        .transpose()?.unwrap_or(0);
+    let limit = params.get("limit").map(|value| value.as_u64().ok_or("Invalid group limit"))
+        .transpose()?.unwrap_or(20);
+    if id.len() > 200 || offset > 128 || !(1..=32).contains(&limit) {
+        return Err("The grouped review page is outside the supported range.".into());
+    }
+    let store = state.store.lock().map_err(error)?;
+    let doc = &store.as_ref().ok_or("Data unavailable")?.doc;
+    if params.get("expectedRevision").is_some_and(|revision| revision != &doc["revision"]) {
+        return Err("The review changed. Read the grouped entries again before continuing.".into());
+    }
+    let event = doc["history"].as_array().and_then(|events| events.iter().rev()
+        .find(|event| crate::bulk_mark::is_group_event(event) && event["id"] == id))
+        .ok_or("The requested review group was not found.")?;
+    let members = event["members"].as_array().ok_or("Invalid saved group")?;
+    let entries: Vec<Value> = members.iter().skip(offset as usize).take(limit as usize).map(|member| {
+        let key = member["key"].as_str().unwrap_or("");
+        let record_id = crate::bulk_mark::history_record_id(event, key);
+        json!({"target":member["target"],"beforeStatus":member["before"]["status"],
+            "afterStatus":member["after"]["status"],"recordId":record_id})
+    }).collect();
+    let next = (offset as usize).saturating_add(entries.len());
+    Ok(json!({"revision":doc["revision"],"id":id,"type":event["type"],"memberCount":members.len(),
+        "undoneAt":event["undoneAt"],"undoes":event["undoes"],"status":event["status"],
+        "offset":offset,"nextOffset":(next < members.len()).then_some(next),"entries":entries}))
 }
 
 fn agent_control_params(params: &Value) -> Result<(Value, MutationOrigin), String> {
@@ -820,6 +864,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         "get_status"=>status_service(state),
         "get_assisted_review"=>crate::assisted_review_service(state),
         "read_review_text"=>read_review_text(state,params),
+        "get_review_group"=>review_group(state,params),
         "audit_status"=>crate::audit_status_service(state),
         "audit_control"=>crate::audit_control_service(state,&text(params,"action",None)?,&text(params,"scope",Some("all"))?,params.get("path").and_then(Value::as_str)),
         "audit_notifications"=>{
@@ -867,6 +912,59 @@ mod tests {
         }
         dispatch(state, method, &params).unwrap()
     }
+    #[test]
+    fn grouped_gateway_edits_use_exact_ids_and_per_member_history() {
+        let state = Arc::new(crate::tests::fixture());
+        let root = std::path::Path::new(&state.volumes[0].root);
+        let a = root.join("group-a.txt");
+        let b = root.join("group-b.txt");
+        std::fs::write(&a, b"first fixture leaf").unwrap();
+        std::fs::write(&b, b"second fixture leaf").unwrap();
+        let revision = document(&state).unwrap()["revision"].as_u64().unwrap();
+        let notes = "fixture note ".repeat(500);
+        let doc = crate::run_mutation(&state, revision, "before-group-note".into(),
+            json!({"type":"note","path":a,"notes":notes})).unwrap();
+        let targets: Vec<Value> = [&a, &b].into_iter().map(|path| {
+            let entry = filesystem::inspect(path);
+            let (volume, relative, _) = filesystem::identify(&entry.path, &state.volumes).unwrap();
+            json!({"path":entry.path,"volumeId":volume.id,"relativePath":relative,
+                "kind":entry.kind,"fingerprint":entry.fingerprint})
+        }).collect();
+        let mut req = json!({"expectedInstanceId":state.gateway.lock().unwrap()["instanceId"],
+            "expectedRevision":doc["revision"],"operationId":"http-reviewed-group",
+            "basis":"assistant_suggestion","reason":"Explicit fixture group",
+            "operation":{"type":"bulkClassify","targets":targets,"status":"last-moment",
+                "confirmed":true,"acknowledgeQueueEffects":true}});
+        assert!(dispatch(&state, "mutate", &req).is_err());
+        req["basis"] = json!("user_instruction");
+        let saved = call(&state, "mutate", req.clone());
+        assert_eq!(saved["operationReceipt"]["memberCount"], 2);
+        assert_eq!(call(&state, "mutate", req.clone())["revision"], saved["revision"]);
+        let latest = call(&state, "get_state", json!({}));
+        assert_eq!(latest["latestUndo"]["id"], "http-reviewed-group");
+        let page = call(&state, "get_review_group",
+            json!({"groupId":"http-reviewed-group","limit":1,"expectedRevision":saved["revision"]}));
+        assert_eq!(page["memberCount"], 2);
+        assert_eq!(page["nextOffset"], 1);
+        assert!(dispatch(&state, "get_review_group",
+            &json!({"groupId":"http-reviewed-group","expectedRevision":0})).is_err());
+        let context = call(&state, "get_details", json!({"path":a}));
+        let event = &context["history"][0];
+        assert_eq!(event["memberCount"], 2);
+        assert_eq!(event["recordId"], page["entries"][0]["recordId"]);
+        assert!(event["members"].is_null());
+        let chunk = call(&state, "read_review_text", json!({"collection":"history",
+            "recordId":event["recordId"],"field":"before.notes","limit":16384}));
+        assert_eq!(chunk["text"], notes);
+        req["operationId"] = json!("http-reviewed-group-undo");
+        req["expectedRevision"] = saved["revision"].clone();
+        req["operation"] = json!({"type":"undoGroup","groupId":"http-reviewed-group",
+            "confirmed":true,"acknowledgeQueueEffects":true});
+        let undone = call(&state, "mutate", req);
+        assert_eq!(undone["operationReceipt"]["memberCount"], 2);
+        assert_eq!(document(&state).unwrap()["decisions"], doc["decisions"]);
+    }
+
     #[test]
     fn saved_note_search_and_utf8_continuation_preserve_complete_text_and_revision_fences() {
         let state=Arc::new(crate::tests::fixture());

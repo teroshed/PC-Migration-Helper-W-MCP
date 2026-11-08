@@ -23,11 +23,12 @@ pub struct Store {
     pub doc: Value,
     pub problem: Option<String>,
     fingerprint: Option<String>,
+    minimum_schema: u64,
     _lock: File,
 }
 
 pub fn validate(doc: &Value) -> Result<(), String> {
-    if !doc.is_object() || doc["schemaVersion"] != 1 {
+    if !doc.is_object() || !matches!(doc["schemaVersion"].as_u64(), Some(1 | 2)) {
         return Err(
             "Unsupported or malformed data file. Original preserved; no writes allowed.".into(),
         );
@@ -38,6 +39,33 @@ pub fn validate(doc: &Value) -> Result<(), String> {
         || !doc["view"].is_object()
     {
         return Err("The saved document has invalid reserved fields. Original preserved.".into());
+    }
+    let groups = doc.get("groupOperations").map(|value| {
+        value.as_object().ok_or("Grouped operation receipts have an unsupported format.")
+    }).transpose()?;
+    let mut group_count = 0usize;
+    for event in doc["history"].as_array().unwrap() {
+        if !matches!(event["type"].as_str(), Some("bulkClassify" | "undoGroup")) {
+            continue;
+        }
+        group_count += 1;
+        let matching_receipt = event["id"].as_str().and_then(|id| groups?.get(id))
+            .is_some_and(|receipt| receipt["payloadHash"] == event["payloadHash"]
+                && receipt["type"] == event["type"] && receipt["memberCount"] == event["memberCount"]);
+        let valid_group = doc["schemaVersion"] == 2 && matching_receipt
+            && event["id"].as_str().is_some_and(|id| !id.is_empty())
+            && event["payloadHash"].as_str().is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|value| value.is_ascii_hexdigit())
+            })
+            && event["members"].as_array().is_some_and(|members| {
+                (1..=128).contains(&members.len()) && event["memberCount"] == members.len()
+            });
+        if !valid_group {
+            return Err("Grouped decision history has an unsupported format. Original preserved.".into());
+        }
+    }
+    if group_count != groups.map_or(0, |receipts| receipts.len()) {
+        return Err("Grouped decision history and receipts disagree. Original preserved.".into());
     }
     let view = &doc["view"];
     if !view["path"].is_string()
@@ -183,24 +211,29 @@ impl Store {
             .open(lock_path)
             .map_err(error)?;
         lock.try_lock_exclusive().map_err(|_| "Another PC Migration Helper instance owns this data file. Close that instance normally, then reopen.".to_string())?;
-        let bytes = match fs::read(&path) {
-            Ok(b) => Some(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(error(e)),
+        let bytes = read_optional(&path)?;
+        let minimum_schema = match read_optional(&path.with_extension("json.format-v2"))? {
+            None => 1,
+            Some(marker) if marker == FORMAT_V2 => 2,
+            Some(_) => return Err("Saved journal format fence is unreadable. Original preserved.".into()),
         };
         let mut store = Self {
             path,
             doc: fresh(root),
             problem: None,
             fingerprint: bytes.as_deref().map(hash),
+            minimum_schema,
             _lock: lock,
         };
         if let Some(bytes) = bytes {
             match serde_json::from_slice::<Value>(&bytes).map_err(error).and_then(|v| { validate(&v)?; Ok(v) }) {
-                Ok(doc) => store.doc = doc,
+                Ok(doc) => {
+                    store.minimum_schema = store.minimum_schema.max(doc["schemaVersion"].as_u64().unwrap());
+                    store.doc = doc;
+                }
                 Err(e) => store.problem = Some(format!("Cannot load saved decisions: {e}. The original is untouched. You may recover the last-known-good copy below.")),
             }
-        } else if store.path.with_extension("json.bak").exists() {
+        } else if store.path.with_extension("json.bak").exists() || store.minimum_schema > 1 {
             store.problem=Some("The main data file is missing, but a recovery copy exists. Recovery is required; no empty replacement was created.".into());
         } else {
             let doc = store.doc.clone();
@@ -217,26 +250,52 @@ impl Store {
         self.fingerprint.as_deref()
     }
 
-    pub fn commit(&mut self, mut candidate: Value) -> Result<Value, String> {
+    pub fn commit(&mut self, candidate: Value) -> Result<Value, String> {
+        self.commit_guarded(candidate, || Ok(()))
+    }
+
+    pub fn commit_guarded(
+        &mut self,
+        mut candidate: Value,
+        mut before_publish: impl FnMut() -> Result<(), String>,
+    ) -> Result<Value, String> {
         if let Some(e) = &self.problem {
             return Err(e.clone());
         }
         validate(&candidate)?;
-        let current = match fs::read(&self.path) {
-            Ok(b) => Some(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(error(e)),
-        };
+        let candidate_schema = candidate["schemaVersion"].as_u64().unwrap();
+        let schema = candidate_schema.max(self.minimum_schema);
+        candidate["schemaVersion"] = json!(schema);
+        let current = read_optional(&self.path)?;
         if current.as_deref().map(hash) != self.fingerprint {
             return Err("Data changed outside this app. Your new edit was not saved. Close and reopen to load the other version; no file was overwritten.".into());
         }
-        candidate["revision"] = json!(self.revision() + 1);
+        candidate["revision"] = json!(self.revision().checked_add(1).ok_or("Saved revision overflow")?);
         candidate["updatedAt"] = json!(now());
         let bytes = serde_json::to_vec_pretty(&candidate).map_err(error)?;
         if let Some(old) = current.as_ref() {
-            let parsed: Value = serde_json::from_slice(&old).map_err(error)?;
+            let mut parsed: Value = serde_json::from_slice(old).map_err(error)?;
             validate(&parsed)?;
-            atomic_write(&self.path.with_extension("json.bak"), &old)?;
+            let backup = self.path.with_extension("json.bak");
+            if parsed["schemaVersion"].as_u64().unwrap() < schema {
+                let prior_backup = read_optional(&backup)?;
+                archive_pre_upgrade(&self.path, old)?;
+                if let Some(prior) = &prior_backup {
+                    archive_pre_upgrade(&self.path, prior)?;
+                }
+                let marker = self.path.with_extension("json.format-v2");
+                keep_exact_or_write(&marker, FORMAT_V2)?;
+                self.minimum_schema = 2;
+                parsed["schemaVersion"] = json!(2);
+                let converted = serde_json::to_vec_pretty(&parsed).map_err(error)?;
+                let backup_hash = prior_backup.as_deref().map(hash);
+                atomic_write_guarded(&backup, &converted, || {
+                    require_fingerprint(&backup, backup_hash.as_deref())?;
+                    require_fingerprint(&self.path, self.fingerprint.as_deref())
+                })?;
+            } else {
+                atomic_write(&backup, old)?;
+            }
         }
         // Recheck after preparing the recovery copy. App peers are locked out; this also
         // catches ordinary external-editor changes during the save preparation.
@@ -249,10 +308,12 @@ impl Store {
             return Err("Data changed outside this app while preparing the save. No main-file replacement was made.".into());
         }
         atomic_write_guarded(&self.path, &bytes, || {
-            require_fingerprint(&self.path, self.fingerprint.as_deref())
+            require_fingerprint(&self.path, self.fingerprint.as_deref())?;
+            before_publish()
         })?;
         self.fingerprint = Some(hash(&bytes));
         self.doc = candidate;
+        self.minimum_schema = schema;
         Ok(self.doc.clone())
     }
 
@@ -290,6 +351,9 @@ impl Store {
         }
         let mut doc: Value = serde_json::from_slice(&backup).map_err(error)?;
         validate(&doc)?;
+        if doc["schemaVersion"].as_u64().unwrap() < self.minimum_schema {
+            return Err("Recovery would downgrade this journal format. Restore a reviewed compatible backup; the original was preserved.".into());
+        }
         let restored = if let Some((operation_id, mut receipt)) = receipt {
             if doc.get("recoveryOperations").is_some_and(|value| !value.is_object()) {
                 return Err("Recovery receipt metadata has an unsupported format. Original preserved.".into());
@@ -338,8 +402,82 @@ impl Store {
         })?;
         self.fingerprint = Some(hash(&restored));
         self.doc = doc;
+        self.minimum_schema = self.minimum_schema.max(self.doc["schemaVersion"].as_u64().unwrap());
         self.problem = None;
         Ok(self.doc.clone())
+    }
+}
+
+const FORMAT_V2: &[u8] = b"{\"minimumSchemaVersion\":2}\n";
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(problem) => Err(error(problem)),
+    }
+}
+
+fn archive_pre_upgrade(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let archived = path.with_extension(format!("json.pre-v2-{}", hash(bytes)));
+    keep_exact_or_write(&archived, bytes)
+}
+
+fn keep_exact_or_write(path: &Path, expected: &[u8]) -> Result<(), String> {
+    if let Some(current) = read_optional(path)? {
+        if current == expected {
+            return Ok(());
+        }
+        return Err("An existing format archive differs from the original. Originals preserved.".into());
+    }
+    atomic_write_guarded(path, expected, || require_fingerprint(path, None))
+}
+
+#[cfg(test)]
+mod format_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_promotion_keeps_the_primary_and_exact_legacy_pair() {
+        let base = std::env::temp_dir().join(format!(
+            "migration-journal-upgrade-{}-{}",
+            std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let path = base.join("data.json");
+        let mut store = Store::open(path.clone(), "E:\\").unwrap();
+        store.commit(store.doc.clone()).unwrap();
+        let primary = fs::read(&path).unwrap();
+        let backup_path = path.with_extension("json.bak");
+        let backup = fs::read(&backup_path).unwrap();
+        let mut candidate = store.doc.clone();
+        candidate["schemaVersion"] = json!(2);
+        candidate["futureField"] = json!({"preserved":true});
+        let fault = store.commit_guarded(candidate.clone(), || Err("fixture pre-publication fault".into()));
+        assert!(fault.unwrap_err().contains("fixture pre-publication fault"));
+        assert_eq!(fs::read(&path).unwrap(), primary);
+        assert_eq!(fs::read(path.with_extension(format!("json.pre-v2-{}", hash(&primary)))).unwrap(), primary);
+        assert_eq!(fs::read(path.with_extension(format!("json.pre-v2-{}", hash(&backup)))).unwrap(), backup);
+        assert_eq!(serde_json::from_slice::<Value>(&fs::read(&backup_path).unwrap()).unwrap()["schemaVersion"], 2);
+        drop(store);
+
+        let mut store = Store::open(path.clone(), "E:\\").unwrap();
+        let upgraded = store.commit(candidate).unwrap();
+        assert_eq!(upgraded["schemaVersion"], 2);
+        assert_eq!(upgraded["futureField"]["preserved"], true);
+        let pair = [fs::read(&path).unwrap(), fs::read(&backup_path).unwrap()];
+        for version in pair {
+            let doc: Value = serde_json::from_slice(&version).unwrap();
+            assert_ne!(doc["schemaVersion"], 1); // Legacy validation rejects both.
+            validate(&doc).unwrap();
+        }
+        drop(store);
+
+        fs::write(&path, b"fixture corruption").unwrap();
+        fs::write(&backup_path, backup).unwrap();
+        let mut store = Store::open(path.clone(), "E:\\").unwrap();
+        assert!(store.problem.is_some());
+        assert!(store.recover().unwrap_err().contains("downgrade"));
+        assert_eq!(fs::read(path).unwrap(), b"fixture corruption");
     }
 }
 

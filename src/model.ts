@@ -40,7 +40,7 @@ export interface Decision {
   [key: string]: unknown;
 }
 export interface Document {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   revision: number;
   decisions: Record<string, Decision>;
   history: unknown[];
@@ -80,6 +80,13 @@ export interface Entry {
   audit?: AuditStats;
 }
 export interface Volume { root: string; id: string; label: string; available: boolean; problem: string | null }
+export interface GroupTarget {
+  path: string;
+  volumeId: string;
+  relativePath: string;
+  kind: 'file' | 'folder';
+  fingerprint: string;
+}
 export interface GatewayStatus { state: 'running' | 'error' | 'unavailable'; endpoint?: string; instanceId?: string; problem?: string; startedAt?: string }
 export interface Boot { document: Document; volumes: Volume[]; dataPath: string; fixture: boolean; problem: string | null; recoveryAvailable: boolean; gateway: GatewayStatus }
 export interface Listing { path: string; entries: Entry[]; total: number; attention: number; counts: Record<string, number>; observedAt: string | null }
@@ -94,6 +101,8 @@ export type Operation =
   | { type: 'assist'; action: 'split' | 'defer'; path: string; questionId: string }
   | { type: 'assist'; action: 'restore' }
   | { type: 'assistAnswer'; path: string; questionId: string; status: Status }
+  | { type: 'bulkClassify'; targets: GroupTarget[]; status: Status; confirmed: true; acknowledgeFolderEffects?: true; acknowledgeQueueEffects: true }
+  | { type: 'undoGroup'; groupId: string; confirmed: true; acknowledgeQueueEffects: true }
   | { type: 'undo' };
 
 export function record(value: unknown): Record<string, unknown> {
@@ -109,14 +118,15 @@ export function parseGateway(value: unknown): GatewayStatus {
 }
 export function parseDocument(value: unknown): Document {
   const v = record(value);
-  if (v.schemaVersion !== 1 || typeof v.revision !== 'number' || !Number.isSafeInteger(v.revision) || !Array.isArray(v.history)) throw new Error('Unsupported saved document. Original data is preserved.');
+  if ((v.schemaVersion !== 1 && v.schemaVersion !== 2) || typeof v.revision !== 'number' ||
+      !Number.isSafeInteger(v.revision) || !Array.isArray(v.history)) throw new Error('Unsupported saved document. Original data is preserved.');
   const decisions = record(v.decisions);
   for (const value of Object.values(decisions)) {
     const d = record(value);
     if (typeof d.path !== 'string' || !isStatus(d.status) || (d.notes !== undefined && typeof d.notes !== 'string') || (d.decidedAt !== undefined && typeof d.decidedAt !== 'string')) throw new Error('A saved decision has an unsupported format.');
   }
   return {
-    ...v, schemaVersion: 1, revision: v.revision, decisions: decisions as Record<string, Decision>, history: v.history,
+    ...v, schemaVersion: v.schemaVersion, revision: v.revision, decisions: decisions as Record<string, Decision>, history: v.history,
     view: parseView(v.view),
   };
 }
@@ -237,6 +247,7 @@ export class MutationQueue {
   private pending: PendingMutation[] = [];
   private running = false;
   private externalHold = false;
+  private externalReadFailed = false;
   private inspectionGeneration = 0;
   private failure: string | null = null;
   private waiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
@@ -250,6 +261,7 @@ export class MutationQueue {
   get state(): QueueState { return { pending: this.pending.length, saving: this.externalHold || this.running || this.pending.length > 0, error: this.failure }; }
   get revision(): number { return this.document.revision; }
   get inspectionVersion(): number { return this.inspectionGeneration; }
+  get needsExternalReconciliation(): boolean { return this.externalReadFailed; }
   get idle(): boolean { return !this.running && !this.pending.length && !this.failure && !this.externalHold; }
   get retainedOperations(): readonly Operation[] { return this.pending.map(item => item.operation); }
   get retainedRequests(): readonly { id: string; operation: Operation }[] { return this.pending.map(({ id, operation }) => ({ id, operation })); }
@@ -286,9 +298,20 @@ export class MutationQueue {
   }
   failExternal(cause: unknown): void {
     this.externalHold = false;
+    this.externalReadFailed = true;
     this.failure = `The native operation needs reconciliation before pending edits can save: ${String(cause)}`;
     for (const waiter of this.waiters.splice(0)) waiter.reject(new Error(this.failure));
     this.notify();
+  }
+  reconcileExternal(value: unknown): boolean {
+    if (!this.externalReadFailed || this.running || this.externalHold || this.pending.length) return false;
+    const document = parseDocument(value);
+    if (document.revision < this.document.revision) return false;
+    this.document = document;
+    this.externalReadFailed = false;
+    this.failure = null;
+    this.notify();
+    return true;
   }
   request(operation: Operation): Promise<Document> {
     const promise = new Promise<Document>((resolve, reject) => {
@@ -298,7 +321,7 @@ export class MutationQueue {
     void this.drain();
     return promise;
   }
-  retry(): void { this.failure = null; void this.drain(); }
+  retry(): void { this.externalReadFailed = false; this.failure = null; void this.drain(); }
   flush(): Promise<void> {
     if (this.failure) return Promise.reject(new Error(this.failure));
     if (!this.pending.length && !this.running && !this.externalHold) return Promise.resolve();

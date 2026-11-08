@@ -2,6 +2,7 @@
 mod assistance;
 mod background;
 mod audit;
+mod bulk_mark;
 mod copy_control;
 mod copy_queue;
 mod filesystem;
@@ -467,9 +468,8 @@ fn details_service(s: &AppState, path: String) -> Result<Value, String> {
         .rev()
         // Drive letters can be reused. History follows the stable volume-relative identity;
         // legacy events without a key remain in the archive rather than being guessed onto a disk.
-        .filter(|h| h["key"] == key)
+        .filter_map(|event| bulk_mark::history_for(event, &key))
         .take(30)
-        .cloned()
         .collect();
     Ok::<_, String>(
         json!({"path":path,"effective":effective(&s,&doc,&entry),"decision":doc["decisions"][key],"overrides":overrides,"history":history,"exists":entry.problem.is_none(),"inventory":s.index.directory_info(&path)?,"audit":s.audit.stats(&[path.clone()])?[&path]}),
@@ -614,6 +614,51 @@ fn apply_view_patch(
     Ok(())
 }
 
+fn decision_record(
+    before: &Value,
+    path: &str,
+    volume_id: &str,
+    relative: &str,
+    provenance: &Value,
+) -> Value {
+    if before.is_object() {
+        before.clone()
+    } else {
+        json!({"path":path,"volumeId":volume_id,"relativePath":relative,"status":"attention",
+            "noteOnly":true,"notes":"","createdAt":now(),"provenance":provenance})
+    }
+}
+
+fn update_decision_snapshot(
+    s: &AppState,
+    decision: &mut Value,
+    path: &str,
+    entry: &Entry,
+    status: &str,
+    provenance: &Value,
+) {
+    decision["status"] = json!(status);
+    decision["provenance"] = provenance.clone();
+    decision["decidedAt"] = json!(now());
+    decision.as_object_mut().expect("prepared decision").remove("noteOnly");
+    decision["snapshot"] = json!({"fingerprint":entry.fingerprint,
+        "directorySignature":s.index.signature(path),"observedAt":now(),
+        "scope":"metadata only; no content/hash verification; descendants not exhaustively checked"});
+    decision["verification"] = match status {
+        "manual-confirmed" => json!({"kind":"manual-backup-assertion","assertedAt":now(),
+            "sourcePath":path,"destination":null,
+            "scope":"User-confirmed manual backup assertion for the selected path only; children require their own review",
+            "provenance":provenance,
+            "limitations":"User assertion. Destination content, checksums and restore have not been verified by this mark."}),
+        "on-external" => json!({"kind":"manual-assertion","assertedAt":now(),"sourcePath":path,
+            "destination":"F:\\ (exact destination not recorded)",
+            "scope":"User assertion for selected path; child exceptions retained","exclusions":"Not specified",
+            "provenance":provenance,
+            "limitations":"Not verified by this app; no copy, full hash audit, snapshot or restore test performed"}),
+        _ => Value::Null,
+    };
+}
+
 fn run_mutation_as(
     s: &AppState,
     expected_revision: u64,
@@ -637,6 +682,7 @@ fn run_mutation_as(
                 store.problem.is_none()
                     && store.revision() == expected_revision
                     && store.doc["agentOperations"].get(&operation_id).is_none()
+                    && store.doc["groupOperations"].get(&operation_id).is_none()
                     && !store.doc["recentOperations"]
                         .as_array()
                         .is_some_and(|ids| ids.iter().any(|id| id == &operation_id))
@@ -653,6 +699,28 @@ fn run_mutation_as(
         return Err("This operationId belongs to a durable copy or recovery receipt and cannot be reused for an edit".into());
     }
     let agent_hash = origin.payload_hash(&op)?;
+    let group_hash = if matches!(operation_type, "bulkClassify" | "undoGroup") {
+        Some(match &agent_hash {
+            Some(hash) => hash.clone(),
+            None => store::hash(&serde_json::to_vec(&canonical_json(
+                &json!({"origin":"manual-ui","operation":op})
+            )).map_err(error)?),
+        })
+    } else {
+        None
+    };
+    if let Some(receipt) = store.doc["groupOperations"].get(&operation_id) {
+        if group_hash.as_deref() != receipt["payloadHash"].as_str() || group_hash.is_none() {
+            return Err("This operation ID belongs to a different grouped edit. No decisions were changed.".into());
+        }
+        return Ok(store.doc.clone());
+    }
+    if group_hash.is_some() && (store.doc["history"].as_array()
+        .is_some_and(|events| events.iter().any(|event| event["id"] == operation_id))
+        || store.doc["recentOperations"].as_array().is_some_and(|ids| ids.iter().any(|id| id == &operation_id)))
+    {
+        return Err("This operation ID already belongs to another saved edit.".into());
+    }
     if let Some(payload_hash) = &agent_hash {
         if store
             .doc
@@ -711,6 +779,7 @@ fn run_mutation_as(
     let is_agent = matches!(&origin, MutationOrigin::Agent { .. });
     let mut activity = None;
     let mut classification_changed = false;
+    let mut group_targets = Vec::new();
     if matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
         let path = filesystem::normalize(op["path"].as_str().ok_or("Missing suggestion path")?)?;
         let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
@@ -747,6 +816,35 @@ fn run_mutation_as(
                 }
             }
             "assist" => assistance::update(s, &mut doc, &op)?,
+            "bulkClassify" => {
+                let prepared = bulk_mark::prepare(s, &op)?;
+                let event = bulk_mark::group_event(
+                    &doc, &prepared, &operation_id,
+                    group_hash.as_deref().expect("grouped request digest"), &provenance,
+                    |member, before, status| {
+                        let target = &member.target;
+                        let mut after = decision_record(before, &target.path, &target.volume_id,
+                            &target.relative_path, &provenance);
+                        update_decision_snapshot(s, &mut after, &target.path, &member.entry(), status, &provenance);
+                        after["updatedAt"] = json!(now());
+                        after["lastEditedBy"] = provenance.clone();
+                        Ok(after)
+                    },
+                )?;
+                if is_agent {
+                    activity = prepared.targets.first().map(|first| ("mark", first.target.path.clone()));
+                }
+                bulk_mark::apply_group(&mut doc, event);
+                group_targets = prepared.targets;
+                classification_changed = true;
+            }
+            "undoGroup" => {
+                let prepared = bulk_mark::prepare_undo(s, &doc, &op)?;
+                bulk_mark::apply_undo(&mut doc, &prepared, &operation_id,
+                    group_hash.as_deref().expect("grouped request digest"), &provenance)?;
+                group_targets = prepared.targets;
+                classification_changed = true;
+            }
             "classify" | "note" | "assistAnswer" => {
                 let question = if operation_type == "assistAnswer" {
                     Some(assistance::validate_question(s, &doc, &op)?)
@@ -757,11 +855,7 @@ fn run_mutation_as(
                     filesystem::normalize(op["path"].as_str().ok_or("Missing decision path")?)?;
                 let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
                 let before = doc["decisions"][&key].clone();
-                let mut after = if before.is_object() {
-                    before.clone()
-                } else {
-                    json!({"path":path,"volumeId":volume.id,"relativePath":relative,"status":"attention","noteOnly":true,"notes":"","createdAt":now(),"provenance":provenance})
-                };
+                let mut after = decision_record(&before, &path, &volume.id, &relative, &provenance);
                 if operation_type != "note" {
                     classification_changed = true;
                     let status = op["status"]
@@ -782,23 +876,10 @@ fn run_mutation_as(
                                 .into(),
                         );
                     }
-                    after["status"] = json!(status);
                     if is_agent {
                         activity = Some(("mark", path.clone()));
                     }
-                    after["provenance"] = provenance.clone();
-                    after["decidedAt"] = json!(now());
-                    after.as_object_mut().unwrap().remove("noteOnly");
-                    after["snapshot"] = json!({"fingerprint":entry.fingerprint,"directorySignature":s.index.signature(&path),"observedAt":now(),"scope":"metadata only; no content/hash verification; descendants not exhaustively checked"});
-                    after["verification"] = if status == "manual-confirmed" {
-                        json!({"kind":"manual-backup-assertion","assertedAt":now(),"sourcePath":path,"destination":null,
-                            "scope":"User-confirmed manual backup assertion for the selected path only; children require their own review",
-                            "provenance":provenance,"limitations":"User assertion. Destination content, checksums and restore have not been verified by this mark."})
-                    } else if status == "on-external" {
-                        json!({"kind":"manual-assertion","assertedAt":now(),"sourcePath":path,"destination":"F:\\ (exact destination not recorded)","scope":"User assertion for selected path; child exceptions retained","exclusions":"Not specified","provenance":provenance,"limitations":"Not verified by this app; no copy, full hash audit, snapshot or restore test performed"})
-                    } else {
-                        Value::Null
-                    };
+                    update_decision_snapshot(s, &mut after, &path, &entry, status, &provenance);
                 } else {
                     let notes = op["notes"].as_str().ok_or("Invalid notes")?;
                     if notes.len() > 1_000_000 {
@@ -822,10 +903,14 @@ fn run_mutation_as(
                     .unwrap()
                     .iter()
                     .rposition(|h| {
-                        (h["type"] == "classify" || h["type"] == "note") && h["undoneAt"].is_null()
+                        matches!(h["type"].as_str(), Some("classify" | "note" | "bulkClassify"))
+                            && h["undoneAt"].is_null()
                     })
                     .ok_or("There is no classification or note change to undo")?;
                 let original = doc["history"][position].clone();
+                if original["type"] == "bulkClassify" {
+                    return Err("The latest edit is a grouped mark. Review the group before using grouped Undo.".into());
+                }
                 classification_changed = original["type"] == "classify";
                 let key = original["key"]
                     .as_str()
@@ -887,12 +972,15 @@ fn run_mutation_as(
         if operation_type == "review" {
             receipt["action"] = op["action"].clone();
         }
+        if group_hash.is_some() {
+            receipt["memberCount"] = outcome.map(|event| event["memberCount"].clone()).unwrap_or(Value::Null);
+        }
         doc["agentOperations"]
             .as_object_mut()
             .ok_or("Invalid agent operation receipt map")?
             .insert(operation_id, receipt);
     }
-    let saved = store.commit(doc)?;
+    let saved = store.commit_guarded(doc, || bulk_mark::ensure_current(&group_targets))?;
     if classification_changed {
         // A running pass owns the decision snapshot from its start. Stop further
         // queued work after an intent change, so the next pass uses the new marks.

@@ -1,0 +1,56 @@
+.entry-group-toggle {
+  display: grid;
+  place-items: center;
+  align-self: stretch;
+  flex: 0 0 28px;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid #293a5144;
+  border-radius: 4px 0 0 4px;
+  background: transparent;
+  color: #a4b7d1;
+}
+
+.entry-group-toggle:hover:not(:disabled) { background: #334966; color: #edf4ff; }
+.entry-group-toggle[aria-pressed=true] { background: #284569; color: #b8dcff; }
+.entry-group-toggle:focus-visible { outline-offset: -3px; }
+
+.review-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px 8px;
+  flex-wrap: wrap;
+  padding: 4px 9px;
+  background: #192b43;
+  border-bottom: 1px solid #395471;
+  color: #c7ddf7;
+  font-size: 11px;
+}
+
+.review-selection-bar .selection-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+.review-selection-bar button, .group-review-actions button { min-height: 28px; padding: 4px 8px; font-size: 11px; }
+.group-review { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.group-review .modal-intro { margin-bottom: 8px; }
+.group-status-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.group-status-options button { padding: 5px 7px; min-height: 30px; }
+.group-targets { flex: 1 1 64px; min-height: 45px; overflow: auto; padding: 0; margin: 9px 0; list-style: none; border: 1px solid #354762; border-radius: 6px; }
+.group-targets li { display: flex; align-items: start; gap: 7px; padding: 6px 8px; font-size: 11px; }
+.group-targets li + li { border-top: 1px solid #293c54; }
+.group-targets li > div { flex: 1; min-width: 0; }
+.group-targets li > svg { flex-shrink: 0; margin-top: 2px; }
+.group-targets li small { display: block; color: #a2b8d4; margin-top: 4px; }
+.group-targets .icon-button { min-height: 25px; min-width: 25px; padding: 3px; }
+.group-target-path { overflow-wrap: anywhere; }
+.group-review-controls { display: grid; gap: 6px; }
+.group-review-controls label { display: flex; gap: 6px; align-items: flex-start; color: #c4d3e8; font-size: 11px; line-height: 1.4; }
+.group-review-controls input { flex-shrink: 0; margin-top: 1px; }
+.group-review-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.group-review-error { display: flex; gap: 6px; color: #ffbdbb; font-size: 11px; overflow-wrap: anywhere; }
+.group-review-error svg { flex-shrink: 0; }
+@media (forced-colors: active) {
+  .entry-group-toggle { border: 1px solid ButtonText; }
+  .entry-group-toggle[aria-pressed=true] { background: Highlight; color: HighlightText; forced-color-adjust: none; }
+  .entry-group-toggle:focus-visible { outline: 2px solid Highlight; outline-offset: -3px; }
+  .entry-group-toggle[aria-pressed=true]:focus-visible { outline-color: HighlightText; }
+}

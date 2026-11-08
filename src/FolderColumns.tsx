@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Check, ChevronLeft, ChevronRight, File, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, TriangleAlert, X } from 'lucide-react';
+import { Check, ChevronLeft, ChevronRight, File, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, Square, SquareCheck, TriangleAlert, X } from 'lucide-react';
 import { baseName, parentPath, parseEntry, STATUSES } from './model';
 import type { Entry, Listing, PreviewColumn, Status } from './model';
 import type { FolderReadCache } from './folder-read-cache';
@@ -21,6 +21,9 @@ export interface ColumnActions {
   menuPath: string | null;
   onSelect: (entry: Entry) => void;
   onToggleSelect: (entry: Entry) => void;
+  canGroupSelect: (entry: Entry) => boolean;
+  isGroupSelected: (entry: Entry) => boolean;
+  onRowsDisplayed: (depth: number, folder: string, paths: readonly string[] | null) => void;
   onOpen: (path: string) => void;
   onOpenByKey: (path: string) => void;
   onPreview: (entry: Entry, depth: number) => void;
@@ -76,6 +79,14 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
   const pinErrorRef = useRef<HTMLDivElement>(null);
   const folderActivity = props.reviewActivity.paths.get(columnKey);
   const folderActivityLabel = reviewActivityLabel(folderActivity, props.reviewActivity.nowMs);
+  const { depth, path, knownSearch, onRowsDisplayed } = props;
+
+  useLayoutEffect(() => {
+    const paths = knownSearch ? [] : (listing?.entries ?? []).map(entry => entry.path);
+    if (pinned && !knownSearch) paths.unshift(pinned.path);
+    onRowsDisplayed(depth, path, paths);
+    return () => onRowsDisplayed(depth, path, null);
+  }, [depth, path, knownSearch, onRowsDisplayed, listing?.entries, pinned]);
 
   useLayoutEffect(() => {
     const list = listRef.current;
@@ -168,7 +179,11 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       {props.loading && !listing && <div className="empty-state"><LoaderCircle size={24} className="spin"/><h3>Reading this folder…</h3><p>Loading immediate contents only.</p></div>}
       {props.knownSearch && props.knownResults ? props.knownResults.length ? props.knownResults.map(path => <button key={path} className="known-result" data-entry-path={path} data-entry-kind="folder" onClick={() => props.onOpen(path)}><Folder size={16}/><span>{path}</span><ChevronRight size={14}/></button>) : <div className="empty-state"><Search size={25}/><h3>No known folders match</h3></div> : entries.map(entry => {
         const entryKey = reviewPathKey(entry.path);
-        return <EntryRow key={entryKey} entry={entry} selected={props.selectedPath !== null && reviewPathKey(props.selectedPath) === entryKey} menuOpen={props.menuPath === entry.path} pinned={entry === pinned} activity={props.reviewActivity.paths.get(entryKey)} nowMs={props.reviewActivity.nowMs} onSelect={() => props.onSelect(entry)} onOpen={() => props.onOpen(entry.path)} onPreview={() => props.onPreview(entry, props.depth)} onMenu={props.onMenu}/>;
+        return <EntryRow key={entryKey} entry={entry} selected={props.selectedPath !== null && reviewPathKey(props.selectedPath) === entryKey}
+          groupSelected={props.isGroupSelected(entry)} canGroupSelect={props.canGroupSelect(entry)}
+          menuOpen={props.menuPath === entry.path} pinned={entry === pinned} activity={props.reviewActivity.paths.get(entryKey)}
+          nowMs={props.reviewActivity.nowMs} onSelect={() => props.onSelect(entry)} onGroupToggle={() => props.onToggleSelect(entry)}
+          onOpen={() => props.onOpen(entry.path)} onPreview={() => props.onPreview(entry, props.depth)} onMenu={props.onMenu}/>;
       })}
       {showPin && !pinned && pin?.path === revealPath && <div className="review-pin-error" ref={pinErrorRef}><strong>Revealed path unavailable</strong><span title={revealPath ?? ''}>{revealPath}</span></div>}
       {!props.knownSearch && listing && !listing.entries.length && <div className="empty-state"><FolderOpen size={25}/><h3>No matching entries</h3><p>This folder may be empty, or the current search and filter hide its entries.</p></div>}
@@ -222,7 +237,23 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
   return <DirectoryColumn {...props} path={props.column.path} width={props.column.width ?? 360} page={props.column.page} scrollTop={props.column.scrollTop} listing={listing} loading={loading} error={error} listRef={listRef} onScroll={scrollTop => props.onChange({ scrollTop })} onPage={page => props.onChange({ page, scrollTop: 0 })} onRefresh={() => { forceRefresh.current = true; setRefresh(value => value + 1); }}/>
 }
 
-function EntryRow({ entry, selected, menuOpen, pinned, activity, nowMs, onSelect, onOpen, onPreview, onMenu }: { entry: Entry; selected: boolean; menuOpen: boolean; pinned: boolean; activity?: ActivityRow; nowMs: number; onSelect: () => void; onOpen: () => void; onPreview: () => void; onMenu: (target: RowMenuTarget) => void }) {
+interface EntryRowProps {
+  entry: Entry;
+  selected: boolean;
+  groupSelected: boolean;
+  canGroupSelect: boolean;
+  menuOpen: boolean;
+  pinned: boolean;
+  activity?: ActivityRow;
+  nowMs: number;
+  onSelect: () => void;
+  onGroupToggle: () => void;
+  onOpen: () => void;
+  onPreview: () => void;
+  onMenu: (target: RowMenuTarget) => void;
+}
+function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pinned, activity, nowMs,
+  onSelect, onGroupToggle, onOpen, onPreview, onMenu }: EntryRowProps) {
   const Icon = entry.kind === 'folder' ? Folder : entry.kind === 'link' ? Link2 : entry.kind === 'unavailable' ? TriangleAlert : File;
   const activityLabel = reviewActivityLabel(activity, nowMs);
   const reviewLabel = [pinned ? 'Revealed · outside current results' : null, activityLabel].filter(Boolean).join(' · ');
@@ -239,6 +270,10 @@ function EntryRow({ entry, selected, menuOpen, pinned, activity, nowMs, onSelect
       if (!event.repeat) menu(target ?? event.currentTarget);
     }
   }}>
+    <button type="button" className="entry-group-toggle" aria-pressed={groupSelected} disabled={!canGroupSelect}
+      aria-label={`Select ${entry.name} for group marking`}
+      title={canGroupSelect ? 'Toggle group selection (Ctrl+Space)' : 'This entry cannot be added to a group'}
+      onClick={onGroupToggle}>{groupSelected ? <SquareCheck size={15} aria-hidden="true"/> : <Square size={15} aria-hidden="true"/>}</button>
     <button className="entry-select" data-entry-path={entry.path} aria-current={selected ? 'true' : undefined} aria-label={`${entry.kind === 'folder' ? 'Open folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${reviewLabel ? `, ${reviewLabel}` : ''}`} title={`${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`} onClick={entry.kind === 'folder' ? onOpen : onSelect}>
       <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span><span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
     </button>

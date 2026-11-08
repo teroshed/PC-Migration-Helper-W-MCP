@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -16,7 +16,7 @@ import {
 } from './model';
 import type {
   AppStatus, Boot, Decision, Details, Document, Effective, Entry, Listing,
-  Operation, QueueState, ScanStatus, Status, ViewState, Volume, GatewayStatus, PreviewColumn, ReviewLayout,
+  GroupTarget, Operation, QueueState, ScanStatus, Status, ViewState, Volume, GatewayStatus, PreviewColumn, ReviewLayout,
 } from './model';
 import { DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
 import { DirectoryColumn, PreviewFolderColumn, RowClassificationMenu } from './FolderColumns';
@@ -40,13 +40,26 @@ import {
 import type { ReviewActivity } from './ReviewActivity';
 import { useUiBridge } from './UIBridge';
 import type { UiParticipant, UiCommand, UiRequest } from './UIBridge';
-import { inspectPending, pendingFingerprint, pendingMetadata } from './pending-inspection';
+import { inspectPending, pendingFingerprint, pendingMetadata, textHash } from './pending-inspection';
 import type { PendingSnapshot } from './pending-inspection';
 import { assertNewCloseAllowed, CloseSession } from './close-session';
 import type { CloseState } from './close-session';
+import { SelectionReview } from './SelectionReview';
+import type { GroupOperation, GroupReview } from './SelectionReview';
+import {
+  changeSelection, EMPTY_SELECTION, latestUndoEvent, loadSelection, reportSelectionTarget, replaceSelection,
+  resolvedSelection, rootForSelection, savedGroup, selectedFor, selectionKey, selectionSignature, selectionTarget,
+} from './review-selection';
+import type { SavedGroup, SelectionSets } from './review-selection';
 
 const EMPTY_STATUS: AppStatus = { scan: { pending: 0 }, gaps: [], decisionCount: 0 };
 const FOLLOW_PREFERENCE = 'migration-master.follow-ai';
+const SELECTION_PREFERENCE = 'migration-master.group-selection-v1';
+
+function readSavedSelection(): SelectionSets {
+  try { return loadSelection(localStorage.getItem(SELECTION_PREFERENCE)); }
+  catch { return new Map(); }
+}
 
 function readFollowPreference(): boolean {
   try { return localStorage.getItem(FOLLOW_PREFERENCE) === 'true'; }
@@ -129,6 +142,17 @@ export default function App() {
   const [selectedEntryInfo, setSelectedEntryInfo] = useState<Entry | null>(null);
   const [followAi, setFollowAi] = useState(readFollowPreference);
   const [revealVersion, setRevealVersion] = useState(0);
+  const [selections, setSelections] = useState(readSavedSelection);
+  const [displayedRows, setDisplayedRows] = useState<ReadonlyMap<number, readonly string[]>>(() => new Map());
+  const [groupReview, setGroupReview] = useState<GroupReview | null>(null);
+  const [groupAttempt, setGroupAttempt] = useState<GroupOperation | null>(null);
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [groupProblem, setGroupProblem] = useState<string | null>(null);
+  const selectionSets = useRef(selections);
+  const activeGroup = useRef<GroupReview | null>(null);
+  const attemptedGroup = useRef<GroupOperation | null>(null);
+  const submittingGroup = useRef(false);
+  const selectionHash = useRef<{ signature: string; promise: Promise<string> } | null>(null);
   const rowMenuRef = useRef<RowMenuTarget | null>(null);
   const followEnabled = useRef(followAi);
   const localFollowView = useRef(false);
@@ -181,6 +205,24 @@ export default function App() {
   const fillDepth = requestedFill != null && requestedFill <= (view?.previewColumns.length ?? 0)
     ? requestedFill : null;
   const readOnly = Boolean(boot?.problem) || closeState.phase !== 'idle';
+  const selectionRoot = rootForSelection(view?.path, boot?.volumes ?? []);
+  const groupTargets = useMemo(() => selectionRoot
+    ? resolvedSelection(selectedFor(selections, selectionRoot.id), selectionRoot) : EMPTY_SELECTION, [selections, selectionRoot]);
+  const groupKeys = useMemo(() => new Set(groupTargets.map(selectionKey)), [groupTargets]);
+  const visibleGroupCount = useMemo(() => {
+    const columns = fillDepth === null ? Array.from(displayedRows.values()) : [displayedRows.get(fillDepth) ?? []];
+    const paths = new Set(columns.flat().map(reviewPathKey));
+    return groupTargets.filter(target => paths.has(reviewPathKey(target.path))).length;
+  }, [displayedRows, fillDepth, groupTargets]);
+  const onRowsDisplayed = useCallback((depth: number, _folder: string, paths: readonly string[] | null): void => {
+    setDisplayedRows(previous => {
+      if (!paths && !previous.has(depth)) return previous;
+      const next = new Map(previous);
+      if (paths) next.set(depth, paths);
+      else next.delete(depth);
+      return next;
+    });
+  }, []);
   const audit = useAuditStatus(Boolean(boot), () => {
     if (activeAuditReads.current > 0 || Date.now() < holdMarkRowsUntil.current || isEditingField() || rowMenuRef.current || window.document.querySelector('dialog[open], [data-notifications-preview="true"]')) return false;
     setAuditDataTick(value => value + 1);
@@ -348,20 +390,28 @@ export default function App() {
       setMessage('Your reviewed pending edits are saved. Other saved fields were preserved.');
     } catch (cause) { setConflictProblem(`${String(cause)}. Your pending edits are still retained. Refresh the comparison before trying again.`); throw cause; }
   }
-  function runNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
+  function runNativeWrite<T>(operation: () => Promise<T>, savedDocument?: (result: T) => Document): Promise<T> {
     const task = nativeWriteLane.current.then(async () => {
       const writer = queue.current;
       if (!writer || readOnly) throw new Error('Recover the review data before starting a native write.');
       flushBuffers();
       await writer.flush();
       writer.holdForExternal();
-      try { return await operation(); }
+      let adopted: Document | undefined;
+      try {
+        const result = await operation();
+        adopted = savedDocument?.(result);
+        return result;
+      }
       finally {
         try {
-          const latest = parseBoot(await invoke('get_boot'));
-          if (latest.problem) throw new Error(latest.problem);
-          writer.finishExternal(latest.document);
-          setObservedRevision(latest.document.revision);
+          if (!adopted) {
+            const latest = parseBoot(await invoke('get_boot'));
+            if (latest.problem) throw new Error(latest.problem);
+            adopted = latest.document;
+          }
+          writer.finishExternal(adopted);
+          setObservedRevision(adopted.revision);
           setDataTick(value => value + 1);
         } catch (cause) { writer.failExternal(cause); throw cause; }
       }
@@ -476,13 +526,193 @@ export default function App() {
     flushBuffers();
     updateView({ selectedPath: entry.path }, true);
   }
+  function currentSelection() {
+    const root = rootForSelection(viewRef.current?.path, boot?.volumes ?? []);
+    const targets = root ? resolvedSelection(selectedFor(selectionSets.current, root.id), root) : EMPTY_SELECTION;
+    return { root, targets, signature: selectionSignature(root?.id ?? null, targets) };
+  }
+  function setRootSelection(rootId: string, targets: readonly GroupTarget[]): void {
+    const next = replaceSelection(selectionSets.current, rootId, targets);
+    selectionSets.current = next;
+    setSelections(next);
+    try { localStorage.setItem(SELECTION_PREFERENCE, JSON.stringify(Object.fromEntries(next))); }
+    catch { setMessage('Selection updated for this session. Restoring it after restart is unavailable.'); }
+  }
+  function assertSelectionEditable(): void {
+    if (readOnly || closeSession.current?.snapshot().phase !== 'idle') throw new Error('Group selection is unavailable while the review is read-only.');
+    if (activeGroup.current) throw new Error('Finish or close the grouped review before changing its selection.');
+  }
+  function setEntrySelected(entry: Entry, selected?: boolean): void {
+    assertSelectionEditable();
+    const { root, targets } = currentSelection();
+    const target = selectionTarget(entry, root);
+    if (!root || !target) throw new Error('This entry is unavailable for grouped marking in the current review drive.');
+    const next = changeSelection(targets, target, selected);
+    if (next !== targets) setRootSelection(root.id, next);
+  }
   function toggleEntry(entry: Entry): void {
-    const selected = viewRef.current?.selectedPath;
-    if (selected && reviewPathKey(selected) === reviewPathKey(entry.path)) {
-      setSelectedEntryInfo(null);
+    try { setEntrySelected(entry); } catch (cause) { report(cause); }
+  }
+  function setCurrentGroup(review: GroupReview | null): void {
+    activeGroup.current = review;
+    setGroupReview(review);
+    attemptedGroup.current = null;
+    setGroupAttempt(null);
+    setGroupProblem(null);
+  }
+  function closeGroupReview(): void {
+    if (submittingGroup.current || attemptedGroup.current) return;
+    setCurrentGroup(null);
+  }
+  function groupRevision(): number {
+    const writer = queue.current;
+    if (!writer || readOnly || closeSession.current?.snapshot().phase !== 'idle') throw new Error('The saved review is unavailable for group changes.');
+    return writer.revision;
+  }
+  function markReview(revision: number, selection = currentSelection()): GroupReview {
+    const { root, targets, signature } = selection;
+    if (!root || !targets.length) throw new Error('Select at least one review entry first.');
+    return { mode: 'mark', operationId: crypto.randomUUID(), revision, rootId: root.id, signature, targets };
+  }
+  async function prepareGroupReview(expectedFingerprint?: unknown, expectedRevision?: unknown): Promise<void> {
+    assertSelectionEditable();
+    if (window.document.querySelector('dialog[open]')) throw new Error('Close the open dialog before reviewing the selection.');
+    flushBuffers();
+    await queue.current?.flush();
+    const expected = expectedFingerprint === undefined ? null : await checkedSelection(expectedFingerprint);
+    assertSelectionEditable();
+    if (window.document.querySelector('dialog[open]')) throw new Error('Close the open dialog before reviewing the selection.');
+    const revision = groupRevision();
+    if (expected && (expected.signature !== currentSelection().signature || expectedRevision !== revision)) {
+      throw new Error('The selection or review revision changed. Inspect the current selection again.');
+    }
+    setCurrentGroup(markReview(revision));
+  }
+  async function prepareGroupUndo(groupId: string, fromHistory = false): Promise<void> {
+    if (activeGroup.current || (!fromHistory && window.document.querySelector('dialog[open]'))) {
+      throw new Error('Close the open dialog before reviewing group Undo.');
+    }
+    flushBuffers();
+    await queue.current?.flush();
+    const revision = groupRevision();
+    const saved = findSavedGroup(groupId);
+    if (!saved) throw new Error('That saved group is no longer available to undo.');
+    if (fromHistory) setShowHistory(false);
+    setCurrentGroup({ mode: 'undo', operationId: crypto.randomUUID(), revision, group: saved });
+  }
+  function findSavedGroup(groupId: string): SavedGroup | null {
+    const history = documentRef.current?.history ?? [];
+    for (let index = history.length - 1; index >= 0; index--) {
+      const group = savedGroup(history[index]);
+      if (group?.id === groupId) return group;
+    }
+    return null;
+  }
+  function removeGroupTarget(target: GroupTarget): void {
+    const review = activeGroup.current;
+    if (review?.mode !== 'mark' || submittingGroup.current || attemptedGroup.current) return;
+    const current = currentSelection();
+    if (!current.root || current.signature !== review.signature) { setGroupProblem('The selection changed. Review the current entries again.'); return; }
+    const next = changeSelection(current.targets, target, false);
+    setRootSelection(current.root.id, next);
+    setCurrentGroup(next.length ? markReview(review.revision) : null);
+  }
+  async function refreshGroupReview(): Promise<void> {
+    const review = activeGroup.current;
+    if (!review || submittingGroup.current || attemptedGroup.current) return;
+    try {
       flushBuffers();
-      updateView({ selectedPath: null }, true);
-    } else selectEntry(entry);
+      await queue.current?.flush();
+      if (activeGroup.current !== review) return;
+      const revision = groupRevision();
+      if (review.mode === 'mark') setCurrentGroup(markReview(revision));
+      else {
+        const group = findSavedGroup(review.group.id);
+        if (!group) throw new Error('That saved group is no longer available to undo.');
+        setCurrentGroup({ ...review, revision, group, operationId: crypto.randomUUID() });
+      }
+    } catch (cause) { setGroupProblem(String(cause)); }
+  }
+  async function applyGroup(operation: GroupOperation): Promise<void> {
+    const review = activeGroup.current;
+    if (!review || submittingGroup.current) return;
+    const previous = attemptedGroup.current;
+    if (previous && previous !== operation) return;
+    submittingGroup.current = true;
+    setGroupBusy(true);
+    setGroupProblem(null);
+    attemptedGroup.current = operation;
+    setGroupAttempt(operation);
+    let dispatched = false;
+    let nativeRefusal = false;
+    function committed(): boolean {
+      return documentRef.current?.history.some(value => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        const event = record(value);
+        return event.id === review?.operationId && event.type === operation.type;
+      }) ?? false;
+    }
+    function finish(): void {
+      if (!review) return;
+      if (review.mode === 'mark') setRootSelection(review.rootId, []);
+      setNotes({});
+      setCurrentGroup(null);
+      setMessage(review.mode === 'mark' ? `Saved one group mark for ${review.targets.length} entries.`
+        : `Restored the previous marks for ${review.group.memberCount} group members.`);
+      void refreshStatus().catch(report);
+    }
+    try {
+      if (previous && queue.current?.needsExternalReconciliation) {
+        const latest = parseBoot(await invoke('get_boot'));
+        if (latest.problem) throw new Error(latest.problem);
+        if (!queue.current.reconcileExternal(latest.document)) throw new Error('Review the retained writer state before retrying the group.');
+        setObservedRevision(latest.document.revision);
+        setDataTick(value => value + 1);
+        if (committed()) { finish(); return; }
+      }
+      await runNativeWrite(async () => {
+        const revision = groupRevision();
+        if (!previous && revision !== review.revision) throw new Error('Saved review changed. Review the group again before applying it.');
+        if (!previous && review.mode === 'mark' && currentSelection().signature !== review.signature) throw new Error('The selection changed. Review its exact entries again.');
+        dispatched = true;
+        try {
+          return await invoke('mutate', { expectedRevision: review.revision, operationId: review.operationId, operation });
+        } catch (cause) {
+          nativeRefusal = typeof cause === 'string' && /no decisions were changed|no member was undone|no decisions were undone|group does not exist|invalid membership|revision conflict|review changed|safe grouped history size/i.test(cause);
+          throw cause;
+        }
+      }, parseDocument);
+      if (!committed()) throw new Error('The saved group receipt could not be confirmed.');
+      finish();
+    } catch (cause) {
+      if (committed()) finish();
+      else {
+        if ((!dispatched && !previous) || (nativeRefusal && !queue.current?.state.error)) {
+          attemptedGroup.current = null;
+          setGroupAttempt(null);
+        }
+        setGroupProblem(attemptedGroup.current
+          ? `The saved outcome is uncertain. Retry this same request to reconcile it. ${String(cause)}`
+          : String(cause));
+      }
+    } finally {
+      submittingGroup.current = false;
+      setGroupBusy(false);
+    }
+  }
+  function selectionFingerprint(signature: string): Promise<string> {
+    if (selectionHash.current?.signature !== signature) {
+      selectionHash.current = { signature, promise: textHash(signature) };
+    }
+    return selectionHash.current.promise;
+  }
+  async function checkedSelection(expected: unknown) {
+    const current = currentSelection();
+    if (typeof expected !== 'string' || expected !== await selectionFingerprint(current.signature) ||
+        current.signature !== currentSelection().signature) {
+      throw new Error('The group selection or review drive changed. Inspect its current fingerprint.');
+    }
+    return current;
   }
   function previewFolder(entry: Entry, fromDepth: number): void {
     if (entry.kind !== 'folder' || !viewRef.current) return;
@@ -834,7 +1064,21 @@ export default function App() {
   }
   async function undo(): Promise<void> {
     flushBuffers();
-    try { await edit({ type: 'undo' }); setNotes({}); setDataTick(value => value + 1); setMessage('Previous decision or note restored.'); void refreshStatus().catch(report); } catch (cause) { report(cause); }
+    try {
+      await queue.current?.flush();
+      const saved = documentRef.current;
+      const latest = saved ? latestUndoEvent(saved) : undefined;
+      if (latest?.type === 'bulkClassify') {
+        if (typeof latest.id !== 'string') throw new Error('The saved group has no usable Undo identity.');
+        await prepareGroupUndo(latest.id);
+        return;
+      }
+      await edit({ type: 'undo' });
+      setNotes({});
+      setDataTick(value => value + 1);
+      setMessage('Previous decision or note restored.');
+      void refreshStatus().catch(report);
+    } catch (cause) { report(cause); }
   }
   async function nextAttention(): Promise<void> {
     if (!view) return;
@@ -878,12 +1122,14 @@ export default function App() {
     } finally { setLoading(false); }
   }
   function closePanels(): void {
+    if (submittingGroup.current || attemptedGroup.current) throw new Error('Reconcile the submitted group before closing its review.');
+    closeGroupReview();
     setShowGaps(false); setShowHistory(false); setShowDecisionPicker(false); setShowContext(false);
     setShowMcp(false); setShowAssistance(false); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
     void notificationControl.current?.execute({ action: 'setNotifications', mode: 'closed' }, { command: { action: 'setNotifications' } });
     void copyControl.current?.execute({ action: 'setCopyDetails', open: false }, { command: { action: 'setCopyDetails' } });
   }
-  function readUiState(): Record<string, unknown> {
+  function readUiState() {
     const retained = queue.current?.retainedRequests ?? [];
     const retainedMetadata = pendingMetadata(retained);
     const draftNotes = Array.from(noteBuffer.current, ([path, text]) => ({ path, text }));
@@ -891,7 +1137,12 @@ export default function App() {
     return {
       revision: documentRef.current?.revision, readOnly, followAi, close: { ...closeState, nativeAtRequest: lifecycleSnapshot },
       panels: { gaps: showGaps, history: showHistory, decision: showDecisionPicker, context: showContext,
-        gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict },
+        gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict, selection: groupReview?.mode ?? null },
+      selection: { rootId: selectionRoot?.id ?? null, total: groupTargets.length, visible: visibleGroupCount,
+        hidden: groupTargets.length - visibleGroupCount, targets: groupTargets.map(reportSelectionTarget),
+        review: groupReview ? { mode: groupReview.mode, revision: groupReview.revision, operationId: groupReview.operationId,
+          groupId: groupReview.mode === 'undo' ? groupReview.group.id : null, pending: groupBusy, outcomeUncertain: !groupBusy && groupAttempt !== null,
+          problem: groupProblem } : null },
       rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || saveState.saving || Boolean(rowMenu.entry.problem) } : null,
       gatewayDetailsOpen, knownFolders: { active: knownSearch, search: view?.search, results: knownResults },
       savedRecords: { search: savedSearch, filter: savedFilter, page: savedPage },
@@ -929,7 +1180,11 @@ export default function App() {
       fingerprintCache.current = { writer, version, draftVersion: draftGeneration.current, path: pathDraft, promise: pendingFingerprint(readPendingSource()) };
     }
     const state = readUiState();
-    return { ...state, pendingFingerprint: await fingerprintCache.current!.promise };
+    const [pending, groupFingerprint] = await Promise.all([
+      fingerprintCache.current!.promise,
+      selectionFingerprint(selectionSignature(selectionRoot?.id ?? null, groupTargets)),
+    ]);
+    return { ...state, pendingFingerprint: pending, selection: { ...state.selection, fingerprint: groupFingerprint } };
   }
   async function executeUi(command: UiCommand, request: UiRequest): Promise<unknown> {
     const action = command.action;
@@ -958,6 +1213,35 @@ export default function App() {
     if (closeState.phase !== 'idle' && action !== 'dismissFeedback') throw new Error('The app is finishing Exit. Pending work remains inspectable; wait or cancel Exit before changing controls.');
     const retainedWorkflow = ['compareConflict', 'retryReviewed', 'retryPending', 'flushPending', 'closePanels', 'dismissFeedback'].includes(action) || action === 'openPanel' && command.panel === 'conflict';
     if (!retainedWorkflow && request.expectedRevision !== documentRef.current?.revision) throw new Error('The displayed revision changed before this UI command could apply. Read the current UI state again.');
+    if (action === 'setEntrySelection' || action === 'clearEntrySelection' || action === 'openSelectionReview') {
+      assertSelectionEditable();
+      const expected = command.expectedSelectionFingerprint;
+      if (action === 'openSelectionReview') { await prepareGroupReview(expected, request.expectedRevision); return; }
+      const selection = await checkedSelection(expected);
+      assertSelectionEditable();
+      if (selection.signature !== currentSelection().signature || request.expectedRevision !== documentRef.current?.revision) {
+        throw new Error('The selection or review revision changed. Inspect the current selection again.');
+      }
+      if (!selection.root) throw new Error('There is no current review drive for group selection.');
+      if (action === 'clearEntrySelection') { setRootSelection(selection.root.id, []); return; }
+      if (typeof command.path !== 'string' || typeof command.selected !== 'boolean') throw new Error('Supply the exact entry path and desired selection state.');
+      const normalized = normalizeReviewPath(command.path, [selection.root.root]);
+      const key = reviewPathKey(normalized);
+      if (!command.selected) {
+        const target = selection.targets.find(target => reviewPathKey(target.path) === key);
+        if (target) setRootSelection(selection.root.id, changeSelection(selection.targets, target, false));
+        return;
+      }
+      const displayed = (): boolean => Array.from(columnStripRef.current?.querySelectorAll<HTMLElement>('.entry-row[data-entry-path]') ?? [])
+        .some(row => reviewPathKey(row.dataset.entryPath ?? '') === key);
+      if (!displayed()) throw new Error('Open the exact entry in a current folder column before selecting it.');
+      const entry = parseEntry(await invoke('get_review_entry', { path: normalized }));
+      const rechecked = await checkedSelection(expected);
+      if (rechecked.signature !== currentSelection().signature || request.expectedRevision !== documentRef.current?.revision ||
+          !displayed() || reviewPathKey(entry.path) !== key) throw new Error('The displayed entry changed. Review its current row again.');
+      setEntrySelected(entry, true);
+      return;
+    }
     if (action === 'setFollowAI') { changeFollowAi(command.enabled === true); return; }
     if (action === 'setAutoCopy' || action === 'setCopyDetails') {
       if (!copyControl.current) throw new Error('The copy panel is not available.');
@@ -1084,6 +1368,12 @@ export default function App() {
     revealVersion,
     onSelect: selectEntry,
     onToggleSelect: toggleEntry,
+    canGroupSelect: (entry: Entry) => !readOnly && Boolean(selectionTarget(entry, selectionRoot)),
+    isGroupSelected: (entry: Entry) => {
+      const target = selectionTarget(entry, selectionRoot);
+      return target !== undefined && groupKeys.has(selectionKey(target));
+    },
+    onRowsDisplayed,
     onOpen: navigate,
     onOpenByKey: navigateByKey,
     onPreview: previewFolder,
@@ -1190,7 +1480,20 @@ export default function App() {
             edge={(_, raw) => raw <= 56} edgeLabel="Release for compact path and search tools"
             onCommit={height => setToolbar(height <= 56 ? 'compact' : 'expanded', true)}/>
         </div>
-        <div className="browse-interaction-hint"><span>Folder click opens · arrow previews</span><span>Right-click or ⋯ to mark</span></div>
+        <div className="browse-interaction-hint"><span>Folder click opens · arrow previews</span><span>Ctrl+Space selects · Space marks</span></div>
+        {groupTargets.length > 0 && <div className="review-selection-bar" role="group" aria-label="Grouped review selection">
+          <span aria-live="polite"><strong>{groupTargets.length} selected</strong> · {visibleGroupCount} shown · {groupTargets.length - visibleGroupCount} hidden</span>
+          <div className="selection-actions">
+            <button type="button" disabled={readOnly} aria-haspopup="dialog" onClick={() => { void prepareGroupReview().catch(report); }}>Review selection</button>
+            <button type="button" disabled={readOnly} onClick={() => {
+              try {
+                assertSelectionEditable();
+                if (selectionRoot) setRootSelection(selectionRoot.id, []);
+                columnStripRef.current?.querySelector<HTMLButtonElement>('.root-column .column-review')?.focus();
+              } catch (cause) { report(cause); }
+            }}>Clear selection</button>
+          </div>
+        </div>}
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
           <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
           {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>The folder arrow previews its contents here. Keep opening arrows for more columns.</p><p>Folder names open the main location. Right-click or use ⋯ to mark a decision.</p></div>}
@@ -1204,7 +1507,7 @@ export default function App() {
           }}><ChevronLeft size={20} aria-hidden="true"/></button>}
         </div>
       </section>
-      <footer className="workspace-footer"><span><ShieldCheck size={13}/>Copy runs use saved marks and the selected destination.</span><span>Enter: open · →: preview · Space: mark</span></footer>
+      <footer className="workspace-footer"><span><ShieldCheck size={13}/>Copy runs use saved marks and the selected destination.</span><span>Enter: open · →: preview · ←: close preview</span></footer>
     </main>
     <ReviewSidebar side="decision" name="decision panel" collapsed={Boolean(layout.decisionCollapsed)} app={() => appRef.current}
       onResize={(width, collapse) => setLayout(collapse ? { decisionCollapsed: true } : { decisionWidth: width })}
@@ -1224,7 +1527,7 @@ export default function App() {
             ? 'Your confirmation for this path. Review children separately. Checksums and restore testing supply separate evidence.'
             : 'Purple = pending copy. Green = your manual F: assertion, unverified.'}</p>
       </div>
-      <div className="data-location"><Database size={14}/><span title={boot.dataPath}>migration_master_data.json<small>Native JSON · version 1 · revision {document.revision}</small></span></div>
+      <div className="data-location"><Database size={14}/><span title={boot.dataPath}>migration_master_data.json<small>Native JSON · version {document.schemaVersion} · revision {document.revision}</small></span></div>
     </aside>
     </ReviewSidebar>
     {showAssistance && <Modal title="AI Assistance" onClose={() => setShowAssistance(false)}>
@@ -1238,44 +1541,61 @@ export default function App() {
     {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{STATUSES.map(status => { const Icon = ICONS[status]; const isSelected = effective.own && effective.status === status; return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); void classify(status); }}><Icon size={18}/><span><strong>{LABELS[status]}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
     {showContext && <Modal title="Review context & exceptions" onClose={() => setShowContext(false)}><p className="context-path">{selectedPath}</p><StatusBadge effective={effective}/><RollupCoverageDetails effective={effective}/><AuditDetails stats={details?.audit ?? selectedEntry?.audit} logicalFallback={selectedEntry?.kind === 'file' ? selectedEntry.size : undefined}/>{agentDecision && <div className="context-box"><Link2 size={16}/><div><p>Saved through MCP by {typeof activeProvenance?.actor === 'string' ? activeProvenance.actor : 'an agent'}{typeof activeProvenance?.at === 'string' ? ` · ${new Date(activeProvenance.at).toLocaleString()}` : ''}.</p>{typeof activeProvenance?.reason === 'string' && <p>{activeProvenance.reason}</p>}</div></div>}{pathSuggestions.length > 0 && <section className="assistant-proposals"><h3>Assistant proposals · not applied</h3><p>Suggestions are separate from saved decisions. No proposal below changes a classification.</p>{pathSuggestions.map(suggestion => <article key={suggestion.id}><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: suggestion.status }}/><p>{suggestion.reason}</p><small>{suggestion.actor} · MCP suggestion{suggestion.createdAt ? ` · ${new Date(suggestion.createdAt).toLocaleString()}` : ''}</small></article>)}</section>}{effective.inheritedFrom && <div className="context-box"><Info size={16}/>{effective.originalStatus === 'on-external' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has a manual F: assertion. This child needs its own review. Backup assertions are not inherited.</p> : effective.originalStatus === 'manual-confirmed' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has your manual-backup confirmation for that path. Review this child separately.</p> : <p>Inherited from <strong>{effective.inheritedFrom}</strong>. Choosing a decision creates a specific child exception.</p>}</div>}{effective.stale && <div className="context-box warning"><TriangleAlert size={16}/><p>Source metadata changed or new content was discovered after the decision. Review it again. The earlier claim remains in history.</p></div>}{details && !details.exists && <div className="context-box warning"><TriangleAlert size={16}/><p>This path is missing or unavailable. Its saved decision is retained. You can edit notes; classification is unavailable until the path can be read again.</p></div>}{selectedPath !== view.path && !selectedEntry && !loading && <p className="modal-intro">The selected path is outside the current page or filter. Its decision remains open.</p>}{activeDecision?.decidedAt && <p className="decision-date">Decision recorded {new Date(activeDecision.decidedAt).toLocaleString()}</p>}<div className="evidence-note"><ShieldCheck size={18}/><p>Manual marks record your pending copy or your confirmation. Source checksums, destination-copy receipts and restore checks provide separate evidence. The green Already on F: mark retains your manual F: assertion.</p></div>{details && details.overrides.length > 0 ? <div className="overrides"><h3>Specific child decisions · {details.overrides.length} recorded</h3>{details.overrides.map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <div key={`${decision.path}-${index}`}><button disabled={!location.path} title={decision.path} onClick={() => { if (!location.path) return; setShowContext(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}><span className={`decision-dot status-${decision.status}`}/><span>{decision.path}</span><ChevronRight size={13}/></button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}</div>; })}</div> : <p className="modal-intro context-empty">No specific child exceptions are recorded for this path.</p>}</Modal>}
     {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>This optional index discovers folder names for navigation. The Count & hash controls run the full allocation and source checksum audit.</p><div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued</p><p className="modal-intro">Protected paths, failed reads and links are recorded here. No ownership or permissions are changed. This shows the latest 200 gaps; the inventory may discover more.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
-    {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}
+    {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item} onGroupUndo={readOnly ? undefined : groupId => { void prepareGroupUndo(groupId, true).catch(report); }}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}
     {showSaved && <Modal title="Saved decisions & notes" onClose={() => setShowSaved(false)}><p className="modal-intro">Every saved record remains here, including paths that were moved, removed or belong to a previous volume. Availability is checked when you open a path. A previous disk’s decision is never applied to a different disk using the same drive letter.</p><div className="saved-tools"><input aria-label="Search saved decisions and notes" placeholder="Search saved paths and notes…" value={savedSearch} onChange={event => { setSavedSearch(event.target.value); setSavedPage(0); }}/><select aria-label="Filter saved records" value={savedFilter} onChange={event => { setSavedFilter(event.target.value); setSavedPage(0); }}><option value="all">All saved records</option>{STATUSES.map(status => <option value={status} key={status}>{LABELS[status]}</option>)}</select></div><p className="saved-result-count">{savedDecisions.length.toLocaleString()} matching saved records · current availability not yet checked</p>{savedDecisions.slice(savedPage * 100, (savedPage + 1) * 100).map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <article className="saved-record" key={`${decision.path}-${index}`}><div><strong>{decision.path}</strong><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: decision.status, own: true }}/>{decision.noteOnly === true && <small>Note only · classification not set</small>}{decision.notes && <p>{decision.notes}</p>}{decision.decidedAt && <small>Recorded {new Date(decision.decidedAt).toLocaleString()}</small>}</div><div className="saved-review-action"><button disabled={!location.path} onClick={() => { if (!location.path) return; setShowSaved(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}>Review path</button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}{location.path && location.path.toLowerCase() !== decision.path.toLowerCase() && <small>Current location: {location.path}</small>}</div></article>; })}{!savedDecisions.length && <div className="empty-state"><Database size={28}/><h3>No matching saved records</h3><p>New decisions and notes are captured as you review folders.</p></div>}<div className="saved-pagination"><button disabled={savedPage === 0} onClick={() => setSavedPage(page => page - 1)}>Previous 100</button><span>Page {savedPage + 1} / {Math.max(1, Math.ceil(savedDecisions.length / 100))}</span><button disabled={(savedPage + 1) * 100 >= savedDecisions.length} onClick={() => setSavedPage(page => page + 1)}>Next 100</button></div></Modal>}
+    {groupReview && <Modal title={groupReview.mode === 'mark' ? 'Review selected entries' : 'Review group Undo'}
+      closeDisabled={groupBusy || groupAttempt !== null} onClose={closeGroupReview}
+      fallbackFocus={() => columnStripRef.current?.querySelector<HTMLButtonElement>('.root-column .column-review')?.focus()}>
+      <SelectionReview key={groupReview.operationId} review={groupReview} attempted={groupAttempt} busy={groupBusy}
+        error={groupProblem} onSubmit={operation => { void applyGroup(operation); }}
+        onRefresh={() => { void refreshGroupReview(); }} onRemove={removeGroupTarget}/>
+    </Modal>}
   </div>;
 }
 
-function HistoryEntry({ value }: { value: unknown }) {
+function HistoryEntry({ value, onGroupUndo }: { value: unknown; onGroupUndo?: (groupId: string) => void }) {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return <article className="human-history"><strong>Earlier journal entry</strong><p>Retained in your data file.</p></article>;
   const item = record(value);
   const before = typeof item.before === 'object' && item.before !== null && !Array.isArray(item.before) ? record(item.before) : null;
   const after = typeof item.after === 'object' && item.after !== null && !Array.isArray(item.after) ? record(item.after) : null;
   const beforeLabel = before && isStatus(before.status) ? LABELS[before.status] : 'No explicit decision';
   const afterLabel = after && isStatus(after.status) ? LABELS[after.status] : 'No explicit decision';
-  const label = item.type === 'note' ? 'Notes updated' : item.type === 'undo' ? 'Previous change undone' : 'Decision changed';
+  const groupCount = typeof item.memberCount === 'number' && Number.isSafeInteger(item.memberCount) ? item.memberCount : null;
+  const groupSuffix = groupCount === null ? '' : ` · ${groupCount} entries`;
+  const label = item.type === 'bulkClassify' ? `Group decision saved${groupSuffix}`
+    : item.type === 'undoGroup' ? `Group decision undone${groupSuffix}`
+    : item.type === 'note' ? 'Notes updated' : item.type === 'undo' ? 'Previous change undone' : 'Decision changed';
   const provenance = typeof item.provenance === 'object' && item.provenance !== null && !Array.isArray(item.provenance) ? record(item.provenance) : null;
   const origin = provenance?.kind === 'agent-mcp' || provenance?.kind === 'mcp-agent' ? `${typeof provenance.actor === 'string' ? provenance.actor : 'Agent'} · MCP` : 'Manual app edit';
-  return <article className="human-history"><div><strong>{label}</strong>{typeof item.at === 'string' && <small>{new Date(item.at).toLocaleString()}</small>}</div><small className="history-origin">{origin}</small>{item.type === 'note' ? <p>{after && typeof after.notes === 'string' && after.notes ? after.notes : 'Notes cleared'}</p> : <p>{beforeLabel}<ArrowRight size={12}/>{afterLabel}</p>}{typeof item.undoneAt === 'string' && <small>This change was later undone.</small>}</article>;
+  const groupId = item.type === 'bulkClassify' && item.undoneAt == null && typeof item.id === 'string' ? item.id : null;
+  return <article className="human-history"><div><strong>{label}</strong>{typeof item.at === 'string' && <small>{new Date(item.at).toLocaleString()}</small>}</div><small className="history-origin">{origin}</small>{item.type === 'note' ? <p>{after && typeof after.notes === 'string' && after.notes ? after.notes : 'Notes cleared'}</p> : <p>{beforeLabel}<ArrowRight size={12}/>{afterLabel}</p>}{typeof item.undoneAt === 'string' && <small>This change was later undone.</small>}
+    {groupId && onGroupUndo && <button type="button" onClick={() => onGroupUndo(groupId)}>Review group Undo</button>}
+  </article>;
 }
 
 function ReviewedUndoTarget({ document }: { document: Document }) {
-  const target = [...document.history].reverse().find(value => {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-    const event = record(value);
-    return (event.type === 'classify' || event.type === 'note') && event.undoneAt == null;
-  });
-  if (!target) return <div className="context-box warning"><TriangleAlert size={16}/><p>This revision has no eligible history change to undo. The pending Undo cannot complete unless an eligible change exists.</p></div>;
-  const event = record(target);
+  const event = latestUndoEvent(document);
+  if (!event) return <div className="context-box warning"><TriangleAlert size={16}/><p>This revision has no eligible history change to undo. The pending Undo cannot complete unless an eligible change exists.</p></div>;
+  if (event.type === 'bulkClassify') return <div className="context-box warning"><TriangleAlert size={16}/><p>The latest saved change is a group. It requires reviewing and confirming Undo for the exact group.</p></div>;
   const previous = typeof event.before === 'object' && event.before !== null && !Array.isArray(event.before) ? record(event.before) : null;
   const current = typeof event.after === 'object' && event.after !== null && !Array.isArray(event.after) ? record(event.after) : null;
   return <div className="conflict-saved-summary"><h3>Undo latest saved change</h3><p>Applying pending Undo targets this reviewed change, which may be from another reviewer. A later saved change stops the request for another review.</p><strong>{typeof event.path === 'string' ? event.path : 'Path not recorded'}</strong><p>{event.type === 'note' ? 'Notes update' : 'Classification change'}{typeof event.at === 'string' ? ` · ${new Date(event.at).toLocaleString()}` : ''}{typeof event.id === 'string' ? ` · event ${event.id}` : ''}</p>{event.type === 'note' ? <p>Restore notes to: {typeof previous?.notes === 'string' ? previous.notes || '(empty)' : '(no earlier notes)'}</p> : <p>{isStatus(current?.status) ? LABELS[current.status] : 'No explicit decision'} → {isStatus(previous?.status) ? LABELS[previous.status] : 'No explicit decision'}</p>}</div>;
 }
 
-function Modal({ title, onClose, children, compact = false }: { title: string; onClose: () => void; children: React.ReactNode; compact?: boolean }) {
+function Modal({ title, onClose, children, compact = false, closeDisabled = false, fallbackFocus }: {
+  title: string; onClose: () => void; children: React.ReactNode; compact?: boolean;
+  closeDisabled?: boolean; fallbackFocus?: () => void;
+}) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = ref.current;
     const previous = window.document.activeElement;
     dialog?.showModal();
-    return () => { dialog?.close(); if (previous instanceof HTMLElement) previous.focus(); };
+    return () => {
+      dialog?.close();
+      if (previous instanceof HTMLElement && previous.isConnected) previous.focus();
+      else fallbackFocus?.();
+    };
   }, []);
-  return <dialog ref={ref} aria-label={title} className={`modal${compact ? ' compact-modal' : ''}`} onCancel={event => { event.preventDefault(); onClose(); }}><div className="modal-header"><h2>{title}</h2><button className="icon-button" aria-label={`Close ${title}`} onClick={onClose}><X size={19}/></button></div><div className="modal-body">{children}</div></dialog>;
+  return <dialog ref={ref} aria-label={title} className={`modal${compact ? ' compact-modal' : ''}`} onCancel={event => { event.preventDefault(); if (!closeDisabled) onClose(); }}><div className="modal-header"><h2>{title}</h2><button className="icon-button" aria-label={`Close ${title}`} disabled={closeDisabled} onClick={onClose}><X size={19}/></button></div><div className="modal-body">{children}</div></dialog>;
 }

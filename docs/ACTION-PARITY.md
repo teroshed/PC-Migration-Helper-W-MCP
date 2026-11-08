@@ -57,6 +57,8 @@ confirmation, fencing, retries and asynchronous status.
 | Flush pending saves, safely retry a failed save, compare a conflict, apply exact retained edits to a reviewed revision | `control_ui`: `flushPending` / `retryPending` / `compareConflict` / `retryReviewed` | `control_ui` |
 | Dismiss status or error feedback while retaining user work | `control_ui`: `dismissFeedback` | `control_ui` |
 | Gracefully close the window, explicitly exit, or retry/cancel a waiting exit ticket | `control_ui`: `closeWindow` / `exitApp` / `retryExit` / `cancelExit` | `control_ui` |
+| Select or clear exact rows; open selection review | `control_ui`: `setEntrySelection` / `clearEntrySelection` / `openSelectionReview` | `control_ui` |
+| Review grouped history; atomically save or undo a reviewed group | `read_review_group` / `mark_review_selection` / `undo_review_group` | `get_review_group`; `mutate`: `bulkClassify` / `undoGroup` |
 | Inspect a damaged journal and a valid recovery backup | `get_recovery_state` | `get_recovery_state` |
 | Explicitly restore that reviewed backup, preserving the displaced original | `recover_review` | `recover_review` |
 

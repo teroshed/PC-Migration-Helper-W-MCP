@@ -125,6 +125,8 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
         "setAssistanceOverride" => &["action", "open", "questionId"],
         "setCopyDetails" | "setGatewayDetails" => &["action", "open"],
         "setRowMenu" => &["action", "path"],
+        "setEntrySelection" => &["action", "path", "selected", "expectedSelectionFingerprint"],
+        "clearEntrySelection" | "openSelectionReview" => &["action", "expectedSelectionFingerprint"],
         "retryReviewed" => &[
             "action",
             "expectedComparisonRevision",
@@ -221,6 +223,21 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
                 crate::filesystem::normalize(path)?;
             }
         }
+        "setEntrySelection" | "clearEntrySelection" | "openSelectionReview" => {
+            let expected = text(command, "expectedSelectionFingerprint")?;
+            if expected.len() != 64 || !expected.bytes().all(|byte|
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("A current selection SHA-256 fingerprint is required".into());
+            }
+            if action == "setEntrySelection" {
+                if !command["selected"].is_boolean() {
+                    return Err("selected must be true or false".into());
+                }
+                let path = text(command, "path")?;
+                crate::filesystem::normalize(path)?;
+            }
+        }
         "retryReviewed" => {
             command["expectedComparisonRevision"]
                 .as_u64()
@@ -263,7 +280,7 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
 }
 fn validate_command(s: &AppState, command: &Value) -> Result<(), String> {
     validate_command_structure(command)?;
-    if command["action"] == "setRowMenu" {
+    if matches!(command["action"].as_str(), Some("setRowMenu" | "setEntrySelection")) {
         if let Some(path) = command["path"].as_str() {
             crate::filesystem::safe(path, &s.volumes, false)?;
         }
@@ -566,6 +583,12 @@ pub(crate) fn request(
         .ok_or("Invalid current revision")?;
     if request["expectedRevision"].as_u64() != Some(revision) {
         return Err("The review changed. Inspect the current UI state before continuing.".into());
+    }
+    if matches!(command["action"].as_str(),
+        Some("setEntrySelection" | "clearEntrySelection" | "openSelectionReview"))
+        && command["expectedSelectionFingerprint"] != session.state["selection"]["fingerprint"]
+    {
+        return Err("The active selection changed. Read the current selection before continuing.".into());
     }
     if matches!(command["action"].as_str(), Some("retryExit" | "cancelExit"))
         && (session.state["close"]["ticket"] != command["expectedExitTicket"]
