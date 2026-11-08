@@ -731,6 +731,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
             Ok(details)
         },
         "get_status"=>status_service(state),
+        "get_assisted_review"=>crate::assistance::snapshot(state,&crate::document(state)?),
         "audit_status"=>crate::audit_status_service(state),
         "audit_control"=>crate::audit_control_service(state,&text(params,"action",None)?,&text(params,"scope",Some("all"))?,params.get("path").and_then(Value::as_str)),
         "audit_notifications"=>{

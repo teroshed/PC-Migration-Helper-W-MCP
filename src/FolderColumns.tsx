@@ -8,6 +8,7 @@ import type { Entry, Listing, PreviewColumn, Status } from './model';
 import { DESCRIPTIONS, ICONS, LABELS, reviewStatusLabel, StatusBadge } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
+import { MAX_COLUMN, MIN_COLUMN, ResizeGrip } from './ReviewLayout';
 import { allocatedLabel, auditDescription, AuditProgress } from './Audit';
 import { isRestoredScroll, restoreReviewScroll, reviewActivityLabel, reviewPathKey, showReviewRow } from './ReviewActivity';
 import type { ActivityRow, ReviewActivitySnapshot } from './ReviewActivity';
@@ -25,6 +26,8 @@ export interface ColumnActions {
   onCloseByKey: (depth: number) => void;
   onEscapeRows: () => void;
   onFirstAttention: (path: string, depth: number) => void;
+  onResizeColumn: (depth: number, width: number, fill: boolean) => void;
+  fillDepth: number | null;
   onMenu: (target: RowMenuTarget) => void;
   onReviewFolder: (path: string) => void;
   onReadPendingChange: (delta: number) => void;
@@ -52,6 +55,7 @@ interface DirectoryColumnProps extends ColumnActions {
 
 export function DirectoryColumn(props: DirectoryColumnProps) {
   const ownRef = useRef<HTMLDivElement>(null);
+  const columnRef = useRef<HTMLElement>(null);
   const listRef = props.listRef ?? ownRef;
   const listing = props.listing?.path.toLowerCase() === props.path.toLowerCase() ? props.listing : null;
   const pages = Math.max(1, Math.ceil((listing?.total ?? 0) / 100));
@@ -154,7 +158,7 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       if (!event.repeat) props.onCloseByKey(props.depth);
     }
   }
-  return <section className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${props.width}px` } as React.CSSProperties}>
+  return <section ref={columnRef} id={'review-folder-column-' + props.depth} className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-fill={props.fillDepth === props.depth ? 'true' : undefined} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${props.width}px` } as React.CSSProperties}>
     <div className="column-heading"><button ref={headingRef} className="column-review" onKeyDown={headingKey} aria-label={`Review folder ${props.path}`} data-review-activity={folderActivity?.pulse?.kind} title={`Review this folder: ${props.path}${folderActivityLabel ? ` · ${folderActivityLabel}` : ''}`} onClick={() => props.onReviewFolder(props.path)}><FolderOpen size={15}/><span><small>{props.depth ? `PREVIEW ${props.depth}` : 'CURRENT LOCATION'}{folderActivityLabel && ` · ${folderActivityLabel}`}</small><strong>{baseName(props.path)}</strong></span>{folderActivity?.pulse && <i key={folderActivity.pulse.sequence} className="review-activity-pulse" aria-hidden="true"/>}</button>{props.loading && <LoaderCircle size={14} className="spin" aria-label="Reading folder"/>}<button className="column-icon" title="Refresh immediate contents" aria-label={`Refresh column ${props.path}`} disabled={props.loading} onClick={props.onRefresh}><RefreshCw size={14}/></button>{props.onClose && <button className="column-icon" aria-label={`Close preview ${props.depth} and deeper previews`} onClick={props.onClose}><X size={15}/></button>}</div>
     <div className="column-path" title={props.path}>{props.path}</div>
     <div className="column-labels"><span>{props.knownSearch ? 'KNOWN FOLDERS' : 'FOLDER / FILE'}</span><span>DECISION · ⋯ TO MARK</span></div>
@@ -169,6 +173,14 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       {props.error && !props.loading && <div className="column-error"><TriangleAlert size={23}/><h3>Folder could not be read</h3><p>{props.error}</p><p>The gap is retained. Other columns remain usable.</p><button onClick={props.onRefresh}>Try reading again</button></div>}
     </div><OverflowIndicators targetRef={listRef} axis="vertical" refreshKey={pinned ?? listing}/></div>
     <div className="column-footer"><span>{props.loading ? 'Reading…' : `${(listing?.total ?? 0).toLocaleString()} items`}</span>{!props.knownSearch && <div className="pagination"><button aria-label={`Previous page in ${props.path}`} disabled={!props.page || props.loading} onClick={() => props.onPage(Math.max(0, props.page - 1))}><ChevronLeft size={15}/></button><span>{props.page + 1} / {pages}</span><button aria-label={`Next page in ${props.path}`} disabled={props.page + 1 >= pages || props.loading} onClick={() => props.onPage(props.page + 1)}><ChevronRight size={15}/></button></div>}</div>
+    {props.fillDepth !== props.depth && <ResizeGrip label={`Resize folder column ${props.depth + 1}`}
+      controls={'review-folder-column-' + props.depth} min={MIN_COLUMN} max={MAX_COLUMN} size={() => columnRef.current?.getBoundingClientRect().width ?? props.width}
+      target={() => columnRef.current} variable="--drag-column-width" edgeLabel="Release to fill the folder pane" edgeShortcut
+      edge={(event, raw) => {
+        const frame = columnRef.current?.closest('.folder-strip-frame')?.getBoundingClientRect();
+        return Boolean(frame && raw > props.width + 6 && event.clientX >= frame.right - 46);
+      }}
+      onCommit={(width, fill) => props.onResizeColumn(props.depth, width, fill)}/>}
   </section>;
 }
 
@@ -223,7 +235,7 @@ function EntryRow({ entry, selected, menuOpen, pinned, activity, nowMs, onSelect
     }
   }}>
     <button className="entry-select" data-entry-path={entry.path} aria-current={selected ? 'true' : undefined} aria-label={`${entry.kind === 'folder' ? 'Open folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${reviewLabel ? `, ${reviewLabel}` : ''}`} title={`${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`} onClick={entry.kind === 'folder' ? onOpen : onSelect}>
-      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span><span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
+      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span><span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
     </button>
     {entry.kind === 'folder' && <button className="entry-preview" title={`Preview ${entry.name} in the next column`} aria-label={`Preview folder ${entry.name}`} onClick={onPreview}><ChevronRight size={17}/></button>}
     <button className="entry-more" title={`Mark ${entry.name}`} aria-label={`Mark ${entry.name}: more actions`} aria-haspopup="menu" aria-expanded={menuOpen} aria-controls={menuOpen ? 'row-classification-menu' : undefined} onClick={event => menu(event.currentTarget)}><MoreHorizontal size={17}/></button>

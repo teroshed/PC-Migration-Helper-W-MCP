@@ -1,0 +1,133 @@
+.review-heading-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.assistance-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  white-space: nowrap;
+}
+
+.modal:has(.assistance-interview) {
+  width: min(660px, calc(100vw - 32px));
+  height: fit-content;
+  max-height: calc(100vh - 32px);
+}
+
+.assistance-interview {
+  display: grid;
+  gap: 12px;
+  color: #bac9dd;
+}
+
+.assistance-interview p {
+  margin: 0;
+}
+
+.assistance-scope {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.assistance-scope strong,
+.assistance-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assistance-scope strong,
+.assistance-question h3 {
+  color: #e1edff;
+}
+
+.assistance-question {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #344963;
+  border-radius: 10px;
+  background: #172337;
+}
+
+.assistance-question h3 {
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+.assistance-question h3:focus-visible {
+  outline: 2px solid #9ebcff;
+  outline-offset: 2px;
+}
+
+.assistance-recommendation,
+.assistance-actions,
+.assistance-overrides {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.assistance-recommendation {
+  justify-content: space-between;
+}
+
+.assistance-recommendation > span:first-child,
+.assistance-actions > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.assistance-actions > button,
+.assistance-overrides > button {
+  min-height: 36px;
+}
+
+.assistance-overrides {
+  border: 1px solid #344963;
+  border-radius: 7px;
+  padding: 8px;
+}
+
+.assistance-overrides legend {
+  padding-inline: 5px;
+}
+
+.assistance-overrides p {
+  flex-basis: 100%;
+}
+
+.assistance-reason {
+  overflow-wrap: anywhere;
+}
+
+.assistance-error {
+  color: #ffb9b5;
+}
+
+@media (max-height: 740px) {
+  .assistance-trigger {
+    min-height: 25px;
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+}
+
+@media (forced-colors: active) {
+  .assistance-question h3:focus-visible {
+    outline-color: Highlight;
+  }
+}
+.browser-heading > div:first-child {
+  min-width: 0;
+}

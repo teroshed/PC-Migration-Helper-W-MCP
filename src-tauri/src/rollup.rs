@@ -27,6 +27,8 @@ fn known_status(value: &Value) -> Option<&'static str> {
         "redownload" => Some("redownload"),
         "erase" => Some("erase"),
         "on-external" => Some("on-external"),
+        "manual-pending" => Some("manual-pending"),
+        "manual-confirmed" => Some("manual-confirmed"),
         _ => None,
     }
 }

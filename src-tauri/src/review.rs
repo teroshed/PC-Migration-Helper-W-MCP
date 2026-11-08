@@ -406,6 +406,11 @@ fn reveal_patch(s: &AppState, doc: &Value, view: &Value, target: &Value) -> Resu
     }
     patch["selectedPath"] = json!(path);
     patch["revealPath"] = json!(path);
+    let target_depth = if main_matches { 0 } else { preview.map_or(0, |index| index + 1) };
+    if view["layout"]["fillDepth"].as_u64().is_some_and(|depth| depth != target_depth as u64) {
+        patch["layout"] = view["layout"].clone();
+        patch["layout"]["fillDepth"] = Value::Null;
+    }
     Ok(patch)
 }
 
@@ -469,7 +474,11 @@ pub(crate) fn plan(s: &AppState, path: String) -> Result<Value, String> {
 
 pub(crate) fn operation_patch(s: &AppState, doc: &Value, op: &Value) -> Result<Value, String> {
     let view = follow_view(s, doc, false)?;
-    let action = action_patch(s, doc, &view, op)?;
+    let mut action = action_patch(s, doc, &view, op)?;
+    if op["action"] == "openPreview" && view["layout"]["fillDepth"].is_u64() {
+        action["layout"] = view["layout"].clone();
+        action["layout"]["fillDepth"] = Value::Null;
+    }
     let fields = action.as_object().ok_or("Invalid review action result")?;
     let mut patch = Map::new();
     if let Some(base) = view.as_object() {
@@ -563,8 +572,45 @@ fn action_patch(s: &AppState, doc: &Value, view: &Value, op: &Value) -> Result<V
             Ok(json!({"selectedPath":path,"revealPath":null}))
         }
         "setView" => view_settings_patch(view, op),
+        "setLayout" => layout_settings_patch(view, op),
         _ => Err("Unknown review action".into()),
     }
+}
+
+fn layout_settings_patch(view: &Value, op: &Value) -> Result<Value, String> {
+    let mut patch = Map::new();
+    if let Some(settings) = op.get("layout") {
+        if !crate::store::valid_review_layout(settings) {
+            return Err("Invalid review layout settings".into());
+        }
+        let mut layout = view["layout"].as_object().cloned().unwrap_or_default();
+        let fields = settings.as_object().ok_or("Invalid review layout settings")?;
+        if fields.get("fillDepth").and_then(Value::as_u64)
+            .is_some_and(|n| n > previews(view).len() as u64)
+        {
+            return Err("The folder column to expand is not open".into());
+        }
+        layout.extend(fields.clone());
+        patch.insert("layout".into(), Value::Object(layout));
+    }
+    if let Some(width) = op.get("width") {
+        if !width.as_f64().is_some_and(|n| (280.0..=800.0).contains(&n)) {
+            return Err("Folder column width must be between 280 and 800 pixels".into());
+        }
+        let depth = depth(op.get("depth"))?;
+        if depth == 0 {
+            patch.insert("browserColumnWidth".into(), width.clone());
+        } else {
+            let mut columns = previews(view);
+            let column = columns.get_mut(depth - 1).ok_or("The preview column is not open")?;
+            column["width"] = width.clone();
+            patch.insert("previewColumns".into(), json!(columns));
+        }
+    }
+    if patch.is_empty() {
+        return Err("Provide a sidebar, toolbar, fill, or width setting".into());
+    }
+    Ok(Value::Object(patch))
 }
 
 fn view_settings_patch(view: &Value, op: &Value) -> Result<Value, String> {

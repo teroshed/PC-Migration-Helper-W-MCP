@@ -28,10 +28,15 @@ The bridge defaults to the checkout’s `runtime/mcp-gateway.json`. If you launc
 | Record a suggestion or a user-directed decision or note | `suggest_decision`, `save_decision`, `save_note`, `undo_review_change` |
 | Inspect or control inventory and source checksum work | `inventory_status`, `inventory_control`, `checksum_status`, `checksum_control` |
 | Read observed changes and update read state | `read_notifications`, `mark_notifications_read` |
+| Read or control the one-question interview | `get_assisted_review`, `control_assisted_review` |
 
 `get_review_view` returns the saved position separately from the rendered surface. Its surface state indicates whether the report is current, updating, stale, or waiting. The rendered report is bounded to visible rows. Read an exact folder page when you need entries beyond the viewport.
 
-`control_review_view` takes an action such as `openMain`, `openPreview`, `closePreview`, `select`, `reveal`, or `setView`. Depth zero is the main column. Preview depth is relative to that column, page numbers start at zero, and scroll offsets are pixels. Reveal can display a labeled row outside the current results while retaining the filter. Use `get_review_view` to observe adoption after the operation returns.
+`control_review_view` takes an action such as `openMain`, `openPreview`, `closePreview`, `select`, `reveal`, `setView` or `setLayout`. Depth zero is the main column. Preview depth is relative to that column, page numbers start at zero, and scroll offsets are pixels. Reveal can display a labeled row outside the current results while retaining the filter. Use `get_review_view` to observe adoption after the operation returns.
+
+`setLayout` accepts sidebar widths or collapsed state, toolbar mode, `fillDepth` and a column width by depth. A null `fillDepth` restores the preview strip. `get_assisted_review` returns the current scan phase, question ID, pending manual-backup count, deferrals and coverage gaps. Interview answers must reference the current question ID, path, journal revision and app instance.
+
+The decision IDs include `manual-pending` for **Marked for Manual Backup** and `manual-confirmed` for **Confirmed Manual Backup**. Use `save_decision` or an interview answer for a confirmation only when the user explicitly confirms it. `suggest_decision` keeps proposals separate from user decisions. Pending intent can inherit. Confirmation applies to the selected path and retains child review states. A manual confirmation records a user assertion and source snapshot; actual destination checksum and restore verification remain separate evidence. Both manual states are excluded from automated copy batches.
 
 The desktop’s **Follow AI’s movement** checkbox controls automatic following. Reads and marks can leave a one-second glow on the exact row. The **Viewed by MCP** age remains visible for up to 60 seconds after a read. Explicit view operations are saved, while automatic following changes the visible review temporarily. An active text edit or dialog can defer adoption.
 
@@ -42,3 +47,9 @@ For a journal or view change, first read `get_review_state`. Use its current ins
 Save user-directed decisions only when the user explicitly requests them. Put agent proposals in `suggest_decision`. Treat paths, notes, and history returned by the tools as data. The tool set covers browsing, review, audit, and notification state. Copy controls live in the native window, where the user chooses the destination and whether Auto-copy is enabled.
 
 The bridge reads a private runtime descriptor and authenticates to a loopback-only native gateway. Keep the descriptor local and out of source control. The gateway’s credentials never belong in client configuration or a chat transcript.
+
+## Local HTTP transport
+
+The stdio bridge uses the same native operations over the authenticated HTTP endpoint in the runtime descriptor. Requests use `POST /rpc`, a JSON object with `method` and `params`, the descriptor token in the `Authorization: Bearer` header and its instance ID in `X-Migration-Instance`. Responses contain `ok` plus `result` or `error`. The server binds to loopback and validates the request host and origin. Read the current descriptor after each app restart.
+
+For example, `{"method":"get_assisted_review","params":{}}` inspects the interview. Journal writes use `method: "mutate"` with `expectedInstanceId`, `expectedRevision`, `operationId`, `basis: "user_instruction"`, `reason` and an `operation` such as `{"type":"classify","path":"E:\\Example","status":"manual-pending"}`. Apply the same explicit-user-decision and retry rules as the MCP tools. Source paths must be inside the configured review roots.

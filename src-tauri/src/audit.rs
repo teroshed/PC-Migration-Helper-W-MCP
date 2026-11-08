@@ -59,6 +59,16 @@ struct HashResult {
     cancelled: bool,
 }
 
+struct HashBaseline {
+    parent: String,
+    digest: Option<String>,
+    logical: i64,
+    allocated: Option<i64>,
+    first_run: i64,
+    identity: String,
+    mtime: String,
+}
+
 struct WorkerPool<'a, J, R> {
     jobs: Option<mpsc::SyncSender<J>>,
     output: Option<mpsc::Receiver<R>>,
@@ -805,31 +815,44 @@ impl Audit {
                     .map_err(error)?;
                 continue;
             }
-            let old: (String, Option<String>, i64, Option<i64>, i64) = tx
+            let old = tx
                 .query_row(
-                    "SELECT parent,digest,logical,allocated,first_run FROM files WHERE id=?1",
+                    "SELECT parent,digest,logical,allocated,first_run,identity,mtime FROM files WHERE id=?1",
                     [result.id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    |r| Ok(HashBaseline {
+                        parent: r.get(0)?,
+                        digest: r.get(1)?,
+                        logical: r.get(2)?,
+                        allocated: r.get(3)?,
+                        first_run: r.get(4)?,
+                        identity: r.get(5)?,
+                        mtime: r.get(6)?,
+                    }),
                 )
                 .map_err(error)?;
-            let values = per_parent.entry(old.0.clone()).or_default();
+            let values = per_parent.entry(old.parent.clone()).or_default();
             if let Some(digest) = &result.digest {
-                let changed = old.1.as_ref().is_some_and(|old| old != digest)
-                    || old.1.is_none() && old.4 == run;
+                // Discovery already records additions. A first stable digest enriches
+                // that observation; only changed content or metadata advances staleness.
+                let changed = old.digest.as_ref().is_some_and(|old| old != digest)
+                    || old.identity != result.identity
+                    || old.mtime != result.mtime
+                    || old.logical != result.logical;
+                let newly_observed = old.digest.is_none() && old.first_run == run;
                 values[0] += 1;
-                values[2] += result.logical - old.2;
-                values[3] += result.allocated.unwrap_or(0) - old.3.unwrap_or(0);
-                values[4] += (result.allocated.is_none() as i64) - (old.3.is_none() as i64);
+                values[2] += result.logical - old.logical;
+                values[3] += result.allocated.unwrap_or(0) - old.allocated.unwrap_or(0);
+                values[4] += (result.allocated.is_none() as i64) - (old.allocated.is_none() as i64);
                 tx.execute("UPDATE files SET state='hashed',digest=?2,verified_at=?3,problem=NULL,logical=?4,allocated=?5,identity=?6,mtime=?7,changed_at=CASE WHEN ?8 THEN ?3 ELSE changed_at END WHERE id=?1",params![result.id,digest,at,result.logical,result.allocated,result.identity,result.mtime,changed]).map_err(error)?;
                 if changed {
                     tx.execute(
                         "UPDATE dirs SET changed_at=?2 WHERE path=?1",
-                        params![old.0, at],
+                        params![old.parent, at],
                     )
                     .map_err(error)?;
                 }
-                if changed && !baseline {
-                    *changes.entry(old.0).or_default() += 1;
+                if (changed || newly_observed) && !baseline {
+                    *changes.entry(old.parent).or_default() += 1;
                 }
             } else {
                 values[1] += 1;
@@ -1416,6 +1439,246 @@ mod tests {
         }
         panic!("audit did not finish");
     }
+
+    const OBSERVED_BEFORE_CONFIRMATION: &str = "2000-01-01T00:00:00Z";
+    const CONFIRMED_AFTER_DISCOVERY: &str = "2001-01-01T00:00:00Z";
+
+    struct PendingHashFixture {
+        audit: Arc<Audit>,
+        file: PathBuf,
+        volumes: Vec<Volume>,
+        run: i64,
+        id: i64,
+    }
+
+    impl PendingHashFixture {
+        fn hash(&self) -> HashResult {
+            hash_file(
+                HashJob {
+                    id: self.id,
+                    path: self.file.to_string_lossy().into_owned(),
+                },
+                &self.volumes,
+                &AtomicBool::new(false),
+            )
+        }
+
+        fn current_since_confirmation(&self) -> bool {
+            !self
+                .audit
+                .changed_below(&self.file.to_string_lossy(), CONFIRMED_AFTER_DISCOVERY)
+                .unwrap()
+        }
+    }
+
+    fn pending_hash_fixture() -> PendingHashFixture {
+        let (audit, parent, volumes) = fixture();
+        let file = parent.join("first.txt");
+        fs::write(&file, b"abc").unwrap();
+        let db = audit.connect().unwrap();
+        db.execute(
+            "INSERT INTO runs(phase,roots,started_at,workers,baseline) VALUES('hashing',?1,?2,1,0)",
+            params![
+                json!([parent.to_string_lossy()]).to_string(),
+                OBSERVED_BEFORE_CONFIRMATION
+            ],
+        )
+        .unwrap();
+        let run = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO dirs(path,parent,run,state,changed_at) VALUES(?1,'',?2,'done',?3)",
+            params![parent.to_string_lossy(), run, OBSERVED_BEFORE_CONFIRMATION],
+        )
+        .unwrap();
+        let observation = observe(
+            &file.to_string_lossy(),
+            &parent.to_string_lossy(),
+            &volumes,
+            false,
+            false,
+        );
+        assert!(observation.problem.is_none());
+        audit
+            .store_discovery(run, &parent.to_string_lossy(), &[observation], "fixture")
+            .unwrap();
+        // Fix the discovery time before the simulated assertion, independently
+        // of scheduler timing between discovery and the first content read.
+        db.execute(
+            "UPDATE files SET changed_at=?1",
+            [OBSERVED_BEFORE_CONFIRMATION],
+        )
+        .unwrap();
+        let id = db
+            .query_row(
+                "SELECT id FROM files WHERE path=?1",
+                [file.to_string_lossy().to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        PendingHashFixture {
+            audit,
+            file,
+            volumes,
+            run,
+            id,
+        }
+    }
+
+    #[test]
+    fn first_hash_enriches_stable_metadata_without_invalidating_confirmation() {
+        let f = pending_hash_fixture();
+        assert!(f.current_since_confirmation());
+        let result = f.hash();
+        assert!(result.digest.is_some());
+        f.audit.store_hashes(f.run, &[result]).unwrap();
+        assert!(f.current_since_confirmation());
+        assert!(!f
+            .audit
+            .changed_below(
+                &f.file.parent().unwrap().to_string_lossy(),
+                CONFIRMED_AFTER_DISCOVERY
+            )
+            .unwrap());
+        let db = f.audit.connect().unwrap();
+        let saved: (String, String, String) = db
+            .query_row(
+                "SELECT digest,verified_at,changed_at FROM files WHERE id=?1",
+                [f.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved.0,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(saved.1.as_str() > CONFIRMED_AFTER_DISCOVERY);
+        assert_eq!(saved.2, OBSERVED_BEFORE_CONFIRMATION);
+        // First observations still produce a notification without claiming a
+        // source change happened after the manual assertion.
+        assert_eq!(f.audit.notifications(100, 0).unwrap()["total"], 1);
+    }
+
+    #[test]
+    fn first_hash_with_changed_metadata_still_invalidates_confirmation() {
+        for field in ["identity", "mtime", "logical"] {
+            let f = pending_hash_fixture();
+            let mut result = f.hash();
+            match field {
+                "identity" => result.identity.push_str("-replacement"),
+                "mtime" => result.mtime.push_str("-modified"),
+                "logical" => result.logical += 1,
+                _ => unreachable!(),
+            }
+            f.audit.store_hashes(f.run, &[result]).unwrap();
+            assert!(!f.current_since_confirmation(), "{field}");
+            let changed: String = f
+                .audit
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT changed_at FROM dirs WHERE path=?1",
+                    [f.file.parent().unwrap().to_string_lossy().to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(changed.as_str() > CONFIRMED_AFTER_DISCOVERY, "{field}");
+        }
+    }
+
+    #[test]
+    fn changed_existing_digest_invalidates_even_with_identical_metadata() {
+        use std::fs::FileTimes;
+        let f = pending_hash_fixture();
+        let first = f.hash();
+        let old_digest = first.digest.clone();
+        let old_identity = first.identity.clone();
+        let old_mtime = first.mtime.clone();
+        let old_logical = first.logical;
+        f.audit.store_hashes(f.run, &[first]).unwrap();
+        let modified = fs::metadata(&f.file).unwrap().modified().unwrap();
+        fs::write(&f.file, b"xyz").unwrap();
+        File::options()
+            .write(true)
+            .open(&f.file)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        let second = f.hash();
+        assert_eq!(second.identity, old_identity);
+        assert_eq!(second.mtime, old_mtime);
+        assert_eq!(second.logical, old_logical);
+        assert_ne!(second.digest, old_digest);
+        f.audit.store_hashes(f.run, &[second]).unwrap();
+        assert!(!f.current_since_confirmation());
+    }
+
+    #[test]
+    fn new_file_discovery_stays_stale_after_first_hash_and_notifies() {
+        let f = pending_hash_fixture();
+        let parent = f.file.parent().unwrap();
+        let added = parent.join("added.txt");
+        fs::write(&added, b"new").unwrap();
+        let observation = observe(
+            &added.to_string_lossy(),
+            &parent.to_string_lossy(),
+            &f.volumes,
+            false,
+            false,
+        );
+        f.audit
+            .store_discovery(f.run, &parent.to_string_lossy(), &[observation], "new-file")
+            .unwrap();
+        let db = f.audit.connect().unwrap();
+        let (id, discovered_at): (i64, String) = db
+            .query_row(
+                "SELECT id,changed_at FROM files WHERE path=?1",
+                [added.to_string_lossy().to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(discovered_at.as_str() > CONFIRMED_AFTER_DISCOVERY);
+        let result = hash_file(
+            HashJob {
+                id,
+                path: added.to_string_lossy().into_owned(),
+            },
+            &f.volumes,
+            &AtomicBool::new(false),
+        );
+        f.audit.store_hashes(f.run, &[result]).unwrap();
+        let hashed_at: String = db
+            .query_row("SELECT changed_at FROM files WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(hashed_at, discovered_at);
+        assert!(f
+            .audit
+            .changed_below(&parent.to_string_lossy(), CONFIRMED_AFTER_DISCOVERY)
+            .unwrap());
+        assert_eq!(f.audit.notifications(100, 0).unwrap()["total"], 1);
+    }
+
+    #[test]
+    fn first_hash_failure_remains_an_invalidating_gap() {
+        let f = pending_hash_fixture();
+        let mut result = f.hash();
+        result.digest = None;
+        result.problem = Some("Synthetic source became unreadable before hashing".into());
+        f.audit.store_hashes(f.run, &[result]).unwrap();
+        assert!(!f.current_since_confirmation());
+        let saved: (String, String) = f
+            .audit
+            .connect()
+            .unwrap()
+            .query_row("SELECT state,problem FROM files WHERE id=?1", [f.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(saved.0, "gap");
+        assert!(saved.1.contains("unreadable"));
+    }
+
     #[test]
     fn baseline_hashes_aggregate_and_persists() {
         let (a, p, v) = fixture();

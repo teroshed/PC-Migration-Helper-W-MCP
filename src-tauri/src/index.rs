@@ -470,7 +470,7 @@ fn sqlite_count(value: u64) -> Result<i64, String> {
             .into()
     })
 }
-fn nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
+pub(super) fn nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
             index,

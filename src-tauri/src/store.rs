@@ -71,6 +71,9 @@ pub fn validate(doc: &Value) -> Result<(), String> {
         || view
             .get("browserColumnWidth")
             .is_some_and(|value| !valid_column_width(value))
+        || view
+            .get("layout")
+            .is_some_and(|value| !valid_review_layout(value))
     {
         return Err(
             "The saved preview-column position has an unsupported format. Original preserved."
@@ -107,7 +110,14 @@ pub fn validate(doc: &Value) -> Result<(), String> {
 pub fn valid_status(s: &str) -> bool {
     matches!(
         s,
-        "attention" | "migrate-now" | "last-moment" | "redownload" | "erase" | "on-external"
+        "attention"
+            | "migrate-now"
+            | "last-moment"
+            | "redownload"
+            | "erase"
+            | "on-external"
+            | "manual-pending"
+            | "manual-confirmed"
     )
 }
 
@@ -124,6 +134,21 @@ pub fn valid_column_width(value: &Value) -> bool {
     value
         .as_f64()
         .is_some_and(|number| number.is_finite() && (240.0..=800.0).contains(&number))
+}
+pub fn valid_review_layout(value: &Value) -> bool {
+    value.as_object().is_some_and(|fields| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "drivesWidth" => value.as_f64().is_some_and(|n| (148.0..=520.0).contains(&n)),
+            "decisionWidth" => value.as_f64().is_some_and(|n| (246.0..=520.0).contains(&n)),
+            "drivesCollapsed" | "decisionCollapsed" => value.is_boolean(),
+            "toolbar" => matches!(
+                value.as_str(),
+                Some("expanded" | "compact" | "path" | "search")
+            ),
+            "fillDepth" => value.is_null() || value.as_u64().is_some_and(|n| n <= 4096),
+            _ => false,
+        })
+    })
 }
 pub fn valid_preview_columns(value: &Value) -> bool {
     value.as_array().is_some_and(|columns| {
@@ -219,7 +244,9 @@ impl Store {
         if recheck.as_deref().map(hash) != self.fingerprint {
             return Err("Data changed outside this app while preparing the save. No main-file replacement was made.".into());
         }
-        atomic_write(&self.path, &bytes)?;
+        atomic_write_guarded(&self.path, &bytes, || {
+            require_fingerprint(&self.path, self.fingerprint.as_deref())
+        })?;
         self.fingerprint = Some(hash(&bytes));
         self.doc = candidate;
         Ok(self.doc.clone())
@@ -254,7 +281,9 @@ impl Store {
             f.write_all(&original).map_err(error)?;
             f.sync_all().map_err(error)?;
         }
-        atomic_write(&self.path, &backup)?;
+        atomic_write_guarded(&self.path, &backup, || {
+            require_fingerprint(&self.path, self.fingerprint.as_deref())
+        })?;
         self.fingerprint = Some(hash(&backup));
         self.doc = doc;
         self.problem = None;
@@ -263,6 +292,26 @@ impl Store {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_guarded(path, bytes, || Ok(()))
+}
+
+fn require_fingerprint(path: &Path, expected: Option<&str>) -> Result<(), String> {
+    let current = match fs::read(path) {
+        Ok(bytes) => Some(hash(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(error(e)),
+    };
+    if current.as_deref() != expected {
+        return Err("Data changed outside this app during save replacement. No main-file replacement was made.".into());
+    }
+    Ok(())
+}
+
+fn atomic_write_guarded(
+    path: &Path,
+    bytes: &[u8],
+    mut before_replace: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let temp = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
@@ -276,7 +325,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     file.write_all(bytes).map_err(error)?;
     file.sync_all().map_err(error)?;
     drop(file);
-    replace(&temp, path).map_err(|e| {
+    replace(&temp, path, &mut before_replace).map_err(|e| {
         format!(
             "Save failed: {e}. Pending data retained at {}",
             temp.display()
@@ -285,34 +334,193 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> Result<(), String> {
+fn replace(
+    from: &Path,
+    to: &Path,
+    before_replace: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
     let a: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
     let b: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe {
-        MoveFileExW(
-            a.as_ptr(),
-            b.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(error(std::io::Error::last_os_error()))
-    } else {
-        Ok(())
+    // A scanner or another reader may briefly omit FILE_SHARE_DELETE. Retry only
+    // these known noncommitted lock failures, with the same synced payload.
+    // The caller's guard runs again before every attempt to protect external edits.
+    const BACKOFF_MS: [u64; 8] = [10, 20, 40, 80, 160, 160, 160, 160];
+    for attempt in 0..=BACKOFF_MS.len() {
+        before_replace()?;
+        if unsafe {
+            MoveFileExW(
+                a.as_ptr(),
+                b.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let problem = std::io::Error::last_os_error();
+        let transient = matches!(problem.raw_os_error(), Some(32 | 33))
+            || (problem.raw_os_error() == Some(5)
+                && (has_delete_sharing_conflict(from) || has_delete_sharing_conflict(to)));
+        if !transient || attempt == BACKOFF_MS.len() {
+            return Err(error(problem));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]));
     }
+    unreachable!("replacement returns on success or the final attempt")
+}
+
+#[cfg(windows)]
+fn has_delete_sharing_conflict(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    // MoveFileEx can map a denied delete-sharing request to ACCESS_DENIED.
+    // Probe that specific access without mutating the file; ACL/readonly failures
+    // remain permanent errors rather than being treated as sharing conflicts.
+    OpenOptions::new()
+        .read(true)
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+        .err()
+        .is_some_and(|problem| matches!(problem.raw_os_error(), Some(32 | 33)))
 }
 #[cfg(not(windows))]
-fn replace(from: &Path, to: &Path) -> Result<(), String> {
+fn replace(
+    from: &Path,
+    to: &Path,
+    before_replace: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    before_replace()?;
     fs::rename(from, to).map_err(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn hold_without_delete_sharing(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn pending_files(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.tmp-", path.file_stem().unwrap().to_string_lossy());
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn wait_for_pending_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pending_files(path).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Save never staged its primary payload"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_primary_sharing_lock_releases_without_replaying_the_commit() {
+        let path = fixture("transient-lock");
+        let mut store = Store::open(path.clone(), r"E:\").unwrap();
+        let before = fs::read(&path).unwrap();
+        let revision = store.revision();
+        let reader = hold_without_delete_sharing(&path);
+        let locked_path = path.clone();
+        let release = std::thread::spawn(move || {
+            wait_for_pending_file(&locked_path);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(reader);
+        });
+        let mut candidate = store.doc.clone();
+        candidate["retainedPayload"] = json!("new user edit");
+        let saved = store.commit(candidate).unwrap();
+        release.join().unwrap();
+        assert_eq!(saved["revision"], revision + 1);
+        assert_eq!(saved["retainedPayload"], "new user edit");
+        assert_eq!(fs::read(path.with_extension("json.bak")).unwrap(), before);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            saved
+        );
+        assert!(pending_files(&path).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_edit_during_replacement_lock_aborts_and_retains_candidate() {
+        let path = fixture("locked-external-edit");
+        let mut store = Store::open(path.clone(), r"E:\").unwrap();
+        let before = store.doc.clone();
+        let mut external = before.clone();
+        external["externalOwner"] = json!("changed while replacement was blocked");
+        let external_bytes = serde_json::to_vec_pretty(&external).unwrap();
+        let reader = hold_without_delete_sharing(&path);
+        let locked_path = path.clone();
+        let written = external_bytes.clone();
+        let edit = std::thread::spawn(move || {
+            wait_for_pending_file(&locked_path);
+            fs::write(&locked_path, &written).unwrap();
+            drop(reader);
+        });
+        let mut candidate = before.clone();
+        candidate["pendingUserEdit"] = json!("retain me");
+        let failed = store.commit(candidate).unwrap_err();
+        edit.join().unwrap();
+        assert!(failed.contains("outside this app"), "{failed}");
+        assert!(failed.contains("Pending data retained"), "{failed}");
+        assert_eq!(store.doc, before);
+        assert_eq!(fs::read(&path).unwrap(), external_bytes);
+        let pending = pending_files(&path);
+        assert_eq!(pending.len(), 1);
+        let payload: Value = serde_json::from_slice(&fs::read(&pending[0]).unwrap()).unwrap();
+        assert_eq!(payload["pendingUserEdit"], "retain me");
+        assert!(payload.get("externalOwner").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_primary_sharing_lock_has_a_bound_and_keeps_original_and_pending_bytes() {
+        let path = fixture("persistent-lock");
+        let mut store = Store::open(path.clone(), r"E:\").unwrap();
+        let before = fs::read(&path).unwrap();
+        let doc = store.doc.clone();
+        let reader = hold_without_delete_sharing(&path);
+        let mut candidate = doc.clone();
+        candidate["pendingUserEdit"] = json!("keep after lock failure");
+        let started = std::time::Instant::now();
+        let failed = store.commit(candidate).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(failed.contains("Pending data retained"), "{failed}");
+        assert_eq!(store.doc, doc);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let pending = pending_files(&path);
+        assert_eq!(pending.len(), 1);
+        let payload: Value = serde_json::from_slice(&fs::read(&pending[0]).unwrap()).unwrap();
+        assert_eq!(payload["pendingUserEdit"], "keep after lock failure");
+        drop(reader);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
     fn fixture(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "migration-master-{label}-{}-{}",

@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
+mod assistance;
 mod audit;
 mod copy_queue;
 mod filesystem;
 mod gateway;
 mod index;
+mod manual_backup;
 mod review;
 mod rollup;
 mod store;
@@ -36,6 +38,7 @@ struct AppState {
     gateway_server: Mutex<Option<gateway::GatewayHandle>>,
     review: review::ReviewBridge,
     copy_queue: Arc<copy_queue::CopyQueue>,
+    assistance: assistance::Cache,
 }
 type Shared = Arc<AppState>;
 
@@ -113,10 +116,10 @@ fn ensure_watcher(state: &Shared) {
         .status()
         .is_ok_and(|status| status["phase"] != "idle")
         || document(state).is_ok_and(|doc| {
-            doc["decisions"].as_object().is_some_and(|decisions| {
+            doc["assistance"]["scope"].is_string() || doc["decisions"].as_object().is_some_and(|decisions| {
                 decisions
                     .values()
-                    .any(|decision| decision["status"] == "on-external")
+                    .any(|decision| matches!(decision["status"].as_str(), Some("on-external" | "manual-confirmed")))
             })
         });
     match watcher::start(roots.clone(), state.exclusions.clone(), callback) {
@@ -154,6 +157,15 @@ fn document(s: &AppState) -> Result<Value, String> {
 }
 
 fn recorded_effective(s: &AppState, doc: &Value, e: &Entry) -> Value {
+    recorded_effective_cached(s, doc, e, &manual_backup::ConfirmationCache::default())
+}
+
+fn recorded_effective_cached(
+    s: &AppState,
+    doc: &Value,
+    e: &Entry,
+    confirmations: &manual_backup::ConfirmationCache,
+) -> Value {
     let Ok((volume, relative, key)) = filesystem::locate(&e.path, &s.volumes) else {
         return json!({"status":"attention","own":false,"inheritedFrom":null,"stale":false,"mixed":0,"originalStatus":null});
     };
@@ -202,6 +214,14 @@ fn recorded_effective(s: &AppState, doc: &Value, e: &Entry) -> Value {
             }
         }
     }
+    if original == "manual-confirmed" {
+        if inherited.is_some() {
+            status = "attention";
+        } else if !confirmations.current(s, decision, volume) {
+            stale = true;
+            status = "attention";
+        }
+    }
     let prefix = if relative.is_empty() {
         String::new()
     } else {
@@ -227,9 +247,18 @@ fn recorded_effective(s: &AppState, doc: &Value, e: &Entry) -> Value {
 }
 
 fn effective(s: &AppState, doc: &Value, entry: &Entry) -> Value {
-    let mut decision = recorded_effective(s, doc, entry);
+    effective_cached(s, doc, entry, &manual_backup::ConfirmationCache::default())
+}
+
+fn effective_cached(
+    s: &AppState,
+    doc: &Value,
+    entry: &Entry,
+    confirmations: &manual_backup::ConfirmationCache,
+) -> Value {
+    let mut decision = recorded_effective_cached(s, doc, entry, confirmations);
     if let Some(summary) = rollup::derive(entry, &decision, doc, &s.volumes, |child| {
-        recorded_effective(s, doc, child)
+        recorded_effective_cached(s, doc, child, confirmations)
     }) {
         if summary["kind"] == "unanimous" {
             decision["status"] = summary["status"].clone();
@@ -328,8 +357,9 @@ fn list_folder_service(
     let mut total = 0usize;
     let mut attention = 0usize;
     let mut counts = serde_json::Map::new();
+    let confirmations = manual_backup::ConfirmationCache::default();
     s.index.each_entry(&path, &search, |entry| {
-        let result = effective(&s, &doc, &entry);
+        let result = effective_cached(&s, &doc, &entry, &confirmations);
         let status = review_status(&result);
         let n = counts.get(status).and_then(Value::as_u64).unwrap_or(0) + 1;
         counts.insert(status.into(), json!(n));
@@ -542,6 +572,7 @@ fn apply_view_patch(
                 }
             }
             "browserColumnWidth" if store::valid_column_width(value) => {}
+            "layout" if store::valid_review_layout(value) => {}
             _ => return Err(format!("Invalid or unsupported review preference: {key}")),
         }
     }
@@ -559,6 +590,10 @@ fn apply_view_patch(
     }
     for (key, value) in patch {
         view[key] = value.clone();
+    }
+    let preview_depth = view["previewColumns"].as_array().map_or(0, Vec::len);
+    if view["layout"]["fillDepth"].as_u64().is_some_and(|n| n > preview_depth as u64) {
+        view["layout"]["fillDepth"] = Value::Null;
     }
     Ok(())
 }
@@ -655,6 +690,7 @@ fn run_mutation_as(
     let provenance = origin.provenance(s.fixture);
     let is_agent = matches!(&origin, MutationOrigin::Agent { .. });
     let mut activity = None;
+    let mut classification_changed = false;
     if matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
         let path = filesystem::normalize(op["path"].as_str().ok_or("Missing suggestion path")?)?;
         let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
@@ -690,7 +726,13 @@ fn run_mutation_as(
                         .map(|path| ("reveal", path.to_string()));
                 }
             }
-            "classify" | "note" => {
+            "assist" => assistance::update(s, &mut doc, &op)?,
+            "classify" | "note" | "assistAnswer" => {
+                let question = if operation_type == "assistAnswer" {
+                    Some(assistance::validate_question(s, &doc, &op)?)
+                } else {
+                    None
+                };
                 let path =
                     filesystem::normalize(op["path"].as_str().ok_or("Missing decision path")?)?;
                 let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
@@ -700,14 +742,21 @@ fn run_mutation_as(
                 } else {
                     json!({"path":path,"volumeId":volume.id,"relativePath":relative,"status":"attention","noteOnly":true,"notes":"","createdAt":now(),"provenance":provenance})
                 };
-                if op["type"] == "classify" {
+                if operation_type != "note" {
+                    classification_changed = true;
                     let status = op["status"]
                         .as_str()
                         .filter(|s| store::valid_status(s))
                         .ok_or("Unknown classification")?;
-                    let (checked, _guards) = filesystem::guard_path(&path, &s.volumes, true)?;
+                    if question.is_some() && status == "attention" {
+                        return Err("Use Defer to leave this interview question unanswered.".into());
+                    }
+                    let (checked, _guards) =
+                        filesystem::guard_path(&path, &s.volumes, question.is_none())?;
                     let entry = filesystem::inspect(&checked);
-                    if entry.problem.is_some() {
+                    if entry.problem.is_some()
+                        || question.as_ref().is_some_and(|q| q["kind"] != entry.kind)
+                    {
                         return Err(
                             "This path is unavailable; the existing decision remains retained."
                                 .into(),
@@ -721,7 +770,11 @@ fn run_mutation_as(
                     after["decidedAt"] = json!(now());
                     after.as_object_mut().unwrap().remove("noteOnly");
                     after["snapshot"] = json!({"fingerprint":entry.fingerprint,"directorySignature":s.index.signature(&path),"observedAt":now(),"scope":"metadata only; no content/hash verification; descendants not exhaustively checked"});
-                    after["verification"] = if status == "on-external" {
+                    after["verification"] = if status == "manual-confirmed" {
+                        json!({"kind":"manual-backup-assertion","assertedAt":now(),"sourcePath":path,"destination":null,
+                            "scope":"User-confirmed manual backup assertion for the selected path only; children require their own review",
+                            "provenance":provenance,"limitations":"User assertion. Destination content, checksums and restore have not been verified by this mark."})
+                    } else if status == "on-external" {
                         json!({"kind":"manual-assertion","assertedAt":now(),"sourcePath":path,"destination":"F:\\ (exact destination not recorded)","scope":"User assertion for selected path; child exceptions retained","exclusions":"Not specified","provenance":provenance,"limitations":"Not verified by this app; no copy, full hash audit, snapshot or restore test performed"})
                     } else {
                         Value::Null
@@ -737,7 +790,11 @@ fn run_mutation_as(
                 after["updatedAt"] = json!(now());
                 after["lastEditedBy"] = provenance.clone();
                 doc["decisions"][&key] = after.clone();
-                doc["history"].as_array_mut().unwrap().push(json!({"id":operation_id,"type":op["type"],"path":path,"key":key,"at":now(),"before":before,"after":after,"provenance":provenance}));
+                let mut event = json!({"id":operation_id,"type":if operation_type == "note" {"note"} else {"classify"},"path":path,"key":key,"at":now(),"before":before,"after":after,"provenance":provenance});
+                if let Some(question) = question {
+                    event["assistanceQuestion"] = question;
+                }
+                doc["history"].as_array_mut().unwrap().push(event);
             }
             "undo" => {
                 let position = doc["history"]
@@ -749,6 +806,7 @@ fn run_mutation_as(
                     })
                     .ok_or("There is no classification or note change to undo")?;
                 let original = doc["history"][position].clone();
+                classification_changed = original["type"] == "classify";
                 let key = original["key"]
                     .as_str()
                     .ok_or("History entry cannot be undone")?;
@@ -815,6 +873,11 @@ fn run_mutation_as(
             .insert(operation_id, receipt);
     }
     let saved = store.commit(doc)?;
+    if classification_changed {
+        // A running pass owns the decision snapshot from its start. Stop further
+        // queued work after an intent change, so the next pass uses the new marks.
+        s.copy_queue.pause();
+    }
     if let Some((kind, path)) = activity {
         s.review.activity(kind, &path, saved["revision"].as_u64());
     }
@@ -1198,30 +1261,32 @@ async fn next_attention(
         .map_err(error)?
 }
 
-fn runtime_directory_arg(args: &[String], name: &str) -> Option<PathBuf> {
+fn runtime_path_arg(args: &[String], name: &str) -> Option<PathBuf> {
     let index = args.iter().position(|arg| arg == name)?;
-    let directory = args
+    let path = args
         .get(index + 1)
         .and_then(|value| filesystem::normalize(value).ok())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
-    if directory.is_none() {
-        eprintln!("{name} requires an absolute local Windows directory path.");
+    if path.is_none() {
+        eprintln!("{name} requires an absolute local Windows path.");
         std::process::exit(2);
     }
-    directory
+    path
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let compact_window = args.iter().any(|arg| arg == "--compact-window");
-    let fixture = runtime_directory_arg(&args, "--fixture-root");
-    let data_directory = runtime_directory_arg(&args, "--data-dir");
+    let fixture = runtime_path_arg(&args, "--fixture-root");
+    let data_directory = runtime_path_arg(&args, "--data-dir");
+    let journal = runtime_path_arg(&args, "--journal-file");
     if (option_env!("MIGRATION_MASTER_FIXTURE_ONLY") == Some("1") && fixture.is_none())
         || fixture.as_ref().is_some_and(|path| !path.join("source").is_dir())
-        || (fixture.is_some() && data_directory.is_some())
+        || (fixture.is_some() && (data_directory.is_some() || journal.is_some()))
+        || journal.as_ref().is_some_and(|path| !path.is_file())
     {
-        eprintln!("Use an absolute --fixture-root with a source directory. --data-dir is for regular runs.");
+        eprintln!("Use --fixture-root with a source directory for isolated runs. For regular runs, --data-dir sets the runtime directory and --journal-file selects an existing review journal.");
         std::process::exit(2);
     }
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1236,6 +1301,7 @@ fn main() {
     let data_path = fixture
         .as_ref()
         .map(|path| path.join("data.json"))
+        .or(journal)
         .unwrap_or_else(|| runtime.join("migration_master_data.json"));
     let roots = filesystem::volumes(fixture.as_ref().map(|p| p.join("source")).as_deref());
     let opened = Store::open(data_path.clone(), &roots[0].root);
@@ -1295,6 +1361,7 @@ fn main() {
         gateway: Mutex::new(json!({"state":"unavailable","problem":"Connection has not started"})),
         gateway_server: Mutex::new(None),
         review: review::ReviewBridge::default(),
+        assistance: assistance::Cache::default(),
         copy_queue,
     });
     tauri::Builder::default()
@@ -1332,6 +1399,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_boot,
+            assistance::get_assisted_review,
             copy_queue_snapshot,
             start_copy_queue,
             pause_copy_queue,
@@ -1359,11 +1427,174 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_copy_intent_requests_pause_before_further_snapshot_work() {
+        let s = fixture();
+        let work = PathBuf::from(&s.volumes[0].root).join("Work");
+        for index in 0..1_000 {
+            std::fs::write(work.join(format!("file-{index:04}.txt")), "synthetic bytes").unwrap();
+        }
+        let path = work.to_string_lossy().into_owned();
+        apply(&s, "copy-planned", json!({"type":"classify","path":path,"status":"migrate-now"}));
+        std::fs::create_dir_all(s.data_path.parent().unwrap().join("destination")).unwrap();
+        let destination = copy_destination(&s);
+        s.copy_queue.start(document(&s).unwrap(), s.volumes.clone(), destination, "all", None).unwrap();
+        apply(&s, "switch-to-manual", json!({"type":"classify","path":path,"status":"manual-pending"}));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = s.copy_queue.status().unwrap();
+            if status["running"] == false {
+                assert_eq!(status["phase"], "paused", "{status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(details_service(&s, path).unwrap()["decision"]["status"], "manual-pending");
+    }
+
+    #[test]
+    fn manual_backup_intent_confirmation_exceptions_and_undo_are_distinct() {
+        let s = fixture();
+        let work = PathBuf::from(&s.volumes[0].root).join("Work");
+        let ordinary = work.join("ordinary.txt");
+        let pending_child = work.join("Child");
+        let private = work.join("Private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(&ordinary, "original").unwrap();
+        std::fs::write(private.join("secret.txt"), "private").unwrap();
+        let work = work.to_string_lossy().into_owned();
+        let pending_child = pending_child.to_string_lossy().into_owned();
+        let private = private.to_string_lossy().into_owned();
+        apply(&s, "manual-plan", json!({"type":"classify","path":work,"status":"manual-pending"}));
+        let pending = details_service(&s, ordinary.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(pending["effective"]["status"], "manual-pending");
+        assert_eq!(pending["effective"]["inheritedFrom"], work);
+        assert!(pending["decision"].is_null());
+        apply(&s, "narrow-pending", json!({"type":"classify","path":pending_child,"status":"manual-pending"}));
+        apply(&s, "private-copy", json!({"type":"classify","path":private,"status":"last-moment"}));
+
+        apply(&s, "owner-confirms", json!({"type":"classify","path":work,"status":"manual-confirmed"}));
+        let confirmed = details_service(&s, work.clone()).unwrap();
+        assert_eq!(confirmed["decision"]["verification"]["kind"], "manual-backup-assertion");
+        assert_eq!(confirmed["decision"]["verification"]["destination"], Value::Null);
+        assert_eq!(details_service(&s, ordinary.to_string_lossy().into_owned()).unwrap()["effective"]["status"], "attention");
+        assert_eq!(details_service(&s, pending_child).unwrap()["effective"]["status"], "manual-pending");
+        assert_eq!(details_service(&s, private).unwrap()["effective"]["status"], "last-moment");
+
+        apply(&s, "undo-owner-confirmation", json!({"type":"undo"}));
+        let restored = details_service(&s, work).unwrap();
+        assert_eq!(restored["decision"]["status"], "manual-pending");
+        assert!(restored["decision"]["verification"].is_null());
+    }
+
+    #[test]
+    fn source_changes_invalidate_selected_manual_confirmation_and_new_leaves_stay_unconfirmed() {
+        let s = fixture();
+        apply(&s, "redownload-ancestor", json!({"type":"classify","path":s.volumes[0].root,"status":"redownload"}));
+        let work = PathBuf::from(&s.volumes[0].root).join("Work");
+        let child = work.join("Child");
+        let leaf = child.join("original.txt");
+        std::fs::write(&leaf, "before").unwrap();
+        let work = work.to_string_lossy().into_owned();
+        apply(&s, "manual-scope-confirmed", json!({"type":"classify","path":work,"status":"manual-confirmed"}));
+        let leaf_path = leaf.to_string_lossy().into_owned();
+        assert_eq!(details_service(&s, work.clone()).unwrap()["effective"]["status"], "manual-confirmed");
+        assert_eq!(details_service(&s, leaf_path.clone()).unwrap()["effective"]["status"], "attention");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&leaf, "after!").unwrap();
+        s.audit.record_watch_change(&leaf_path, "modified").unwrap();
+        let changed = details_service(&s, work.clone()).unwrap();
+        assert_eq!(changed["effective"]["status"], "attention");
+        assert_eq!(changed["effective"]["originalStatus"], "manual-confirmed");
+        assert_eq!(changed["effective"]["stale"], true);
+        assert_eq!(changed["effective"]["own"], true);
+        assert!(changed["effective"]["inheritedFrom"].is_null());
+        assert_eq!(details_service(&s, work.clone()).unwrap()["decision"]["status"], "manual-confirmed");
+
+        apply(&s, "owner-reconfirms", json!({"type":"classify","path":work,"status":"manual-confirmed"}));
+        assert_eq!(details_service(&s, work.clone()).unwrap()["effective"]["status"], "manual-confirmed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(child.join("new.txt"), "new original").unwrap();
+        s.audit.record_watch_change(&child.join("new.txt").to_string_lossy(), "created").unwrap();
+        assert_eq!(details_service(&s, work).unwrap()["effective"]["status"], "attention");
+        let newly_added = details_service(&s, child.join("new.txt").to_string_lossy().into_owned()).unwrap();
+        assert_eq!(newly_added["effective"]["status"], "attention");
+    }
+
+    #[test]
+    fn manual_marks_never_enter_automated_copy_and_override_parent_copy_intent() {
+        let s = fixture();
+        let source = PathBuf::from(&s.volumes[0].root);
+        let work = source.join("Work");
+        let now = work.join("automatic.txt");
+        let pending = work.join("manual-pending.txt");
+        let confirmed = work.join("manual-confirmed.txt");
+        for file in [&now, &pending, &confirmed] {
+            std::fs::write(file, "source bytes").unwrap();
+        }
+        let scope = work.to_string_lossy().into_owned();
+        apply(&s, "auto-parent", json!({"type":"classify","path":scope,"status":"migrate-now"}));
+        apply(&s, "pending-file", json!({"type":"classify","path":pending.to_string_lossy(),"status":"manual-pending"}));
+        apply(&s, "confirmed-file", json!({"type":"classify","path":confirmed.to_string_lossy(),"status":"manual-confirmed"}));
+        let destination_path = s.data_path.parent().unwrap().join("destination");
+        std::fs::create_dir_all(&destination_path).unwrap();
+        let destination = copy_destination(&s);
+        let doc = document(&s).unwrap();
+        let queue = s.copy_queue.snapshot(&doc, &s.volumes, &destination).unwrap();
+        assert_eq!(queue["migrateNowCount"], 1);
+        assert_eq!(queue["lastMomentCount"], 0);
+        s.copy_queue.start(doc, s.volumes.clone(), destination, "all", None).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = s.copy_queue.status().unwrap();
+            if status["running"] == false {
+                assert_eq!(status["phase"], "complete", "{status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(destination_path.join("Work").join("automatic.txt").is_file());
+        assert!(!destination_path.join("Work").join("manual-pending.txt").exists());
+        assert!(!destination_path.join("Work").join("manual-confirmed.txt").exists());
+        assert!(pending.is_file() && confirmed.is_file());
+    }
+
+    #[test]
+    fn manual_child_rollups_and_journal_reopen_preserve_assertion_provenance() {
+        let s = fixture();
+        let parent = PathBuf::from(&s.volumes[0].root).join("Work").join("Group");
+        std::fs::create_dir_all(&parent).unwrap();
+        for name in ["one.txt", "two.txt"] {
+            let path = parent.join(name);
+            std::fs::write(&path, name).unwrap();
+            apply(&s, &format!("pending-{name}"), json!({"type":"classify","path":path.to_string_lossy(),"status":"manual-pending"}));
+        }
+        let path = parent.to_string_lossy().into_owned();
+        let rolled = details_service(&s, path.clone()).unwrap();
+        assert_eq!(rolled["effective"]["rollup"]["kind"], "unanimous");
+        assert_eq!(rolled["effective"]["status"], "manual-pending");
+        for name in ["one.txt", "two.txt"] {
+            apply(&s, &format!("confirm-{name}"), json!({"type":"classify","path":parent.join(name).to_string_lossy(),"status":"manual-confirmed"}));
+        }
+        let rolled = details_service(&s, path).unwrap();
+        assert_eq!(rolled["effective"]["status"], "manual-confirmed");
+        assert_eq!(rolled["effective"]["rollup"]["kind"], "unanimous");
+        let expected = document(&s).unwrap();
+        let journal = s.data_path.clone();
+        let root = s.volumes[0].root.clone();
+        drop(s);
+        let reopened = Store::open(journal, &root).unwrap();
+        assert_eq!(reopened.doc["decisions"], expected["decisions"]);
+        assert_eq!(reopened.doc["history"], expected["history"]);
+    }
     fn wait_audit(s: &AppState) -> Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let status = s.audit.status().unwrap();
-            if status["phase"] == "complete" {
+            if status["phase"] == "complete" && !s.audit.is_running() {
                 return status;
             }
             assert_ne!(status["phase"], "error", "{status}");
@@ -1484,6 +1715,7 @@ mod tests {
             gateway: Mutex::new(json!({"state":"running","instanceId":"fixture-native-instance"})),
             gateway_server: Mutex::new(None),
             review: review::ReviewBridge::default(),
+            assistance: assistance::Cache::default(),
             copy_queue: copy_queue::CopyQueue::new(
                 root.join("copy-receipts.sqlite"),
                 Vec::new(),

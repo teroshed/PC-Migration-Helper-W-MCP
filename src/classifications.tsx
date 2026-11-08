@@ -1,16 +1,23 @@
-import { ArrowDownToLine, CheckCircle2, CircleHelp, Clock3, Download, Trash2, TriangleAlert } from 'lucide-react';
+import { ArrowDownToLine, CheckCircle2, CircleHelp, Clock3, Download, FolderCheck, FolderClock, Trash2, TriangleAlert } from 'lucide-react';
 import type { Effective, Status } from './model';
 
 export const LABELS: Record<Status, string> = {
   attention: 'Needs attention', 'migrate-now': 'Migrate now', 'last-moment': 'Migrate Last Moment',
   redownload: 'To Redownload', erase: 'To be ERASED', 'on-external': 'Already on F:',
+  'manual-pending': 'Marked for Manual Backup', 'manual-confirmed': 'Confirmed Manual Backup',
 };
 export const DESCRIPTIONS: Record<Status, string> = {
   attention: 'No migration decision yet', 'migrate-now': 'Pending · ready for an early copy',
   'last-moment': 'Capture again before the final shutdown', redownload: 'Keep the decision to download it again',
   erase: 'Saved decision only · never deletes anything', 'on-external': 'Your manual assertion · not a verified backup',
+  'manual-pending': 'Manual copy still pending · confirm after you finish copying',
+  'manual-confirmed': 'Your confirmation for this path · review children separately · checksum verification is separate',
 };
-export const ICONS = { attention: CircleHelp, 'migrate-now': ArrowDownToLine, 'last-moment': Clock3, redownload: Download, erase: Trash2, 'on-external': CheckCircle2 };
+export const ICONS = {
+  attention: CircleHelp, 'migrate-now': ArrowDownToLine, 'last-moment': Clock3,
+  redownload: Download, erase: Trash2, 'on-external': CheckCircle2,
+  'manual-pending': FolderClock, 'manual-confirmed': FolderCheck,
+};
 export const EMPTY_EFFECTIVE: Effective = { status: 'attention', own: false, inheritedFrom: null, stale: false, mixed: 0, originalStatus: null };
 export function reviewStatusLabel(effective: Effective): string {
   if (effective.rollup?.kind === 'mixed') return 'Mixed child decisions';

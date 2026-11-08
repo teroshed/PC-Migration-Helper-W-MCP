@@ -51,6 +51,28 @@ test('saved boundary rejects malformed decisions and preserves future fields', (
   assert.throws(() => parseDocument({ ...doc(), decisions: { path: { path: 'E:\\work', status: 'green-means-verified' } } }), /unsupported/);
   assert.throws(() => parseDocument({ ...doc(), revision: '1' }), /Unsupported/);
 });
+test('manual-backup marks preserve distinct saved intent and confirmation with legacy records', () => {
+  const decisions = {
+    pending: {
+      path: 'E:\\Work',
+      status: 'manual-pending',
+      notes: 'Copy this folder manually',
+      futureMetadata: { owner: 'fixture' },
+    },
+    confirmed: {
+      path: 'E:\\Originals',
+      status: 'manual-confirmed',
+      decidedAt: '2026-11-08T10:00:00Z',
+      verification: { kind: 'manual-assertion', futureEvidence: 'preserved' },
+    },
+    legacy: { path: 'E:\\Archive', status: 'on-external' },
+  };
+  const parsed = parseDocument({ ...doc(), decisions });
+  assert.deepEqual(parsed.decisions, decisions);
+  assert.equal(parsed.decisions.pending?.status, 'manual-pending');
+  assert.equal(parsed.decisions.confirmed?.status, 'manual-confirmed');
+  assert.equal(parsed.decisions.legacy?.status, 'on-external');
+});
 test('Windows breadcrumbs stop at the drive root', () => {
   assert.equal(parentPath('E:\\'), null);
   assert.equal(parentPath('E:\\work'), 'E:\\');

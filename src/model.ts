@@ -1,8 +1,19 @@
 import { parseAuditStats } from './audit-model.ts';
 import type { AuditStats, AuditNotification } from './audit-model.ts';
-export const STATUSES = ['attention', 'migrate-now', 'last-moment', 'redownload', 'erase', 'on-external'] as const;
+export const STATUSES = [
+  'attention', 'migrate-now', 'last-moment', 'redownload', 'erase', 'on-external',
+  'manual-pending', 'manual-confirmed',
+] as const;
 export type Status = typeof STATUSES[number];
 export interface PreviewColumn { path: string; page: number; scrollTop: number; width?: number }
+export interface ReviewLayout {
+  drivesWidth?: number;
+  decisionWidth?: number;
+  drivesCollapsed?: boolean;
+  decisionCollapsed?: boolean;
+  toolbar?: 'expanded' | 'compact' | 'path' | 'search';
+  fillDepth?: number | null;
+}
 export interface ViewState {
   path: string;
   selectedPath: string | null;
@@ -14,6 +25,7 @@ export interface ViewState {
   previewColumns: PreviewColumn[];
   previewScrollLeft: number;
   browserColumnWidth?: number;
+  layout?: ReviewLayout;
   revealPath: string | null;
 }
 export interface Decision {
@@ -66,6 +78,10 @@ export type Operation =
   | { type: 'classify'; path: string; status: Status }
   | { type: 'note'; path: string; notes: string }
   | { type: 'view'; patch: Partial<ViewState> }
+  | { type: 'assist'; action: 'scope'; path: string }
+  | { type: 'assist'; action: 'split' | 'defer'; path: string; questionId: string }
+  | { type: 'assist'; action: 'restore' }
+  | { type: 'assistAnswer'; path: string; questionId: string; status: Status }
   | { type: 'undo' };
 
 export function record(value: unknown): Record<string, unknown> {
@@ -107,7 +123,25 @@ export function parseView(value: unknown): ViewState {
       previewColumns: Array.isArray(view.previewColumns) ? view.previewColumns.map(parsePreviewColumn) : [],
       previewScrollLeft: typeof view.previewScrollLeft === 'number' && Number.isFinite(view.previewScrollLeft) ? Math.max(0, view.previewScrollLeft) : 0,
       browserColumnWidth: typeof view.browserColumnWidth === 'number' && Number.isFinite(view.browserColumnWidth) ? Math.max(280, Math.min(800, view.browserColumnWidth)) : undefined,
+      layout: parseReviewLayout(view.layout),
   };
+}
+function parseReviewLayout(value: unknown): ReviewLayout | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const layout = record(value);
+  return {
+    drivesWidth: layoutWidth(layout.drivesWidth, 148),
+    decisionWidth: layoutWidth(layout.decisionWidth, 246),
+    drivesCollapsed: typeof layout.drivesCollapsed === 'boolean' ? layout.drivesCollapsed : undefined,
+    decisionCollapsed: typeof layout.decisionCollapsed === 'boolean' ? layout.decisionCollapsed : undefined,
+    toolbar: layout.toolbar === 'expanded' || layout.toolbar === 'compact' || layout.toolbar === 'path'
+      || layout.toolbar === 'search' ? layout.toolbar : undefined,
+    fillDepth: typeof layout.fillDepth === 'number' && Number.isInteger(layout.fillDepth)
+      && layout.fillDepth >= 0 && layout.fillDepth <= 4096 ? layout.fillDepth : null,
+  };
+}
+function layoutWidth(value: unknown, min: number): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(520, value)) : undefined;
 }
 function parsePreviewColumn(value: unknown): PreviewColumn {
   const column = record(value);

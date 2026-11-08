@@ -82,6 +82,18 @@ At the end of the search field, <kbd>→</kbd> moves to **Known folders**. Press
 
 </details>
 
+## Manual backup decisions
+
+**Marked for Manual Backup** records a manual copy that is still pending and can flow to eligible children as intent. **Confirmed Manual Backup** records your explicit assertion for the selected path. Children retain their own review state. An unmarked parent can show a summary when its observed children are individually confirmed. Observed source changes return an affected confirmation to **Needs attention**.
+
+The app records confirmation time, provenance and source metadata. Destination checksum comparison and restore evidence have their own scope. Both manual choices stay outside automated copy batches. Existing **Already on F:** decisions retain their original selected-path behavior.
+
+## AI Assistance and adjustable layout
+
+Open **AI Assistance**, choose the current folder and complete its metadata inventory. The interview presents one question at a time with **Approve**, **Override**, **Review children** and **Defer**. Likely local exceptions are considered before their parents, and uncertain branches default to keeping data. Deferred branches and coverage gaps stay visible. Pending manual backups receive an explicit confirmation question after the ordinary review decisions.
+
+Drag sidebar or folder-column dividers to resize them, or focus a divider and use the arrow keys. An edge warning appears before a sidebar collapses or a column fills the workspace. Reopen controls restore the saved widths and preview branch. **Ctrl+End** on a folder divider fills its pane. Compact toolbar mode keeps labeled **Path** and **Search** controls available. Layout, filter and review context are saved automatically.
+
 ## Work with an MCP agent
 
 Register the bundled stdio server with your MCP client and leave the native app open. An agent can read folder metadata, saved decisions, audit progress, and the currently rendered review columns. It can navigate or reveal a path without clearing your filter. **Follow AI’s movement** is a window preference that reveals paths as the agent touches them when the review is idle.
@@ -91,6 +103,8 @@ Agent suggestions are stored separately. User-directed changes retain their prov
 ## Data and coverage
 
 The checkout’s `runtime` directory holds the review journal, recovery copy, inventory, audit and copy receipts, and the private gateway descriptor. Keep the journal in your backup plan. To use another writable location, launch the executable with `--data-dir` and an absolute directory path, then point the MCP server at that directory’s descriptor.
+
+Use `--journal-file` with an existing absolute journal filename to retain a journal stored separately from the runtime directory. Fixture runs use their own journal and reject regular-run journal overrides.
 
 The audit checks readable unnamed file streams. Allocation totals count hard-linked entries individually. Access failures, skipped links, unsupported streams, and unavailable paths can leave coverage gaps. A green **Already on F:** mark records your manual assertion. Copy receipts and source checksums cover the reported files and byte streams. Confirm the files and application state you need by testing a restore before retiring a source drive.
 
