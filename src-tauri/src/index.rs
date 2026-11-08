@@ -2,7 +2,7 @@ use crate::{
     filesystem::{self, Entry, Volume},
     store::{error, hash, now},
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -40,6 +40,9 @@ impl Index {
             CREATE INDEX IF NOT EXISTS listing_order ON listing_entries(parent,generation,kind,name COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS listing_heads(parent TEXT PRIMARY KEY COLLATE NOCASE,generation TEXT,observed_at TEXT);
             CREATE TABLE IF NOT EXISTS queue(path TEXT PRIMARY KEY COLLATE NOCASE,state TEXT);
+            CREATE TABLE IF NOT EXISTS scan_progress(path TEXT PRIMARY KEY COLLATE NOCASE,files INTEGER NOT NULL,bytes INTEGER NOT NULL);
+            DELETE FROM scan_progress;
+            UPDATE queue SET state='pending' WHERE state='working';
             CREATE INDEX IF NOT EXISTS queue_state ON queue(state);
             CREATE INDEX IF NOT EXISTS queue_order ON queue(state,length(path),path);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
@@ -54,7 +57,8 @@ impl Index {
         Ok(c)
     }
     pub fn scan_status(&self) -> Result<Value, String> {
-        let db = self.connect()?;
+        let mut db = self.connect()?;
+        let db = db.transaction().map_err(error)?;
         let raw: String = db
             .query_row("SELECT value FROM meta WHERE key='scan'", [], |r| r.get(0))
             .map_err(error)?;
@@ -66,6 +70,33 @@ impl Index {
                 |r| r.get::<_, i64>(0)
             )
             .map_err(error)?);
+        v["active"] = json!(db
+            .query_row(
+                "SELECT count(*) FROM queue WHERE state='working'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .map_err(error)?);
+        v["currentPath"] = json!(db
+            .query_row(
+                "SELECT path FROM queue WHERE state='working' ORDER BY path LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .optional()
+            .map_err(error)?);
+        let (files, bytes): (i64, i64) = db
+            .query_row(
+                "SELECT coalesce(sum(files),0),coalesce(sum(bytes),0) FROM scan_progress",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(error)?;
+        v["currentFiles"] = json!(files);
+        v["currentBytes"] = json!(bytes);
+        v["workers"] = json!(v["workers"].as_u64().unwrap_or(0));
+        // The unseen filesystem has no trustworthy denominator during discovery.
+        v["totalKnown"] = json!(v["status"] == "complete");
         v["gaps"] = json!(db
             .query_row(
                 "SELECT count(*) FROM directories WHERE problem IS NOT NULL",
@@ -135,6 +166,7 @@ impl Index {
         let mut samples = Vec::new();
         let mut errors = 0u64;
         let scanning = self.running.load(Ordering::Relaxed) && cancel.is_some();
+        let mut db = self.connect()?;
         let mut chunk = Vec::with_capacity(500);
         for item in listing {
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -168,7 +200,8 @@ impl Index {
             }
             chunk.push(e);
             if chunk.len() == 500 {
-                self.flush_chunk(
+                Self::flush_chunk_on(
+                    &mut db,
                     path,
                     &generation,
                     &chunk,
@@ -180,15 +213,6 @@ impl Index {
                 chunk.clear();
             }
         }
-        self.flush_chunk(
-            path,
-            &generation,
-            &chunk,
-            cache_files,
-            scanning,
-            files,
-            bytes,
-        )?;
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err("Paused".into());
         }
@@ -202,8 +226,19 @@ impl Index {
                 samples.join("; ")
             ))
         };
-        let mut db = self.connect()?;
         let tx = db.transaction().map_err(error)?;
+        // Publish the final batch and its summary in one commit, avoiding a redundant
+        // journal sync for the overwhelmingly common small-directory case.
+        Self::flush_chunk_in(
+            &tx,
+            path,
+            &generation,
+            &chunk,
+            cache_files,
+            scanning,
+            files,
+            bytes,
+        )?;
         let observed = now();
         let (files_sql, folders_sql, bytes_sql) = (
             sqlite_count(files)?,
@@ -240,6 +275,7 @@ impl Index {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn flush_chunk(
         &self,
         path: &str,
@@ -250,8 +286,50 @@ impl Index {
         files: u64,
         bytes: u64,
     ) -> Result<(), String> {
-        let mut db = self.connect()?;
+        Self::flush_chunk_on(
+            &mut self.connect()?,
+            path,
+            generation,
+            entries,
+            cache_files,
+            scanning,
+            files,
+            bytes,
+        )
+    }
+    fn flush_chunk_on(
+        db: &mut Connection,
+        path: &str,
+        generation: &str,
+        entries: &[Entry],
+        cache_files: bool,
+        scanning: bool,
+        files: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
         let tx = db.transaction().map_err(error)?;
+        Self::flush_chunk_in(
+            &tx,
+            path,
+            generation,
+            entries,
+            cache_files,
+            scanning,
+            files,
+            bytes,
+        )?;
+        tx.commit().map_err(error)
+    }
+    fn flush_chunk_in(
+        tx: &rusqlite::Transaction<'_>,
+        path: &str,
+        generation: &str,
+        entries: &[Entry],
+        cache_files: bool,
+        scanning: bool,
+        files: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
         let observed = now();
         for e in entries {
             if cache_files {
@@ -295,9 +373,9 @@ impl Index {
             }
         }
         if scanning {
-            tx.execute("UPDATE meta SET value=json_set(value,'$.currentFiles',?1,'$.currentBytes',?2) WHERE key='scan'",params![sqlite_count(files)?,sqlite_count(bytes)?]).map_err(error)?;
+            tx.execute("INSERT INTO scan_progress VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET files=?2,bytes=?3",params![path,sqlite_count(files)?,sqlite_count(bytes)?]).map_err(error)?;
         }
-        tx.commit().map_err(error)
+        Ok(())
     }
     fn clean_old_generations(&self, path: &str) -> Result<(), String> {
         let db = self.connect()?;
@@ -386,6 +464,9 @@ impl Index {
         let init = (|| {
             let mut db = self.connect()?;
             let tx = db.transaction().map_err(error)?;
+            tx.execute("UPDATE queue SET state='pending' WHERE state='working'", [])
+                .map_err(error)?;
+            tx.execute("DELETE FROM scan_progress", []).map_err(error)?;
             if !resume {
                 tx.execute("DELETE FROM queue", []).map_err(error)?;
                 for root in &roots {
@@ -421,44 +502,137 @@ impl Index {
             cancel: self.cancel.clone(),
             refresh_locks: self.refresh_locks.clone(),
         };
-        std::thread::spawn(move || {
-            let result = worker.run(&volumes);
+        let spawn = std::thread::Builder::new().name("migration-inventory".into()).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&volumes)))
+                .unwrap_or_else(|_| Err("Inventory stopped unexpectedly; the durable queue can be resumed".into()));
             if let Err(e) = result {
                 if let Ok(db) = worker.connect() {
+                    let _ = db.execute_batch("UPDATE queue SET state='pending' WHERE state='working'; DELETE FROM scan_progress;");
                     let _=db.execute("UPDATE meta SET value=json_set(value,'$.status','error','$.error',?1) WHERE key='scan'",[e]);
                 }
             }
             worker.running.store(false, Ordering::SeqCst);
         });
+        if let Err(e) = spawn {
+            self.running.store(false, Ordering::SeqCst);
+            if let Ok(db) = self.connect() {
+                let _ = db.execute("UPDATE meta SET value=json_set(value,'$.status','error','$.error',?1) WHERE key='scan'", [error(&e)]);
+            }
+            return Err(error(e));
+        }
         Ok(())
     }
     fn run(&self, volumes: &[Volume]) -> Result<(), String> {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        self.run_with_workers(volumes, workers)
+    }
+    fn run_with_workers(&self, volumes: &[Volume], workers: usize) -> Result<(), String> {
+        let workers = workers.clamp(1, 8);
         let db = self.connect()?;
+        db.execute(
+            "UPDATE meta SET value=json_set(value,'$.workers',?1) WHERE key='scan'",
+            [workers as i64],
+        )
+        .map_err(error)?;
+        // Like the audit pool, bound work and retain the durable queue. Workers claim one
+        // directory at a time; no growing in-memory list or unbounded thread creation.
+        let result = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for n in 0..workers {
+                let handle = std::thread::Builder::new().name(format!("migration-inventory-{n}")).spawn_scoped(scope, || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_worker(volumes)))
+                        .unwrap_or_else(|_| Err("Inventory worker stopped unexpectedly; the durable queue can be resumed".into()));
+                    if result.is_err() { self.cancel.store(true, Ordering::SeqCst); }
+                    result
+                });
+                match handle {
+                    Ok(handle) => handles.push(handle),
+                    Err(e) => {
+                        self.cancel.store(true, Ordering::SeqCst);
+                        return Err(error(e));
+                    }
+                }
+            }
+            let mut failure = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        failure.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        failure.get_or_insert("Inventory worker stopped unexpectedly".into());
+                    }
+                }
+            }
+            failure.map_or(Ok(()), Err)
+        });
+        let tx = db.unchecked_transaction().map_err(error)?;
+        tx.execute("UPDATE queue SET state='pending' WHERE state='working'", [])
+            .map_err(error)?;
+        tx.execute("DELETE FROM scan_progress", []).map_err(error)?;
+        let status = if result.is_err() {
+            "error"
+        } else if self.cancel.load(Ordering::Relaxed) {
+            "paused"
+        } else {
+            "complete"
+        };
+        tx.execute("UPDATE meta SET value=json_set(value,'$.status',?1,'$.finishedAt',?2,'$.currentPath',null,'$.currentFiles',0,'$.currentBytes',0) WHERE key='scan'", params![status, if status == "complete" { Some(now()) } else { None }]).map_err(error)?;
+        tx.commit().map_err(error)?;
+        result
+    }
+    fn run_worker(&self, volumes: &[Volume]) -> Result<(), String> {
+        let mut db = self.connect()?;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
-                db.execute(
-                    "UPDATE meta SET value=json_set(value,'$.status','paused') WHERE key='scan'",
-                    [],
-                )
-                .map_err(error)?;
                 return Ok(());
             }
-            let path:Option<String>=db.query_row("SELECT path FROM queue WHERE state='pending' ORDER BY length(path),path LIMIT 1",[],|r|r.get(0)).optional().map_err(error)?;
+            // IMMEDIATE avoids concurrent read-to-write upgrades and duplicate claims.
+            let tx = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(error)?;
+            let path: Option<String> = tx.query_row("SELECT path FROM queue WHERE state='pending' ORDER BY length(path),path LIMIT 1", [], |r| r.get(0)).optional().map_err(error)?;
             let Some(path) = path else {
-                db.execute("UPDATE meta SET value=json_set(value,'$.status','complete','$.finishedAt',?1,'$.currentPath',null,'$.currentFiles',0,'$.currentBytes',0) WHERE key='scan'",[now()]).map_err(error)?;
-                return Ok(());
+                let working: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM queue WHERE state='working')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(error)?;
+                tx.commit().map_err(error)?;
+                if !working {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
             };
-            db.execute("UPDATE meta SET value=json_set(value,'$.currentPath',?1,'$.currentFiles',0,'$.currentBytes',0) WHERE key='scan'",[&path]).map_err(error)?;
+            tx.execute("UPDATE queue SET state='working' WHERE path=?1", [&path])
+                .map_err(error)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO scan_progress VALUES(?1,0,0)",
+                [&path],
+            )
+            .map_err(error)?;
+            tx.commit().map_err(error)?;
             let result = self.refresh(&path, volumes, Some(&self.cancel), false);
             if result.as_ref().is_err_and(|e| e == "Paused") {
-                continue;
+                return Ok(());
             }
-            let tx = db.unchecked_transaction().map_err(error)?;
+            let tx = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(error)?;
             tx.execute(
                 "UPDATE queue SET state=?2 WHERE path=?1",
                 params![path, if result.is_ok() { "done" } else { "gap" }],
             )
             .map_err(error)?;
+            tx.execute("DELETE FROM scan_progress WHERE path=?1", [&path])
+                .map_err(error)?;
             tx.execute("UPDATE meta SET value=json_set(value,'$.processed',coalesce(json_extract(value,'$.processed'),0)+1,'$.files',coalesce(json_extract(value,'$.files'),0)+CASE WHEN ?2 THEN coalesce((SELECT files FROM directories WHERE path=?1),0) ELSE 0 END,'$.bytes',coalesce(json_extract(value,'$.bytes'),0)+CASE WHEN ?2 THEN coalesce((SELECT bytes FROM directories WHERE path=?1),0) ELSE 0 END) WHERE key='scan'",params![path,result.is_ok()]).map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -659,5 +833,125 @@ mod tests {
                 .contains("not followed")
         );
         assert_eq!(i.scan_status().unwrap()["pending"], 0);
+    }
+    #[test]
+    #[ignore = "Synthetic fixture benchmark; never scans live data"]
+    fn inventory_synthetic_benchmark() {
+        let (i, v, p) = fixture("benchmark");
+        for d in 0..160 {
+            let child = p.join(format!("dir-{d:04}"));
+            fs::create_dir(&child).unwrap();
+            for f in 0..40 {
+                fs::write(child.join(format!("file-{f:04}")), b"synthetic").unwrap();
+            }
+        }
+        for workers in [1, 4] {
+            for attempt in 0..3 {
+                let i = Index::open(
+                    i.path
+                        .with_file_name(format!("bench-{workers}-{attempt}.sqlite")),
+                )
+                .unwrap();
+                let db = i.connect().unwrap();
+                db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+                    .unwrap();
+                i.running.store(true, Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                i.run_with_workers(&v, workers).unwrap();
+                eprintln!(
+                    "INVENTORY_BENCH workers={workers} attempt={attempt} elapsed_ms={} status={}",
+                    started.elapsed().as_millis(),
+                    i.scan_status().unwrap()
+                );
+                i.running.store(false, Ordering::Relaxed);
+                assert_eq!(i.scan_status().unwrap()["processed"], 161);
+                assert_eq!(i.scan_status().unwrap()["files"], 6400);
+            }
+        }
+    }
+    #[test]
+    fn interrupted_claim_is_recovered_without_double_counting() {
+        let (i, v, p) = fixture("crash-recovery");
+        fs::write(p.join("file"), b"fixture").unwrap();
+        let db = i.connect().unwrap();
+        db.execute("INSERT INTO queue VALUES(?1,'working')", [path(&p)])
+            .unwrap();
+        db.execute("INSERT INTO scan_progress VALUES(?1,999,999)", [path(&p)])
+            .unwrap();
+        db.execute(
+            "UPDATE meta SET value=?1 WHERE key='scan'",
+            [json!({"status":"running","processed":0,"files":0}).to_string()],
+        )
+        .unwrap();
+        drop(db);
+        let database = i.path.clone();
+        drop(i);
+        let i = Index::open(database).unwrap();
+        let status = i.scan_status().unwrap();
+        assert_eq!(status["status"], "paused");
+        assert_eq!(status["pending"], 1);
+        assert_eq!(status["active"], 0);
+        assert_eq!(status["currentFiles"], 0);
+        i.running.store(true, Ordering::Relaxed);
+        i.run_with_workers(&v, 4).unwrap();
+        let status = i.scan_status().unwrap();
+        assert_eq!(status["processed"], 1);
+        assert_eq!(status["files"], 1);
+        assert_eq!(status["active"], 0);
+        assert_eq!(status["pending"], 0);
+    }
+    #[test]
+    fn parallel_pause_drains_claims_and_resume_counts_each_directory_once() {
+        let (i, v, p) = fixture("parallel-pause");
+        for n in 0..48 {
+            let child = p.join(format!("dir-{n}"));
+            fs::create_dir(&child).unwrap();
+            for f in 0..32 {
+                fs::write(child.join(format!("file-{f}")), b"x").unwrap();
+            }
+        }
+        let db = i.connect().unwrap();
+        db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+            .unwrap();
+        i.running.store(true, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let scan = scope.spawn(|| i.run_with_workers(&v, 4));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let status = i.scan_status().unwrap();
+                assert!(status["active"].as_u64().unwrap() <= 4);
+                if status["active"].as_u64().unwrap() >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "workers never overlapped: {status}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            i.cancel.store(true, Ordering::Relaxed);
+            scan.join().unwrap().unwrap();
+        });
+        let status = i.scan_status().unwrap();
+        assert_eq!(status["status"], "paused");
+        assert_eq!(status["active"], 0);
+        assert_eq!(status["currentFiles"], 0);
+        assert!(status["pending"].as_u64().unwrap() > 0);
+        assert_eq!(status["totalKnown"], false);
+        i.cancel.store(false, Ordering::Relaxed);
+        i.run_with_workers(&v, 4).unwrap();
+        let status = i.scan_status().unwrap();
+        assert_eq!(status["status"], "complete");
+        assert_eq!(status["processed"], 49);
+        assert_eq!(status["files"], 1536);
+        assert_eq!(status["gaps"], 0);
+        assert_eq!(status["active"], 0);
+        assert_eq!(status["pending"], 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM listing_entries", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

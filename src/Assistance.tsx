@@ -5,6 +5,8 @@ import { Check, FolderTree, ScanSearch, Sparkles } from 'lucide-react';
 import { LABELS, StatusBadge, EMPTY_EFFECTIVE } from './classifications';
 import { STATUSES, isStatus, readableBytes, record } from './model';
 import type { Operation, Status } from './model';
+import { inventoryElapsed, inventoryProgressLabel, parseInventoryProgress } from './assistance-progress';
+import type { InventoryProgress } from './assistance-progress';
 import './assistance.css';
 
 interface Question {
@@ -32,7 +34,7 @@ interface Interview {
   gaps: number;
   deferred: number;
   manualPending: number;
-  scannedDirectories: number;
+  progress: InventoryProgress;
   scanProblem: string | null;
 }
 
@@ -64,7 +66,7 @@ function parseInterview(input: unknown): Interview {
   return {
     phase, question, revision: data.revision, scope: typeof data.scope === 'string' ? data.scope : null,
     files: count(data.files), gaps: count(data.gaps), deferred: count(data.deferred), manualPending: count(data.manualPending),
-    scannedDirectories: count(scan.processed), scanProblem: typeof scan.error === 'string' ? scan.error : null,
+    progress: parseInventoryProgress(scan), scanProblem: typeof scan.error === 'string' ? scan.error : null,
   };
 }
 
@@ -175,12 +177,28 @@ export function AssistanceInterview({ currentPath, revision, readOnly, onEdit, c
     </div>
     {problem && <p role="alert" className="assistance-error">{problem}</p>}
     {actionProblem && <p role="alert" className="assistance-error">{actionProblem}</p>}
-    {working && <p role="status">Saving your interview choice…</p>}
-    {!interview && !problem && <p role="status">Loading the interview…</p>}
+    {working && <p role="status">Updating interview.</p>}
+    {!interview && !problem && <div className="assistance-progress-panel">
+      <p role="status">Loading saved inventory and preparing the interview.</p>
+      <progress className="assistance-progress-bar" aria-label="Preparing interview" />
+    </div>}
     {(phase === 'idle' || problem) && <p>Choose a folder to review. The interview uses inventoried metadata to ask one question at a time.</p>}
     {phase === 'needs-scan' && <p>Run the metadata inventory for this folder first. The interview starts when it finishes.</p>}
     {phase === 'needs-scan' && interview?.scanProblem && <p role="alert" className="assistance-error">{interview.scanProblem}</p>}
-    {phase === 'scanning' && interview && <p role="status">Scanning directories… {interview.scannedDirectories.toLocaleString()} processed.</p>}
+    {(phase === 'scanning' || phase === 'paused') && interview && <section className="assistance-progress-panel" aria-label="Inventory progress">
+      <div className="assistance-progress-heading"><strong>{phase === 'paused' ? 'Inventory paused' : 'Discovering folders'}</strong>
+        {interview.progress.workers > 0 && <span>{interview.progress.workers} workers</span>}</div>
+      {phase === 'scanning' && <progress className="assistance-progress-bar" aria-label="Metadata inventory"
+        aria-valuetext={inventoryProgressLabel(interview.progress)} />}
+      <p role="status">{inventoryProgressLabel(interview.progress)}</p>
+      <p>{interview.progress.files.toLocaleString()} files found · {readableBytes(interview.progress.bytes)} logical size</p>
+      {interview.progress.currentPath && <p className="assistance-progress-path" title={interview.progress.currentPath}>
+        {interview.progress.currentPath}</p>}
+      <small>{inventoryElapsed(interview.progress.startedAt, Date.now()) && <>{inventoryElapsed(interview.progress.startedAt, Date.now())} since scan started · </>}
+        {interview.progress.gaps > 0 && <>{interview.progress.gaps.toLocaleString()} recorded coverage gaps · </>}
+        The total grows as folders are discovered. A reliable percentage and ETA are not available yet.</small>
+      <small>Metadata inventory only. It does not hash file contents or verify a backup.</small>
+    </section>}
     {phase === 'other-scan' && <p role="status">Another folder is being inventoried. You can start this scope when that scan stops.</p>}
     {phase === 'paused' && <p>The inventory is paused. Resume it to continue the interview.</p>}
     {question && <section className="assistance-question" aria-labelledby="assistance-question-title">

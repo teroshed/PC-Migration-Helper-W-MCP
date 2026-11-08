@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent as ReactKeyEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -26,6 +26,9 @@ import { NotificationBell } from './NotificationBell';
 import { CopyQueue } from './CopyQueue';
 import { AssistanceInterview } from './Assistance';
 import { ResizeGrip, ReviewSidebar } from './ReviewLayout';
+import { FolderReadCache } from './folder-read-cache';
+import { reviewContentKey } from './read-cache';
+import { auditRefreshKey } from './audit-model';
 import './copy-queue.css';
 import './review-layout.css';
 import { isCaretBoundary, ReviewFilter, useReviewKeyboardFocus } from './ReviewKeyboard';
@@ -160,7 +163,7 @@ export default function App() {
   const keyboard = useReviewKeyboardFocus(columnStripRef);
   const breadcrumbRef = useRef<HTMLElement>(null);
   const revealPreviewDepth = useRef<number | null>(null);
-  const scannedPaths = useRef(new Set<string>());
+  const folderReads = useRef(new FolderReadCache());
   const mounted = useRef(true);
   const closeAllowed = useRef(false);
   const loadedDetailsPath = useRef<string | null>(null);
@@ -178,6 +181,17 @@ export default function App() {
     setAuditDataTick(value => value + 1);
     return true;
   });
+  const reviewContent = useMemo(() => reviewContentKey(document), [document]);
+  // Observe watcher/audit changes even while visible-row refresh is deferred during
+  // editing. A later navigation must never reuse the superseded snapshot.
+  const folderReadScope = JSON.stringify([boot?.dataPath, boot?.volumes, reviewContent,
+    dataTick, auditDataTick, refreshTick, appStatus.scan.status, appStatus.scan.processed, appStatus.scan.files, appStatus.scan.bytes, appStatus.scan.pending, appStatus.scan.error, audit.status ? auditRefreshKey(audit.status) : null, audit.problem]);
+  folderReads.current.setScope(folderReadScope);
+  // A source event or missed-watcher interval requires fresh immediate metadata,
+  // while hashes and decision edits only need the derived listing recomputed.
+  folderReads.current.setSourceScope(JSON.stringify([boot?.dataPath, boot?.volumes,
+    audit.status?.watcherChangeSequence, audit.status?.reconciliationRequired, audit.problem]));
+  const folderRefreshToken = JSON.stringify([reviewContent, dataTick, auditDataTick, refreshTick, appStatus.scan.status]);
   const reviewActivity = useReviewActivity(Boolean(boot), receiveReviewActivity);
   useReviewSurface(columnStripRef, view && document ? { view, appliedRevision: document.revision, followAi, following: localFollowView.current, knownSearch, loading } : null);
 
@@ -717,14 +731,16 @@ export default function App() {
     const path = view.path;
     const contextKey = JSON.stringify([path, view.search, view.filter, view.page]);
     const foreground = loadedListingContext.current !== contextKey || refreshRequested.current;
-    const refresh = !scannedPaths.current.has(path) || refreshTick > 0 && refreshRequested.current;
+    const force = refreshRequested.current;
     refreshRequested.current = false;
+    const query = { path, search: view.search, filter: view.filter, page: view.page };
+    const cached = !force ? folderReads.current.peekListing(query) : undefined;
+    if (cached) { loadedListingContext.current = contextKey; setListing(cached); setLoading(false); return; }
     if (foreground) setLoading(true);
     const timeout = setTimeout(() => {
       activeAuditReads.current += 1;
-      void invoke<unknown>('list_folder', { path, refresh, search: view.search, filter: view.filter, page: view.page }).then(parseListing).then(result => {
+      void folderReads.current.listing(query, force).then(result => {
         if (!active) return;
-        scannedPaths.current.add(path);
         loadedListingContext.current = contextKey;
         setListing(result);
         setLoading(false);
@@ -737,7 +753,7 @@ export default function App() {
       }).finally(() => { activeAuditReads.current = Math.max(0, activeAuditReads.current - 1); });
     }, view.search ? 160 : 0);
     return () => { active = false; clearTimeout(timeout); };
-  }, [boot, view?.path, view?.search, view?.filter, view?.page, dataTick, auditDataTick, refreshTick, appStatus.scan.status]);
+  }, [boot, view?.path, view?.search, view?.filter, view?.page, folderRefreshToken]);
   const refreshRequested = useRef(false);
 
   useEffect(() => {
@@ -825,7 +841,7 @@ export default function App() {
     if (!current || loading) throw new Error('Wait for the current folder read to finish.');
     setLoading(true);
     try {
-      const next = parseListing(await invoke('list_folder', { path: current.path, refresh: true, search: current.search, filter: current.filter, page: current.page }));
+      const next = await folderReads.current.listing({ path: current.path, search: current.search, filter: current.filter, page: current.page }, true);
       if (viewRef.current !== current) throw new Error('The review location changed during refresh.');
       setListing(next);
       setRefreshTick(value => value + 1);
@@ -1111,7 +1127,7 @@ export default function App() {
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
           <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
           {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>The folder arrow previews its contents here. Keep opening arrows for more columns.</p><p>Folder names open the main location. Right-click or use ⋯ to mark a decision.</p></div>}
-          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} refreshToken={`${dataTick}:${auditDataTick}:${refreshTick}:${appStatus.scan.status ?? ''}`} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
+          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} cache={folderReads.current} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
         </div>
         <OverflowIndicators targetRef={columnStripRef} axis="horizontal" refreshKey={view.previewColumns}/>
         {fillDepth !== null && <button ref={restoreColumnsRef} className="review-restore-columns"

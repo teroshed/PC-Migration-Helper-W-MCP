@@ -25,6 +25,11 @@ export interface AuditStatus extends AuditStats {
   currentPath: string | null;
   updatedAt?: string;
   changeSequence?: number;
+  watcherChangeSequence?: number;
+  savedHashFiles: number;
+  pendingHashFiles: number;
+  activeHashFiles: number;
+  hashCheckpointUnit?: 'completed-file';
   gapSamples: Array<{ path: string; problem: string; kind: string; observedAt?: string }>;
   exclusions: string[];
   reconciliationRequired: boolean;
@@ -88,7 +93,7 @@ export function parseAuditStatus(value: unknown): AuditStatus {
     if (typeof gap.path !== 'string' || typeof gap.problem !== 'string') throw new Error('Invalid source audit coverage sample.');
     return { path: gap.path, problem: gap.problem, kind: typeof gap.kind === 'string' ? gap.kind : 'unavailable', observedAt: typeof gap.observedAt === 'string' ? gap.observedAt : undefined };
   }) : [];
-  return { ...stats, workers: count(native.workers, 'workers', 0), coverageGaps: count(native.coverageGaps, 'coverage gaps', 0), notificationsUnread: count(native.notificationsUnread, 'unread notifications', 0), currentPath: typeof native.currentPath === 'string' ? native.currentPath : null, updatedAt: typeof native.updatedAt === 'string' ? native.updatedAt : undefined, changeSequence: typeof native.changeSequence === 'number' ? count(native.changeSequence, 'change sequence') : undefined, gapSamples, exclusions: Array.isArray(native.exclusions) ? native.exclusions.filter((path): path is string => typeof path === 'string') : [], reconciliationRequired: native.reconciliationRequired === true };
+  return { ...stats, workers: count(native.workers, 'workers', 0), coverageGaps: count(native.coverageGaps, 'coverage gaps', 0), notificationsUnread: count(native.notificationsUnread, 'unread notifications', 0), currentPath: typeof native.currentPath === 'string' ? native.currentPath : null, updatedAt: typeof native.updatedAt === 'string' ? native.updatedAt : undefined, changeSequence: typeof native.changeSequence === 'number' ? count(native.changeSequence, 'change sequence') : undefined, watcherChangeSequence: typeof native.watcherChangeSequence === 'number' ? count(native.watcherChangeSequence, 'watcher change sequence') : undefined, savedHashFiles: count(native.savedHashFiles, 'saved hash files', stats.hashedLeaves), pendingHashFiles: count(native.pendingHashFiles, 'pending hash files', 0), activeHashFiles: count(native.activeHashFiles, 'active hash files', 0), hashCheckpointUnit: native.hashCheckpointUnit === 'completed-file' ? 'completed-file' : undefined, gapSamples, exclusions: Array.isArray(native.exclusions) ? native.exclusions.filter((path): path is string => typeof path === 'string') : [], reconciliationRequired: native.reconciliationRequired === true };
 }
 export function parseNotificationFeed(value: unknown): NotificationFeed {
   const feed = object(value);

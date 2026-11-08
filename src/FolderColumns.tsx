@@ -3,8 +3,9 @@ import type { RefObject, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Check, ChevronLeft, ChevronRight, File, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, TriangleAlert, X } from 'lucide-react';
-import { baseName, parentPath, parseEntry, parseListing, STATUSES } from './model';
+import { baseName, parentPath, parseEntry, STATUSES } from './model';
 import type { Entry, Listing, PreviewColumn, Status } from './model';
+import type { FolderReadCache } from './folder-read-cache';
 import { DESCRIPTIONS, ICONS, LABELS, reviewStatusLabel, StatusBadge } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
@@ -188,6 +189,7 @@ interface PreviewFolderProps extends ColumnActions {
   column: PreviewColumn;
   depth: number;
   refreshToken: string;
+  cache: FolderReadCache;
   onChange: (patch: Partial<PreviewColumn>) => void;
   onClose: () => void;
 }
@@ -196,7 +198,6 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
-  const loaded = useRef(false);
   const loadedContext = useRef<string | null>(null);
   const forceRefresh = useRef(false);
   const listRef = useRef<HTMLDivElement>(null);
@@ -204,13 +205,16 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
     let active = true;
     const contextKey = JSON.stringify([props.column.path, props.column.page]);
     const foreground = loadedContext.current !== contextKey || forceRefresh.current;
+    const query = { path: props.column.path, search: '', filter: 'all', page: props.column.page };
+    const force = forceRefresh.current;
+    const cached = !force ? props.cache.peekListing(query) : undefined;
+    if (cached) { loadedContext.current = contextKey; setListing(cached); setLoading(false); setError(null); return; }
     if (foreground) { setLoading(true); setError(null); }
-    const reload = !loaded.current || forceRefresh.current;
     forceRefresh.current = false;
     props.onReadPendingChange(1);
-    void invoke<unknown>('list_folder', { path: props.column.path, refresh: reload, search: '', filter: 'all', page: props.column.page }).then(parseListing).then(result => {
+    void props.cache.listing(query, force).then(result => {
       if (!active) return;
-      loaded.current = true; loadedContext.current = contextKey; setListing(result); setLoading(false); setError(null);
+      loadedContext.current = contextKey; setListing(result); setLoading(false); setError(null);
     }).catch(cause => { if (active) { if (foreground) setListing(null); setError(String(cause)); setLoading(false); } }).finally(() => props.onReadPendingChange(-1));
     return () => { active = false; };
   }, [props.column.path, props.column.page, props.refreshToken, refresh]);

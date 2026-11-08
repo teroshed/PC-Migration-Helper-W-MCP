@@ -152,6 +152,11 @@ impl Audit {
             [],
         )
         .map_err(error)?;
+        db.execute(
+            "INSERT OR IGNORE INTO meta VALUES('watcherChangeSequence','0')",
+            [],
+        )
+        .map_err(error)?;
         db.execute("INSERT OR IGNORE INTO meta VALUES('updatedAt',?1)", [now()])
             .map_err(error)?;
         let existing: Option<String> = db
@@ -173,7 +178,20 @@ impl Audit {
     fn connect(&self) -> Result<Connection, String> {
         let db = Connection::open(&self.path).map_err(error)?;
         db.busy_timeout(Duration::from_secs(15)).map_err(error)?;
+        // Transient discovery/claims recover after an application crash. NORMAL
+        // may lose the newest transactions on power failure, so completed hashes
+        // use a separate FULL connection below rather than paying fsync per claim.
         db.execute_batch("PRAGMA synchronous=NORMAL;")
+            .map_err(error)?;
+        Ok(db)
+    }
+    fn connect_hash_checkpoint(&self) -> Result<Connection, String> {
+        let db = self.connect()?;
+        // The digest, verified_at and aggregate counts commit together. FULL syncs
+        // that transaction and prior WAL records; hardware must honor flushes.
+        // Local synthetic measurement: ~4.25 ms per FULL commit, so only batches
+        // containing completed hashes pay this cost, not transient queue updates.
+        db.execute_batch("PRAGMA synchronous=FULL;")
             .map_err(error)?;
         Ok(db)
     }
@@ -799,7 +817,14 @@ impl Audit {
         Ok(())
     }
     fn store_hashes(&self, run: i64, results: &[HashResult]) -> Result<(), String> {
-        let mut db = self.connect()?;
+        let mut db = if results
+            .iter()
+            .any(|result| result.digest.is_some() && !result.cancelled)
+        {
+            self.connect_hash_checkpoint()?
+        } else {
+            self.connect()?
+        };
         let tx = db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(error)?;
@@ -880,10 +905,17 @@ impl Audit {
         Ok(())
     }
     pub fn status(&self) -> Result<Value, String> {
-        let db = self.connect()?;
+        let mut connection = self.connect()?;
+        let db = connection.transaction().map_err(error)?;
         let row:Option<Value>=db.query_row("SELECT id,phase,started_at,completed_at,workers,current_path,error,discovered,counted,hashed,failed,logical,allocated,unknown,gaps,roots FROM runs ORDER BY id DESC LIMIT 1",[],|r|Ok(json!({"runId":r.get::<_,i64>(0)?,"phase":r.get::<_,String>(1)?,"startedAt":r.get::<_,Option<String>>(2)?,"completedAt":r.get::<_,Option<String>>(3)?,"workers":r.get::<_,i64>(4)?,"currentPath":r.get::<_,Option<String>>(5)?,"error":r.get::<_,Option<String>>(6)?,"discoveredLeaves":r.get::<_,i64>(7)?,"countedLeaves":r.get::<_,i64>(8)?,"hashedLeaves":r.get::<_,i64>(9)?,"failedLeaves":r.get::<_,i64>(10)?,"logicalBytes":r.get::<_,i64>(11)?,"allocatedBytes":r.get::<_,i64>(12)?,"allocationUnknown":r.get::<_,i64>(13)?,"coverageGaps":r.get::<_,i64>(14)?,"roots":serde_json::from_str::<Value>(&r.get::<_,String>(15)?).unwrap_or(Value::Null)}))).optional().map_err(error)?;
         let mut value=row.unwrap_or_else(||json!({"phase":"idle","discoveredLeaves":0,"countedLeaves":0,"hashedLeaves":0,"failedLeaves":0,"logicalBytes":0,"allocatedBytes":0,"allocationUnknown":0,"coverageGaps":0,"workers":4,"currentPath":null,"startedAt":null,"completedAt":null}));
         let phase = value["phase"].as_str().unwrap_or("idle").to_string();
+        // These are durable completed-file checkpoints, not promises that a saved
+        // observation is still current after an unobserved source-change interval.
+        value["savedHashFiles"] = value["hashedLeaves"].clone();
+        value["pendingHashFiles"] = json!(db.query_row("SELECT count(*) FROM files WHERE run=(SELECT max(id) FROM runs) AND state='pending'", [], |r| r.get::<_, i64>(0)).map_err(error)?);
+        value["activeHashFiles"] = json!(db.query_row("SELECT count(*) FROM files WHERE run=(SELECT max(id) FROM runs) AND state='working'", [], |r| r.get::<_, i64>(0)).map_err(error)?);
+        value["hashCheckpointUnit"] = json!("completed-file");
         let watcher_gaps:i64=db.query_row("SELECT count(*) FROM watch_changes WHERE kind='coverage-gap' AND changed_at>coalesce((SELECT started_at FROM runs ORDER BY id DESC LIMIT 1),'')",[],|r|r.get(0)).map_err(error)?;
         value["sourceCoverageGaps"] = value["coverageGaps"].clone();
         value["watcherCoverageGaps"] = json!(watcher_gaps);
@@ -909,6 +941,13 @@ impl Audit {
             })
             .map_err(error)?);
         value["changeSequence"] = json!(sequence(&db)?);
+        value["watcherChangeSequence"] = json!(db
+            .query_row(
+                "SELECT cast(value AS INTEGER) FROM meta WHERE key='watcherChangeSequence'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .map_err(error)?);
         let mut samples = Vec::new();
         {
             let mut q=db.prepare("SELECT path,problem,'folder',observed_at FROM dirs WHERE run=(SELECT max(id) FROM runs) AND state='gap' LIMIT 50").map_err(error)?;
@@ -1097,8 +1136,15 @@ impl Audit {
         }
         let volumes = self.volumes()?;
         filesystem::identify(path, &volumes)?;
-        self.connect()?.execute("INSERT INTO watch_changes VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET changed_at=?2,kind=?3",params![path,now(),kind]).map_err(error)?;
-        touch(&self.connect()?)?;
+        let mut db = self.connect()?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(error)?;
+        tx.execute("INSERT INTO watch_changes VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET changed_at=?2,kind=?3",params![path,now(),kind]).map_err(error)?;
+        // Atomic with the observation, including repeated events for the same path.
+        // Hash progress deliberately does not advance this source-change signal.
+        touch_watcher(&tx)?;
+        tx.commit().map_err(error)?;
         let parent = parent_path(path);
         self.notify(&format!("watch|{parent}"),"source-change","Source changes need checksum verification","Filesystem change events were observed. These are pending verification, not proof of changed content or a completed backup.",&parent,1)
     }
@@ -1111,9 +1157,19 @@ impl Audit {
         } else {
             vec![root.to_string()]
         };
-        let db = self.connect()?;
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.connect()?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(error)?;
         for path in &roots {
-            db.execute("INSERT INTO watch_changes VALUES(?1,?2,'coverage-gap') ON CONFLICT(path) DO UPDATE SET changed_at=?2,kind='coverage-gap'",params![path,now()]).map_err(error)?;
+            tx.execute("INSERT INTO watch_changes VALUES(?1,?2,'coverage-gap') ON CONFLICT(path) DO UPDATE SET changed_at=?2,kind='coverage-gap'",params![path,now()]).map_err(error)?;
+        }
+        touch_watcher(&tx)?;
+        tx.commit().map_err(error)?;
+        for path in &roots {
             self.notify(
                 &format!("watch-gap|{path}"),
                 "coverage-gap",
@@ -1123,7 +1179,6 @@ impl Audit {
                 1,
             )?;
         }
-        touch(&db)?;
         Ok(())
     }
     fn watch_changed(&self, path: &str, since: &str) -> Result<bool, String> {
@@ -1152,6 +1207,14 @@ fn sequence(db: &Connection) -> Result<i64, String> {
         |r| r.get(0),
     )
     .map_err(error)
+}
+fn touch_watcher(db: &Connection) -> Result<(), String> {
+    db.execute(
+        "UPDATE meta SET value=cast(value AS INTEGER)+1 WHERE key='watcherChangeSequence'",
+        [],
+    )
+    .map_err(error)?;
+    touch(db)
 }
 fn touch(db: &Connection) -> Result<(), String> {
     db.execute(
@@ -2101,5 +2164,164 @@ mod tests {
         assert_eq!(latest["items"][0]["id"], id);
         assert_eq!(latest["items"][0]["changeCount"], 2);
         assert!(latest["items"][0]["readAt"].is_null());
+    }
+
+    #[test]
+    fn hash_checkpoints_survive_restart_and_resume_without_rehashing_completed_files() {
+        let fixture = pending_hash_fixture();
+        fixture
+            .audit
+            .store_hashes(fixture.run, &[fixture.hash()])
+            .unwrap();
+        let pending = fixture.file.with_file_name("interrupted.txt");
+        fs::write(&pending, b"unfinished work").unwrap();
+        let parent = fixture.file.parent().unwrap().to_string_lossy();
+        fixture
+            .audit
+            .store_discovery(
+                fixture.run,
+                &parent,
+                &[observe(
+                    &pending.to_string_lossy(),
+                    &parent,
+                    &fixture.volumes,
+                    false,
+                    false,
+                )],
+                "fixture",
+            )
+            .unwrap();
+        let db = fixture.audit.connect().unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let checkpoint = fixture.audit.connect_hash_checkpoint().unwrap();
+        assert_eq!(
+            checkpoint
+                .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(checkpoint);
+        let saved: (String, String) = db
+            .query_row(
+                "SELECT digest,verified_at FROM files WHERE id=?1",
+                [fixture.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE files SET state='working' WHERE path=?1",
+            [pending.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        let status = fixture.audit.status().unwrap();
+        assert_eq!(status["savedHashFiles"], 1);
+        assert_eq!(status["activeHashFiles"], 1);
+        let database = fixture.audit.path.clone();
+        let id = fixture.id;
+        let volumes = fixture.volumes.clone();
+        drop(db);
+        drop(fixture);
+        let reopened = Audit::open(database, "fixture".into(), vec![]).unwrap();
+        let status = reopened.status().unwrap();
+        assert_eq!(status["phase"], "paused");
+        assert_eq!(status["savedHashFiles"], 1);
+        assert_eq!(status["pendingHashFiles"], 1);
+        assert_eq!(status["activeHashFiles"], 0);
+        // Match the application's startup fence: saved results remain useful work,
+        // but resuming cannot erase a missed watcher interval or certify freshness.
+        reopened
+            .record_watch_gap(&volumes[0].root, "Fixture restart: unobserved interval")
+            .unwrap();
+        thread::sleep(Duration::from_millis(3));
+        reopened.start(Vec::new(), volumes, true, 2).unwrap();
+        wait(&reopened);
+        let db = reopened.connect().unwrap();
+        let retained: (String, String) = db
+            .query_row(
+                "SELECT digest,verified_at FROM files WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, saved, "Completed file was unnecessarily rehashed");
+        let status = reopened.status().unwrap();
+        assert_eq!(status["savedHashFiles"], 2);
+        assert_eq!(status["pendingHashFiles"], 0);
+        assert_eq!(status["activeHashFiles"], 0);
+        assert_eq!(status["reconciliationRequired"], true);
+        assert_eq!(status["complete"], false);
+    }
+
+    #[test]
+    fn watcher_sequence_tracks_repeat_events_but_not_hash_progress() {
+        let fixture = pending_hash_fixture();
+        let a = &fixture.audit;
+        let sequence = || {
+            a.status().unwrap()["watcherChangeSequence"]
+                .as_i64()
+                .unwrap()
+        };
+        let initial = sequence();
+        a.store_hashes(fixture.run, &[fixture.hash()]).unwrap();
+        assert_eq!(sequence(), initial);
+        a.record_watch_change(&fixture.file.to_string_lossy(), "modified")
+            .unwrap();
+        assert_eq!(sequence(), initial + 1);
+        a.record_watch_change(&fixture.file.to_string_lossy(), "modified")
+            .unwrap();
+        assert_eq!(sequence(), initial + 2);
+        a.record_watch_gap(&fixture.volumes[0].root, "Missed interval")
+            .unwrap();
+        assert_eq!(sequence(), initial + 3);
+        a.record_watch_gap(&fixture.volumes[0].root, "Repeated missed interval")
+            .unwrap();
+        assert_eq!(sequence(), initial + 4);
+        assert!(a
+            .record_watch_change(r"Z:\outside-fixture", "modified")
+            .is_err());
+        assert_eq!(sequence(), initial + 4);
+        let reopened = Audit::open(a.path.clone(), "fixture".into(), vec![]).unwrap();
+        assert_eq!(
+            reopened.status().unwrap()["watcherChangeSequence"],
+            initial + 4
+        );
+    }
+    #[test]
+    fn failed_hash_checkpoint_rolls_back_digest_timestamp_and_counts_together() {
+        let fixture = pending_hash_fixture();
+        let db = fixture.audit.connect().unwrap();
+        db.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE OF hashed ON runs BEGIN SELECT RAISE(ABORT,'fixture checkpoint failure'); END;").unwrap();
+        assert!(fixture
+            .audit
+            .store_hashes(fixture.run, &[fixture.hash()])
+            .is_err());
+        let row: (Option<String>, Option<String>, String) = db
+            .query_row(
+                "SELECT digest,verified_at,state FROM files WHERE id=?1",
+                [fixture.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, "pending".into()));
+        assert_eq!(fixture.audit.status().unwrap()["savedHashFiles"], 0);
+        db.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap();
+        fixture
+            .audit
+            .store_hashes(fixture.run, &[fixture.hash()])
+            .unwrap();
+        let row: (Option<String>, Option<String>, String) = db
+            .query_row(
+                "SELECT digest,verified_at,state FROM files WHERE id=?1",
+                [fixture.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(row.0.is_some() && row.1.is_some());
+        assert_eq!(row.2, "hashed");
+        assert_eq!(fixture.audit.status().unwrap()["savedHashFiles"], 1);
     }
 }

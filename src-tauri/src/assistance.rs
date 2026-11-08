@@ -191,11 +191,8 @@ impl Inventory {
 }
 
 fn scan_state(s: &AppState) -> Result<Value, String> {
-    let db = s.index.connect()?;
-    let raw: String = db
-        .query_row("SELECT value FROM meta WHERE key='scan'", [], |r| r.get(0))
-        .map_err(error)?;
-    serde_json::from_str(&raw).map_err(error)
+    // Reuse the inventory controls' durable queue snapshot, including pending work.
+    s.index.scan_status()
 }
 
 fn saved_paths(doc: &Value, field: &str) -> HashSet<String> {

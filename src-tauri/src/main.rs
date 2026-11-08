@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 mod assistance;
+mod background;
 mod audit;
 mod copy_control;
 mod copy_queue;
@@ -26,6 +27,7 @@ use store::{error, now, Store};
 use tauri::{Manager, State};
 
 struct AppState {
+    background: background::Control,
     store: Mutex<Option<Store>>,
     startup_problem: Option<String>,
     volumes: Vec<Volume>,
@@ -981,6 +983,7 @@ fn audit_control_service(
     scope: &str,
     path: Option<&str>,
 ) -> Result<Value, String> {
+    let _start = if action != "pause" { Some(s.background.start_guard()?) } else { None };
     healthy_owner(s)?;
     match action {
         "pause" => s.audit.pause(),
@@ -1117,6 +1120,7 @@ async fn get_status(state: State<'_, Shared>) -> Result<Value, String> {
 }
 
 fn scan_service(s: &AppState, mode: String, path: String) -> Result<Value, String> {
+    let _start = if mode != "pause" { Some(s.background.start_guard()?) } else { None };
     {
         let guard = s.store.lock().map_err(error)?;
         let store = guard
@@ -1315,6 +1319,7 @@ fn main() {
         fixture.is_some(),
     );
     let state = Arc::new(AppState {
+        background: background::Control::new(fixture.is_none() || args.iter().any(|arg| arg == "--fixture-tray")),
         store: Mutex::new(store),
         startup_problem: problem,
         volumes: roots,
@@ -1338,9 +1343,10 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<Shared>();
-                if state.copy_queue.status().is_ok_and(|status| status["running"] == true) {
+                if state.background.enabled {
+                    // The frontend flushes drafts before calling background_hide.
+                    // Never pause workers merely because the window is closed.
                     api.prevent_close();
-                    state.copy_queue.pause();
                 }
             }
         })
@@ -1364,9 +1370,15 @@ fn main() {
                 builder
             };
             builder.build()?;
+            background::setup(app.handle(), &state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            background::background_status,
+            background::background_hide,
+            background::background_request_exit,
+            background::background_cancel_exit,
+            background::background_confirm_exit,
             ui_control::report_ui_state,
             ui_control::poll_ui_commands,
             ui_control::validate_auto_copy,
@@ -1703,6 +1715,7 @@ mod tests {
         .unwrap();
         audit.set_volumes(volumes.clone()).unwrap();
         AppState {
+            background: background::Control::new(false),
             store: Mutex::new(Some(
                 Store::open(data_path.clone(), &volumes[0].root).unwrap(),
             )),
