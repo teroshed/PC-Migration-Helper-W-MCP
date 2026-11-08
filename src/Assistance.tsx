@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { UiControlRef } from './UIBridge';
 import { Check, FolderTree, ScanSearch, Sparkles } from 'lucide-react';
 import { LABELS, StatusBadge, EMPTY_EFFECTIVE } from './classifications';
 import { STATUSES, isStatus, readableBytes, record } from './model';
@@ -67,11 +68,12 @@ function parseInterview(input: unknown): Interview {
   };
 }
 
-export function AssistanceInterview({ currentPath, revision, readOnly, onEdit }: {
+export function AssistanceInterview({ currentPath, revision, readOnly, onEdit, controlRef }: {
   currentPath: string;
   revision: number;
   readOnly: boolean;
   onEdit: (operation: Operation, reviewedRevision: number) => Promise<void>;
+  controlRef: UiControlRef;
 }) {
   const [interview, setInterview] = useState<Interview | null>(null);
   const [reading, setReading] = useState(true);
@@ -86,6 +88,19 @@ export function AssistanceInterview({ currentPath, revision, readOnly, onEdit }:
   const question = interview?.question;
   const questionId = question?.id;
   const choosing = questionId !== undefined && overrideQuestion === questionId;
+  function chooseOverride(open: boolean): void {
+    if (open && (!questionId || readOnly || reading || working || problem)) throw new Error('The current question is not available for override.');
+    setOverrideQuestion(open ? questionId ?? null : null);
+    if (!open) heading.current?.focus();
+  }
+  controlRef.current = {
+    read: () => ({ interview, reading, working, problem, actionProblem, overrideOpen: choosing }),
+    execute: async command => {
+      if (command.action !== 'setAssistanceOverride' || command.questionId !== questionId) throw new Error('The interview question changed. Read it again before opening its override.');
+      chooseOverride(command.open === true);
+    },
+  };
+  useEffect(() => () => { controlRef.current = null; }, [controlRef]);
 
   useEffect(() => {
     let active = true;
@@ -193,12 +208,12 @@ export function AssistanceInterview({ currentPath, revision, readOnly, onEdit }:
         <p>Marked for Manual Backup keeps your copy pending. Choose Confirmed Manual Backup after copying the selected path; review child entries separately.</p>
         {STATUSES.filter(status => status !== 'attention' && status !== question.status).map(status =>
           <button key={status} disabled={locked || Boolean(problem)} onClick={() => answer(status)}>{LABELS[status]}</button>)}
-        <button onClick={() => { setOverrideQuestion(null); heading.current?.focus(); }}>Back</button>
+        <button onClick={() => chooseOverride(false)}>Back</button>
       </fieldset> : <div className="assistance-actions">
         <button className="primary" disabled={locked || Boolean(problem)} onClick={() => answer(question.status)}>
           <Check size={16} aria-hidden="true"/>{question.manualConfirmation ? 'Confirm manual backup' : `Approve ${LABELS[question.status]}`}
         </button>
-        <button disabled={locked || Boolean(problem)} onClick={() => setOverrideQuestion(question.id)}>Override</button>
+        <button disabled={locked || Boolean(problem)} onClick={() => chooseOverride(true)}>Override</button>
         {question.kind === 'folder' && !question.manualConfirmation && <button disabled={locked || Boolean(problem)}
           onClick={() => edit({ type: 'assist', action: 'split', path: question.path, questionId: question.id })}>
           <FolderTree size={16} aria-hidden="true"/> Review children

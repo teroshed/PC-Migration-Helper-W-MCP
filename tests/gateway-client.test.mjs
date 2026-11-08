@@ -34,7 +34,7 @@ test('bridge authenticates and fences identity, rereads descriptor, and never re
     const client=new GatewayClient(file);
     assert.equal((await client.call('get_state')).revision,7);
     await assert.rejects(client.call('mutate',{operationId:'same-edit',expectedInstanceId:'old-instance-1234567890'}),/session changed/);assert.equal(calls,1);
-    for (const method of ['audit_control', 'audit_read_notifications']) {
+    for (const method of ['audit_control', 'audit_read_notifications', 'control_copy_queue', 'control_ui', 'recover_review']) {
       await assert.rejects(client.call(method, { expectedInstanceId: 'old-instance-1234567890' }), /session changed/);
       await assert.rejects(client.call(method), /session changed/);
       assert.equal(calls, 1, 'A stale checksum/notification write must never be sent');

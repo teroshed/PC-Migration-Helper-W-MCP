@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import {
   MutationQueue, STATUSES, baseName, parentPath, parseDetails, parseDocument,
-  parseListing, parseView, readableBytes, record, normalizeReviewPath, isStatus, resolveDecisionPath, parseGateway, previewBranch, closePreviewBranch,
+  parseListing, parseEntry, parseView, readableBytes, record, normalizeReviewPath, isStatus, resolveDecisionPath, parseGateway, previewBranch, closePreviewBranch,
 } from './model';
 import type {
   AppStatus, Boot, Decision, Details, Document, Effective, Entry, Listing,
@@ -34,6 +34,10 @@ import {
   isRestoredScroll, isReviewRowVisible, PULSE_MS, restoreReviewScroll, reviewPathKey, useReviewActivity, useReviewSurface,
 } from './ReviewActivity';
 import type { ReviewActivity } from './ReviewActivity';
+import { useUiBridge } from './UIBridge';
+import type { UiParticipant, UiCommand, UiRequest } from './UIBridge';
+import { inspectPending, pendingFingerprint, pendingMetadata } from './pending-inspection';
+import type { PendingSnapshot } from './pending-inspection';
 
 const EMPTY_STATUS: AppStatus = { scan: { pending: 0 }, gaps: [], decisionCount: 0 };
 const FOLLOW_PREFERENCE = 'migration-master.follow-ai';
@@ -98,6 +102,7 @@ export default function App() {
   const [showDecisionPicker, setShowDecisionPicker] = useState(false);
   const [showContext, setShowContext] = useState(false);
   const [showMcp, setShowMcp] = useState(false);
+  const [gatewayDetailsOpen, setGatewayDetailsOpen] = useState(false);
   const [showAssistance, setShowAssistance] = useState(false);
   const [observedRevision, setObservedRevision] = useState(0);
   const [showConflict, setShowConflict] = useState(false);
@@ -126,6 +131,12 @@ export default function App() {
   const holdMarkRowsUntil = useRef(0);
   const externalRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const queue = useRef<MutationQueue | null>(null);
+  const nativeWriteLane = useRef<Promise<void>>(Promise.resolve());
+  const draftGeneration = useRef(0);
+  const fingerprintCache = useRef<{ writer: MutationQueue | null; version: number; draftVersion: number; path: string; promise: Promise<string> } | null>(null);
+  const copyControl = useRef<UiParticipant | null>(null);
+  const notificationControl = useRef<UiParticipant | null>(null);
+  const assistanceControl = useRef<UiParticipant | null>(null);
   const documentRef = useRef<Document | null>(null);
   const conflictReviewOpen = useRef(false);
   const viewRef = useRef<ViewState | null>(null);
@@ -276,28 +287,31 @@ export default function App() {
     setDocument(doc);
     setSaveState(state);
   }
-  async function loadConflictComparison(): Promise<void> {
+  async function loadConflictComparison(throwFailure = false): Promise<void> {
     setConflictLoading(true);
     setConflictProblem(null);
     try {
       const result = parseBoot(await invoke<unknown>('get_boot'));
       if (result.problem) throw new Error(result.problem);
       setExternalDocument(result.document);
-    } catch (cause) { setConflictProblem(cause instanceof Error ? cause.message : String(cause)); }
+    } catch (cause) { setConflictProblem(cause instanceof Error ? cause.message : String(cause)); if (throwFailure) throw cause; }
     finally { setConflictLoading(false); }
   }
   function openConflictReview(): void {
+    void beginConflictReview(false);
+  }
+  async function beginConflictReview(throwFailure: boolean): Promise<void> {
     flushBuffers();
     conflictReviewOpen.current = true;
     setShowConflict(true);
-    void loadConflictComparison();
+    await loadConflictComparison(throwFailure);
   }
   function closeConflictReview(): void { conflictReviewOpen.current = false; setShowConflict(false); }
   async function applyReviewedPending(): Promise<void> {
     const writer = queue.current;
     if (!writer || !externalDocument || !writer.rebaseAfterReview(externalDocument)) {
       setConflictProblem('This comparison cannot be applied while a save is active or after the pending request changed. Refresh the comparison and review again.');
-      return;
+      throw new Error('The reviewed comparison is no longer applicable.');
     }
     writer.retry();
     try {
@@ -308,7 +322,28 @@ export default function App() {
       setDataTick(value => value + 1);
       closeConflictReview();
       setMessage('Your reviewed pending edits are saved. Other saved fields were preserved.');
-    } catch (cause) { setConflictProblem(`${String(cause)}. Your pending edits are still retained. Refresh the comparison before trying again.`); }
+    } catch (cause) { setConflictProblem(`${String(cause)}. Your pending edits are still retained. Refresh the comparison before trying again.`); throw cause; }
+  }
+  function runNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const task = nativeWriteLane.current.then(async () => {
+      const writer = queue.current;
+      if (!writer || readOnly) throw new Error('Recover the review data before starting a native write.');
+      flushBuffers();
+      await writer.flush();
+      writer.holdForExternal();
+      try { return await operation(); }
+      finally {
+        try {
+          const latest = parseBoot(await invoke('get_boot'));
+          if (latest.problem) throw new Error(latest.problem);
+          writer.finishExternal(latest.document);
+          setObservedRevision(latest.document.revision);
+          setDataTick(value => value + 1);
+        } catch (cause) { writer.failExternal(cause); throw cause; }
+      }
+    });
+    nativeWriteLane.current = task.then(() => {}, () => {});
+    return task;
   }
   function edit(operation: Operation): Promise<Document> {
     if (!queue.current || readOnly) return Promise.reject(new Error('The saved data must be recovered before editing.'));
@@ -330,6 +365,7 @@ export default function App() {
     setDataTick(value => value + 1);
   }
   function flushBuffers(): void {
+    draftGeneration.current += 1;
     if (timer.current) clearTimeout(timer.current);
     timer.current = null;
     const patch = viewBuffer.current;
@@ -340,6 +376,7 @@ export default function App() {
     setBuffered(false);
   }
   function scheduleFlush(): void {
+    draftGeneration.current += 1;
     setBuffered(true);
     // A fixed timer, rather than a trailing debounce, bounds the unsaved typing interval.
     if (!timer.current) timer.current = setTimeout(flushBuffers, 350);
@@ -771,8 +808,8 @@ export default function App() {
     if (!view) return;
     try { await invoke('scan', { mode, path: view.path }); await refreshStatus(); } catch (cause) { report(cause); }
   }
-  async function searchKnown(): Promise<void> {
-    if (!view?.search.trim()) { setMessage('Type a folder name in Search, then search known folders.'); return; }
+  async function searchKnown(throwFailure = false): Promise<void> {
+    if (!view?.search.trim()) { const problem = 'Type a folder name in Search, then search known folders.'; setMessage(problem); if (throwFailure) throw new Error(problem); return; }
     const searchView = viewRef.current;
     try {
       const response = await invoke<unknown>('search_dirs', { search: view.search });
@@ -781,8 +818,140 @@ export default function App() {
       if (searchView?.revealPath || localFollowView.current) updateView({ revealPath: null }, true);
       setKnownResults(response);
       setKnownSearch(true);
-    } catch (cause) { report(cause); }
+    } catch (cause) { report(cause); if (throwFailure) throw cause; }
   }
+  async function refreshVisible(): Promise<void> {
+    const current = viewRef.current;
+    if (!current || loading) throw new Error('Wait for the current folder read to finish.');
+    setLoading(true);
+    try {
+      const next = parseListing(await invoke('list_folder', { path: current.path, refresh: true, search: current.search, filter: current.filter, page: current.page }));
+      if (viewRef.current !== current) throw new Error('The review location changed during refresh.');
+      setListing(next);
+      setRefreshTick(value => value + 1);
+    } finally { setLoading(false); }
+  }
+  function closePanels(): void {
+    setShowGaps(false); setShowHistory(false); setShowDecisionPicker(false); setShowContext(false);
+    setShowMcp(false); setShowAssistance(false); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
+    void notificationControl.current?.execute({ action: 'setNotifications', mode: 'closed' }, { command: { action: 'setNotifications' } });
+    void copyControl.current?.execute({ action: 'setCopyDetails', open: false }, { command: { action: 'setCopyDetails' } });
+  }
+  function readUiState(): Record<string, unknown> {
+    const retained = queue.current?.retainedRequests ?? [];
+    const retainedMetadata = pendingMetadata(retained);
+    const draftNotes = Array.from(noteBuffer.current, ([path, text]) => ({ path, text }));
+    const visibleText = selectedPath ? notes[selectedPath] ?? details?.decision?.notes ?? '' : '';
+    return {
+      revision: documentRef.current?.revision, readOnly, followAi,
+      panels: { gaps: showGaps, history: showHistory, decision: showDecisionPicker, context: showContext,
+        gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict },
+      rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || saveState.saving || Boolean(rowMenu.entry.problem) } : null,
+      gatewayDetailsOpen, knownFolders: { active: knownSearch, search: view?.search, results: knownResults },
+      savedRecords: { search: savedSearch, filter: savedFilter, page: savedPage },
+      writer: { ...queue.current?.state, revision: queue.current?.revision, retainedRequestCount: retainedMetadata.total,
+        retainedRequests: retainedMetadata.entries, metadataTruncated: retainedMetadata.truncated, inspection: 'listPending / readPendingText' },
+      drafts: { path: pathDraft.slice(0, 100_000), pathTruncated: pathDraft.length > 100_000,
+        viewFields: Object.keys(viewBuffer.current), noteCount: draftNotes.length,
+        notes: draftNotes.slice(0, 16).map((item, index) => ({ operationId: `buffered-note-${index}`, pathPreview: item.path.slice(0, 256), textCharacters: item.text.length })),
+        metadataTruncated: draftNotes.length > 16,
+        visibleNote: { path: selectedPath, text: visibleText.slice(0, 100_000), textCharacters: visibleText.length, textTruncated: visibleText.length > 100_000 } },
+      conflict: { loading: conflictLoading, problem: conflictProblem, comparisonRevision: externalDocument?.revision ?? null },
+      notifications: notificationControl.current?.read() ?? null,
+      copy: copyControl.current?.read() ?? null,
+      assistance: assistanceControl.current?.read() ?? null,
+      feedback: { status: message, error, saveError: saveState.error },
+    };
+  }
+  function readPendingSource(): PendingSnapshot {
+    const writer = queue.current;
+    const retained = writer?.retainedRequests ?? [];
+    const noteDrafts = Array.from(noteBuffer.current, ([path, notes], index) => ({ id: `buffered-note-${index}`, origin: 'draft-note', operation: { type: 'note', path, notes } }));
+    const viewDrafts = Object.keys(viewBuffer.current).length ? [{ id: 'buffered-view', origin: 'draft-view', operation: { type: 'view', patch: viewBuffer.current } }] : [];
+    const pathDrafts = pathDraft !== viewRef.current?.path ? [{ id: 'buffered-path', origin: 'draft-path', operation: { type: 'path-draft', text: pathDraft } }] : [];
+    return {
+      writer: { ...writer?.state, revision: writer?.revision, retainedRequests: retained },
+      drafts: { path: pathDraft, view: viewBuffer.current, notes: noteDrafts },
+      requests: [...retained.map(item => ({ ...item, origin: 'retained' })), ...noteDrafts, ...viewDrafts, ...pathDrafts],
+    };
+  }
+  async function readUiReport(): Promise<Record<string, unknown>> {
+    const writer = queue.current;
+    const version = writer?.inspectionVersion ?? 0;
+    const cached = fingerprintCache.current;
+    if (!cached || cached.writer !== writer || cached.version !== version || cached.draftVersion !== draftGeneration.current || cached.path !== pathDraft) {
+      fingerprintCache.current = { writer, version, draftVersion: draftGeneration.current, path: pathDraft, promise: pendingFingerprint(readPendingSource()) };
+    }
+    const state = readUiState();
+    return { ...state, pendingFingerprint: await fingerprintCache.current!.promise };
+  }
+  async function executeUi(command: UiCommand, request: UiRequest): Promise<unknown> {
+    const action = command.action;
+    if (action === 'listPending' || action === 'readPendingText') return inspectPending(readPendingSource, command);
+    const retainedWorkflow = ['compareConflict', 'retryReviewed', 'retryPending', 'flushPending', 'closePanels', 'dismissFeedback'].includes(action) || action === 'openPanel' && command.panel === 'conflict';
+    if (!retainedWorkflow && request.expectedRevision !== documentRef.current?.revision) throw new Error('The displayed revision changed before this UI command could apply. Read the current UI state again.');
+    if (action === 'setFollowAI') { changeFollowAi(command.enabled === true); return; }
+    if (action === 'setAutoCopy' || action === 'setCopyDetails') {
+      if (!copyControl.current) throw new Error('The copy panel is not available.');
+      await copyControl.current.execute(command, request); return;
+    }
+    if (action === 'setNotifications') {
+      if (!notificationControl.current) throw new Error('Notifications are not available.');
+      await notificationControl.current.execute(command, request); return;
+    }
+    if (action === 'setAssistanceOverride') {
+      if (!showAssistance || !assistanceControl.current) throw new Error('Open AI Assistance and read its current question first.');
+      await assistanceControl.current.execute(command, request); return;
+    }
+    if (action === 'closePanels') { closePanels(); return; }
+    if (action === 'openPanel') {
+      if (command.panel === 'conflict') {
+        if (!queue.current?.state.error) throw new Error('No failed writer is available to compare.');
+        await beginConflictReview(true); return;
+      }
+      if (command.panel === 'decision' && (readOnly || !selectedPath || detailsLoading || !details || !details.exists || saveState.saving)) throw new Error('The selected decision is not available for editing.');
+      const setters: Record<string, (open: boolean) => void> = { assistance: setShowAssistance, decision: setShowDecisionPicker,
+        context: setShowContext, history: setShowHistory, saved: setShowSaved, gaps: setShowGaps, gateway: setShowMcp };
+      const setter = setters[String(command.panel)];
+      if (!setter) throw new Error('Unsupported panel');
+      setter(true); return;
+    }
+    if (action === 'setSavedRecords') {
+      if (!showSaved) throw new Error('Open Saved records before controlling its query.');
+      const search = typeof command.search === 'string' ? command.search : savedSearch;
+      const filter = typeof command.filter === 'string' ? command.filter : savedFilter;
+      const page = typeof command.page === 'number' ? command.page : command.search !== undefined || command.filter !== undefined ? 0 : savedPage;
+      const total = Object.values(documentRef.current?.decisions ?? {}).filter(decision => (filter === 'all' || decision.status === filter) && `${decision.path}\n${decision.notes ?? ''}`.toLowerCase().includes(search.toLowerCase())).length;
+      if (page >= Math.max(1, Math.ceil(total / 100))) throw new Error('The saved-record page is outside the current results.');
+      setSavedSearch(search); setSavedFilter(filter); setSavedPage(page); return;
+    }
+    if (action === 'setGatewayDetails') { if (!showMcp) throw new Error('Open Local MCP gateway first.'); setGatewayDetailsOpen(command.open === true); return; }
+    if (action === 'setRowMenu') {
+      if (command.path === null) { dismissRowMenu(true); return; }
+      const path = String(command.path);
+      const parent = parentPath(path);
+      if (!viewRef.current || !parent || ![viewRef.current.path, ...viewRef.current.previewColumns.map(column => column.path)].some(folder => reviewPathKey(folder) === reviewPathKey(parent))) throw new Error('Open the parent review column before opening this row menu.');
+      const entry = parseEntry(await invoke('get_review_entry', { path }));
+      openRowMenu({ id: crypto.randomUUID(), entry, x: Math.max(8, window.innerWidth / 2 - 180), y: 100, invoker: null }); return;
+    }
+    if (action === 'refreshVisible') { await refreshVisible(); return; }
+    if (action === 'searchKnownFolders') { await searchKnown(true); return; }
+    if (action === 'flushPending') { flushBuffers(); await queue.current?.flush(); return; }
+    if (action === 'retryPending') {
+      const writer = queue.current;
+      if (!writer?.state.error) throw new Error('There is no failed save to retry.');
+      if (/newer saved state|revision conflict|outside this app|stale save response/i.test(writer.state.error)) throw new Error('Review the current conflict before applying retained edits.');
+      writer.retry(); await writer.flush(); return;
+    }
+    if (action === 'compareConflict') { if (!queue.current?.state.error) throw new Error('There is no failed writer to compare.'); await beginConflictReview(true); return; }
+    if (action === 'retryReviewed') {
+      if (!showConflict || command.expectedComparisonRevision !== externalDocument?.revision || command.expectedPendingFingerprint !== await pendingFingerprint(readPendingSource())) throw new Error('The pending requests or displayed comparison changed. Refresh and review them again.');
+      await applyReviewedPending(); return;
+    }
+    if (action === 'dismissFeedback') { if (command.kind === 'status') setMessage(null); else setError(null); return; }
+    throw new Error('Unsupported UI command');
+  }
+  useUiBridge(gateway.instanceId, { read: readUiState, readForReport: readUiReport, execute: executeUi });
   useEffect(() => {
     function key(event: KeyboardEvent): void {
       if (event.defaultPrevented || rowMenuRef.current || window.document.querySelector('dialog[open], .review-filter-options')) return;
@@ -871,7 +1040,7 @@ export default function App() {
         {saveError || readOnly ? <TriangleAlert size={16}/> : saving ? <LoaderCircle size={16} className="spin"/> : <CheckCircle2 size={16}/>}
         <span>{saveError ? 'Not saved' : readOnly ? 'Recovery needed' : saving ? 'Saving…' : boot.fixture ? 'Saved in test fixture' : 'Saved locally'}</span>
       </div>
-      <NotificationBell enabled={Boolean(boot)} unread={audit.status?.notificationsUnread ?? 0} volumes={boot.volumes} onNavigate={navigate} onReadStateChanged={audit.refresh} onError={report}/>
+      <NotificationBell enabled={Boolean(boot)} unread={audit.status?.notificationsUnread ?? 0} volumes={boot.volumes} onNavigate={navigate} onReadStateChanged={audit.refresh} onError={report} controlRef={notificationControl}/>
     </header>
     <ReviewSidebar side="drives" name="review drives" collapsed={Boolean(layout.drivesCollapsed)} app={() => appRef.current}
       onResize={(width, collapse) => setLayout(collapse ? { drivesCollapsed: true } : { drivesWidth: width })}
@@ -892,7 +1061,7 @@ export default function App() {
     </aside>
     </ReviewSidebar>
     <main className="workspace">
-      <CopyQueue revision={document.revision} enabled={!readOnly} />
+      <CopyQueue revision={document.revision} enabled={!readOnly} controlRef={copyControl} onNativeWrite={runNativeWrite}/>
       <div className="backup-reminder"><Info size={16}/><span><strong>Review journal.</strong> Include migration_master_data.json in your external backup.</span></div>
       {boot.problem && <div className="recovery-banner" role="alert"><TriangleAlert size={20}/><div><strong>Saved data needs recovery</strong><p>{boot.problem}</p>{boot.recoveryAvailable && <button onClick={() => { void invoke<unknown>('recover').then(parseDocument).then(doc => { setDocument(doc); documentRef.current = doc; setView(doc.view); viewRef.current = doc.view; setBoot({ ...boot, document: doc, problem: null }); queue.current = new MutationQueue(doc, (revision, operationId, operation) => invoke('mutate', { expectedRevision: revision, operationId, operation }), receiveDocument); setDataTick(v => v + 1); setMessage('Recovered the last-known-good copy. The malformed original was preserved separately.'); }).catch(report); }}>Recover last-known-good copy</button>}</div></div>}
       {visibleError && <div className="error-banner" role="alert"><TriangleAlert size={17}/><span>{visibleError}{revisionConflict && <small>Your pending edits remain in this window. A newer saved version is protected; nothing will be reapplied automatically.</small>}</span>{revisionConflict ? <button onClick={openConflictReview}>Review conflict</button> : saveError ? <button onClick={() => queue.current?.retry()}>Retry saving</button> : <button aria-label="Dismiss error" onClick={() => setError(null)}><X size={16}/></button>}</div>}
@@ -919,7 +1088,7 @@ export default function App() {
               onClick={() => setToolbar('expanded', true)}><ChevronsDown size={16}/></button>
           </div>}
         <div id="review-path-tools" hidden={toolbar !== 'expanded' && toolbar !== 'path'}>
-        <div className="path-row"><button className="icon-button" disabled={!canUp || loading} aria-label="Go to parent folder" onClick={() => { if (up && canUp) navigate(up); }}><ArrowUp size={17}/></button><form className="path-form" onSubmit={event => { event.preventDefault(); navigate(pathDraft); }}><FolderOpen size={17}/><input ref={pathInputRef} aria-label="Current folder path" value={pathDraft} spellCheck={false} onChange={event => setPathDraft(event.target.value)}/><button type="submit" aria-label="Open folder path" title="Open path"><ArrowRight size={16}/></button></form><button className="icon-button" aria-label="Rescan current folder" title="Refresh immediate contents; keep decisions" disabled={loading} onClick={() => { refreshRequested.current = true; setRefreshTick(v => v + 1); }}><RefreshCw size={17} className={loading ? 'spin' : ''}/></button>
+        <div className="path-row"><button className="icon-button" disabled={!canUp || loading} aria-label="Go to parent folder" onClick={() => { if (up && canUp) navigate(up); }}><ArrowUp size={17}/></button><form className="path-form" onSubmit={event => { event.preventDefault(); navigate(pathDraft); }}><FolderOpen size={17}/><input ref={pathInputRef} aria-label="Current folder path" value={pathDraft} spellCheck={false} onChange={event => setPathDraft(event.target.value)}/><button type="submit" aria-label="Open folder path" title="Open path"><ArrowRight size={16}/></button></form><button className="icon-button" aria-label="Rescan current folder" title="Refresh immediate contents; keep decisions" disabled={loading} onClick={() => { void refreshVisible().catch(report); }}><RefreshCw size={17} className={loading ? 'spin' : ''}/></button>
           {toolbar === 'expanded' && <button ref={expandedTrigger} className="icon-button" aria-label="Compact path and search tools"
             title="Compact path and search tools" onClick={() => setToolbar('compact', true)}><ChevronsUp size={16}/></button>}
         </div>
@@ -940,7 +1109,7 @@ export default function App() {
         </div>
         <div className="browse-interaction-hint"><span>Folder click opens · arrow previews</span><span>Right-click or ⋯ to mark</span></div>
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
-          <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { refreshRequested.current = true; setRefreshTick(value => value + 1); }}/>
+          <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
           {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>The folder arrow previews its contents here. Keep opening arrows for more columns.</p><p>Folder names open the main location. Right-click or use ⋯ to mark a decision.</p></div>}
           {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} refreshToken={`${dataTick}:${auditDataTick}:${refreshTick}:${appStatus.scan.status ?? ''}`} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
         </div>
@@ -977,12 +1146,12 @@ export default function App() {
     </ReviewSidebar>
     {showAssistance && <Modal title="AI Assistance" onClose={() => setShowAssistance(false)}>
       <AssistanceInterview currentPath={view.path} revision={Math.max(document.revision, observedRevision)}
-        readOnly={Boolean(readOnly)} onEdit={editAssistance}/>
+        readOnly={Boolean(readOnly)} onEdit={editAssistance} controlRef={assistanceControl}/>
     </Modal>}
     {rowMenu && <RowClassificationMenu key={rowMenu.id} target={rowMenu} disabledReason={rowMenuDisabled} onDismiss={dismissRowMenu} onChoose={status => { const target = rowMenu; setSelectedEntryInfo(target.entry); dismissRowMenu(true); void classifyPath(target.entry.path, status).then(() => { if (target.invoker && !target.invoker.isConnected) window.document.querySelector<HTMLButtonElement>('.decision-picker-trigger')?.focus(); }); }}/ >}
     {message && <div className="toast" role="status"><CheckCircle2 size={16}/><span>{message}</span><button onClick={() => setMessage(null)} aria-label="Dismiss status"><X size={14}/></button></div>}
-    {showMcp && <Modal title="Local MCP gateway" compact onClose={() => setShowMcp(false)}><div className={`mcp-state-line mcp-${gateway.state}`}><Link2 size={19}/><strong>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'Gateway needs attention' : 'Gateway unavailable'}</strong></div><p className="modal-intro">Keep the native app open while using an MCP client. This indicator shows the local gateway’s readiness.</p>{gateway.problem && <div className="context-box warning"><TriangleAlert size={16}/><p>{gateway.problem}</p></div>}{gateway.endpoint && <label className="gateway-endpoint">Local endpoint<input aria-label="Local MCP gateway endpoint" readOnly value={gateway.endpoint}/></label>}<p className="modal-intro gateway-instructions">Register the included local stdio server with your MCP client. The bridge shares the app’s saved decisions and revision checks. Agent proposals remain separate from decisions; accepted edits retain their provenance.</p><details className="gateway-diagnostics"><summary>Session details</summary>{gateway.startedAt && <p>Gateway started: {new Date(gateway.startedAt).toLocaleString()}</p>}{gateway.instanceId && <p>Instance: {gateway.instanceId}</p>}<p>Authentication credentials are never displayed here.</p></details></Modal>}
-    {showConflict && <Modal title="Saved-state conflict" onClose={closeConflictReview}><p className="modal-intro">Another reviewer saved a newer version while your edit was pending. The newer file was not overwritten. Your pending requests below remain in this window and will not be replayed automatically. Compare both versions, then explicitly choose whether to apply your pending edits to the displayed revision.</p><div className="context-box warning"><TriangleAlert size={17}/><p>Keep this window open while resolving the conflict. Pending edits are still held in memory. You can select and copy this text to preserve a separate record before any manual recovery.</p></div><p className="conflict-revisions">This window last acknowledged revision {queue.current?.revision ?? document.revision}.{externalDocument ? ` The newer saved version is revision ${externalDocument.revision}.` : ' The latest saved revision will be read on the next status check.'}</p><label className="conflict-draft-label">Retained pending requests<textarea aria-label="Retained pending requests" readOnly value={JSON.stringify(queue.current?.retainedOperations ?? [], null, 2)}/></label>{externalDocument && <div className="conflict-saved-summary"><h3>Newer saved decisions for pending paths</h3>{Array.from(new Set((queue.current?.retainedOperations ?? []).flatMap(operation => 'path' in operation ? [operation.path] : []))).map(path => { const decision = Object.values(externalDocument.decisions).find(decision => resolveDecisionPath(decision, boot.volumes).path?.toLowerCase() === path.toLowerCase()); return <article key={path}><strong>{path}</strong><p>{decision ? LABELS[decision.status] : 'No explicit saved decision'}</p>{decision?.notes && <p>{decision.notes}</p>}</article>; })}</div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'view') && <div className="conflict-saved-summary"><h3>Saved review position in this revision</h3><p>{externalDocument.view.path}</p><p>Selection: {externalDocument.view.selectedPath ?? 'folder itself'} · filter: {externalDocument.view.filter} · search: {externalDocument.view.search || '(empty)'}</p></div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') && <ReviewedUndoTarget document={externalDocument}/>}<div className="conflict-recovery-actions"><button disabled={conflictLoading || !queue.current?.state.error} onClick={() => void loadConflictComparison()}><RefreshCw size={14}/>{conflictLoading ? 'Reading saved version…' : 'Refresh comparison'}</button><button className="primary" disabled={conflictLoading || !externalDocument || !queue.current?.state.error || (externalDocument?.revision ?? 0) < (queue.current?.revision ?? 0)} onClick={() => void applyReviewedPending()}>Apply my pending edits{(queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') ? ' + reviewed Undo' : ''} to revision {externalDocument?.revision ?? '…'}</button></div>{conflictProblem && <div className="context-box warning" role="alert"><TriangleAlert size={17}/><p>{conflictProblem}</p></div>}<p className="modal-intro conflict-footnote">Applying uses the displayed revision and the original request identifiers. Unrelated saved fields stay intact. For fields changed in both versions, this action deliberately chooses your pending edit. If the saved file changes again, the revision check stops the edit for another review.</p><p className="modal-intro">No pending request is discarded and no revision fence is bypassed by closing this panel.</p></Modal>}
+    {showMcp && <Modal title="Local MCP gateway" compact onClose={() => setShowMcp(false)}><div className={`mcp-state-line mcp-${gateway.state}`}><Link2 size={19}/><strong>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'Gateway needs attention' : 'Gateway unavailable'}</strong></div><p className="modal-intro">Keep the native app open while using an MCP client. This indicator shows the local gateway’s readiness.</p>{gateway.problem && <div className="context-box warning"><TriangleAlert size={16}/><p>{gateway.problem}</p></div>}{gateway.endpoint && <label className="gateway-endpoint">Local endpoint<input aria-label="Local MCP gateway endpoint" readOnly value={gateway.endpoint}/></label>}<p className="modal-intro gateway-instructions">Register the included local stdio server with your MCP client. The bridge shares the app’s saved decisions and revision checks. Agent proposals remain separate from decisions; accepted edits retain their provenance.</p><details className="gateway-diagnostics" open={gatewayDetailsOpen} onToggle={event => setGatewayDetailsOpen(event.currentTarget.open)}><summary>Session details</summary>{gateway.startedAt && <p>Gateway started: {new Date(gateway.startedAt).toLocaleString()}</p>}{gateway.instanceId && <p>Instance: {gateway.instanceId}</p>}<p>Authentication credentials are never displayed here.</p></details></Modal>}
+    {showConflict && <Modal title="Saved-state conflict" onClose={closeConflictReview}><p className="modal-intro">Another reviewer saved a newer version while your edit was pending. The newer file was not overwritten. Your pending requests below remain in this window and will not be replayed automatically. Compare both versions, then explicitly choose whether to apply your pending edits to the displayed revision.</p><div className="context-box warning"><TriangleAlert size={17}/><p>Keep this window open while resolving the conflict. Pending edits are still held in memory. You can select and copy this text to preserve a separate record before any manual recovery.</p></div><p className="conflict-revisions">This window last acknowledged revision {queue.current?.revision ?? document.revision}.{externalDocument ? ` The newer saved version is revision ${externalDocument.revision}.` : ' The latest saved revision will be read on the next status check.'}</p><label className="conflict-draft-label">Retained pending requests<textarea aria-label="Retained pending requests" readOnly value={JSON.stringify(queue.current?.retainedOperations ?? [], null, 2)}/></label>{externalDocument && <div className="conflict-saved-summary"><h3>Newer saved decisions for pending paths</h3>{Array.from(new Set((queue.current?.retainedOperations ?? []).flatMap(operation => 'path' in operation ? [operation.path] : []))).map(path => { const decision = Object.values(externalDocument.decisions).find(decision => resolveDecisionPath(decision, boot.volumes).path?.toLowerCase() === path.toLowerCase()); return <article key={path}><strong>{path}</strong><p>{decision ? LABELS[decision.status] : 'No explicit saved decision'}</p>{decision?.notes && <p>{decision.notes}</p>}</article>; })}</div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'view') && <div className="conflict-saved-summary"><h3>Saved review position in this revision</h3><p>{externalDocument.view.path}</p><p>Selection: {externalDocument.view.selectedPath ?? 'folder itself'} · filter: {externalDocument.view.filter} · search: {externalDocument.view.search || '(empty)'}</p></div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') && <ReviewedUndoTarget document={externalDocument}/>}<div className="conflict-recovery-actions"><button disabled={conflictLoading || !queue.current?.state.error} onClick={() => void loadConflictComparison()}><RefreshCw size={14}/>{conflictLoading ? 'Reading saved version…' : 'Refresh comparison'}</button><button className="primary" disabled={conflictLoading || !externalDocument || !queue.current?.state.error || (externalDocument?.revision ?? 0) < (queue.current?.revision ?? 0)} onClick={() => { void applyReviewedPending().catch(() => {}); }}>Apply my pending edits{(queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') ? ' + reviewed Undo' : ''} to revision {externalDocument?.revision ?? '…'}</button></div>{conflictProblem && <div className="context-box warning" role="alert"><TriangleAlert size={17}/><p>{conflictProblem}</p></div>}<p className="modal-intro conflict-footnote">Applying uses the displayed revision and the original request identifiers. Unrelated saved fields stay intact. For fields changed in both versions, this action deliberately chooses your pending edit. If the saved file changes again, the revision check stops the edit for another review.</p><p className="modal-intro">No pending request is discarded and no revision fence is bypassed by closing this panel.</p></Modal>}
     {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{STATUSES.map(status => { const Icon = ICONS[status]; const isSelected = effective.own && effective.status === status; return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); void classify(status); }}><Icon size={18}/><span><strong>{LABELS[status]}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
     {showContext && <Modal title="Review context & exceptions" onClose={() => setShowContext(false)}><p className="context-path">{selectedPath}</p><StatusBadge effective={effective}/><AuditDetails stats={details?.audit ?? selectedEntry?.audit} logicalFallback={selectedEntry?.kind === 'file' ? selectedEntry.size : undefined}/>{agentDecision && <div className="context-box"><Link2 size={16}/><div><p>Saved through MCP by {typeof activeProvenance?.actor === 'string' ? activeProvenance.actor : 'an agent'}{typeof activeProvenance?.at === 'string' ? ` · ${new Date(activeProvenance.at).toLocaleString()}` : ''}.</p>{typeof activeProvenance?.reason === 'string' && <p>{activeProvenance.reason}</p>}</div></div>}{pathSuggestions.length > 0 && <section className="assistant-proposals"><h3>Assistant proposals · not applied</h3><p>Suggestions are separate from saved decisions. No proposal below changes a classification.</p>{pathSuggestions.map(suggestion => <article key={suggestion.id}><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: suggestion.status }}/><p>{suggestion.reason}</p><small>{suggestion.actor} · MCP suggestion{suggestion.createdAt ? ` · ${new Date(suggestion.createdAt).toLocaleString()}` : ''}</small></article>)}</section>}{effective.inheritedFrom && <div className="context-box"><Info size={16}/>{effective.originalStatus === 'on-external' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has a manual F: assertion. This child needs its own review. Backup assertions are not inherited.</p> : effective.originalStatus === 'manual-confirmed' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has your manual-backup confirmation for that path. Review this child separately.</p> : <p>Inherited from <strong>{effective.inheritedFrom}</strong>. Choosing a decision creates a specific child exception.</p>}</div>}{effective.stale && <div className="context-box warning"><TriangleAlert size={16}/><p>Source metadata changed or new content was discovered after the decision. Review it again. The earlier claim remains in history.</p></div>}{details && !details.exists && <div className="context-box warning"><TriangleAlert size={16}/><p>This path is missing or unavailable. Its saved decision is retained. You can edit notes; classification is unavailable until the path can be read again.</p></div>}{selectedPath !== view.path && !selectedEntry && !loading && <p className="modal-intro">The selected path is outside the current page or filter. Its decision remains open.</p>}{activeDecision?.decidedAt && <p className="decision-date">Decision recorded {new Date(activeDecision.decidedAt).toLocaleString()}</p>}<div className="evidence-note"><ShieldCheck size={18}/><p>Manual marks record your pending copy or your confirmation. Source checksums, destination-copy receipts and restore checks provide separate evidence. The green Already on F: mark retains your manual F: assertion.</p></div>{details && details.overrides.length > 0 ? <div className="overrides"><h3>Specific child decisions · {details.overrides.length} recorded</h3>{details.overrides.map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <div key={`${decision.path}-${index}`}><button disabled={!location.path} title={decision.path} onClick={() => { if (!location.path) return; setShowContext(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}><span className={`decision-dot status-${decision.status}`}/><span>{decision.path}</span><ChevronRight size={13}/></button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}</div>; })}</div> : <p className="modal-intro context-empty">No specific child exceptions are recorded for this path.</p>}</Modal>}
     {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>This optional index discovers folder names for navigation. The Count & hash controls run the full allocation and source checksum audit.</p><div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued</p><p className="modal-intro">Protected paths, failed reads and links are recorded here. No ownership or permissions are changed. This shows the latest 200 gaps; the inventory may discover more.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}

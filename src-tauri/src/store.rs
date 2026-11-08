@@ -213,6 +213,10 @@ impl Store {
         self.doc["revision"].as_u64().unwrap_or(0)
     }
 
+    pub fn loaded_fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
+    }
+
     pub fn commit(&mut self, mut candidate: Value) -> Result<Value, String> {
         if let Some(e) = &self.problem {
             return Err(e.clone());
@@ -253,13 +257,61 @@ impl Store {
     }
 
     pub fn recover(&mut self) -> Result<Value, String> {
+        let expected = self.fingerprint.clone();
+        self.recover_checked(expected.as_deref(), None, None)
+    }
+
+    pub fn recover_prepared(
+        &mut self,
+        expected_original: Option<&str>,
+        expected_backup: &str,
+        operation_id: &str,
+        receipt: Value,
+    ) -> Result<Value, String> {
+        self.recover_checked(expected_original, Some(expected_backup), Some((operation_id, receipt)))
+    }
+
+    fn recover_checked(
+        &mut self,
+        expected_original: Option<&str>,
+        expected_backup: Option<&str>,
+        receipt: Option<(&str, Value)>,
+    ) -> Result<Value, String> {
         if self.problem.is_none() {
             return Err("Recovery is available only when the main data file cannot load.".into());
         }
+        if self.fingerprint.as_deref() != expected_original {
+            return Err("The prepared recovery does not match the original loaded by this app.".into());
+        }
         let backup = fs::read(self.path.with_extension("json.bak"))
             .map_err(|e| format!("No readable recovery copy: {e}"))?;
-        let doc: Value = serde_json::from_slice(&backup).map_err(error)?;
+        if expected_backup.is_some_and(|expected| expected != hash(&backup)) {
+            return Err("The recovery copy changed. Inspect recovery state again before proceeding.".into());
+        }
+        let mut doc: Value = serde_json::from_slice(&backup).map_err(error)?;
         validate(&doc)?;
+        let restored = if let Some((operation_id, mut receipt)) = receipt {
+            if doc.get("recoveryOperations").is_some_and(|value| !value.is_object()) {
+                return Err("Recovery receipt metadata has an unsupported format. Original preserved.".into());
+            }
+            if doc["recoveryOperations"].get(operation_id).is_some() {
+                return Err("This operation ID is already present in the recovery copy. Inspect the current state and use a new recovery operation.".into());
+            }
+            if doc["copyOperations"].get(operation_id).is_some() || doc["agentOperations"].get(operation_id).is_some()
+                || doc["recentOperations"].as_array().is_some_and(|items|items.iter().any(|id|id==operation_id))
+                || doc["history"].as_array().is_some_and(|items|items.iter().any(|event|event["id"]==operation_id)) {
+                return Err("Recovery operation ID is already used in the recovery copy".into());
+            }
+            let revision = doc["revision"].as_u64().unwrap().checked_add(1).ok_or("Recovery revision overflow")?;
+            doc["revision"] = json!(revision);
+            doc["updatedAt"] = json!(now());
+            receipt["committedRevision"] = json!(revision);
+            if doc.get("recoveryOperations").is_none() { doc["recoveryOperations"] = json!({}); }
+            doc["recoveryOperations"][operation_id] = receipt;
+            serde_json::to_vec_pretty(&doc).map_err(error)?
+        } else {
+            backup
+        };
         let original = match fs::read(&self.path) {
             Ok(b) => Some(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -281,10 +333,10 @@ impl Store {
             f.write_all(&original).map_err(error)?;
             f.sync_all().map_err(error)?;
         }
-        atomic_write_guarded(&self.path, &backup, || {
+        atomic_write_guarded(&self.path, &restored, || {
             require_fingerprint(&self.path, self.fingerprint.as_deref())
         })?;
-        self.fingerprint = Some(hash(&backup));
+        self.fingerprint = Some(hash(&restored));
         self.doc = doc;
         self.problem = None;
         Ok(self.doc.clone())
@@ -481,12 +533,15 @@ mod tests {
         let edit = std::thread::spawn(move || {
             wait_for_pending_file(&locked_path);
             fs::write(&locked_path, &written).unwrap();
-            drop(reader);
         });
         let mut candidate = before.clone();
         candidate["pendingUserEdit"] = json!("retain me");
-        let failed = store.commit(candidate).unwrap_err();
+        // Keep replacement blocked until the commit has observed the edit.
+        // Releasing from the editor would race the final fingerprint-to-rename gap.
+        let result = store.commit(candidate);
+        drop(reader);
         edit.join().unwrap();
+        let failed = result.unwrap_err();
         assert!(failed.contains("outside this app"), "{failed}");
         assert!(failed.contains("Pending data retained"), "{failed}");
         assert_eq!(store.doc, before);

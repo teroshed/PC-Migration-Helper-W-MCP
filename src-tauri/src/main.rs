@@ -1,14 +1,17 @@
 #![windows_subsystem = "windows"]
 mod assistance;
 mod audit;
+mod copy_control;
 mod copy_queue;
 mod filesystem;
 mod gateway;
 mod index;
 mod manual_backup;
+mod recovery_control;
 mod review;
 mod rollup;
 mod store;
+mod ui_control;
 mod watcher;
 
 use filesystem::{Entry, Volume};
@@ -38,6 +41,7 @@ struct AppState {
     gateway_server: Mutex<Option<gateway::GatewayHandle>>,
     review: review::ReviewBridge,
     copy_queue: Arc<copy_queue::CopyQueue>,
+    copy_control: Mutex<()>,
     assistance: assistance::Cache,
 }
 type Shared = Arc<AppState>;
@@ -47,10 +51,10 @@ fn ensure_gateway(state: &Shared) {
         .store
         .lock()
         .ok()
-        .is_some_and(|lock| lock.as_ref().is_some_and(|store| store.problem.is_none()));
+        .is_some_and(|lock| lock.is_some());
     if !available {
         if let Ok(mut public) = state.gateway.lock() {
-            *public = json!({"state":"unavailable","problem":"The local connection requires the healthy data-file owner. Review the recovery or other-instance message."});
+            *public = json!({"state":"unavailable","problem":"The local connection requires the data-file owner. A competing instance cannot replace its connection."});
         }
         return;
     }
@@ -632,6 +636,9 @@ fn run_mutation_as(
     let store = guard
         .as_mut()
         .ok_or("Data file is not writable in this instance")?;
+    if store.doc["copyOperations"].get(&operation_id).is_some() || store.doc["recoveryOperations"].get(&operation_id).is_some() {
+        return Err("This operationId belongs to a durable copy or recovery receipt and cannot be reused for an edit".into());
+    }
     let agent_hash = origin.payload_hash(&op)?;
     if let Some(payload_hash) = &agent_hash {
         if store
@@ -900,18 +907,7 @@ async fn mutate(
 #[tauri::command]
 async fn recover(state: State<'_, Shared>) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let recovered = s
-            .store
-            .lock()
-            .map_err(error)?
-            .as_mut()
-            .ok_or("This instance does not own the data file")?
-            .recover()?;
-        ensure_gateway(&s);
-        ensure_watcher(&s);
-        Ok(recovered)
-    })
+    tauri::async_runtime::spawn_blocking(move || recovery_control::recover_ui(&s))
     .await
     .map_err(error)?
 }
@@ -944,48 +940,20 @@ fn copy_destination(s: &AppState) -> Volume {
 #[tauri::command]
 async fn copy_queue_snapshot(state: State<'_, Shared>) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let doc = document(&s)?;
-        let mut snapshot = s
-            .copy_queue
-            .snapshot(&doc, &s.volumes, &copy_destination(&s))?;
-        snapshot["revision"] = doc["revision"].clone();
-        Ok(snapshot)
-    })
+    tauri::async_runtime::spawn_blocking(move || copy_control::snapshot(&s))
     .await
     .map_err(error)?
 }
 
 #[tauri::command]
-async fn start_copy_queue(
+async fn control_copy_queue(
     state: State<'_, Shared>,
-    mode: String,
-    expected_destination_id: String,
-    expected_revision: u64,
-    scope: Option<String>,
+    request: Value,
 ) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        healthy_owner(&s)?;
-        let doc = document(&s)?;
-        if doc["revision"].as_u64() != Some(expected_revision) {
-            return Err("The review changed. Check the updated copy queue and try again.".into());
-        }
-        let destination = copy_destination(&s);
-        if !destination.available || destination.id != expected_destination_id {
-            return Err("The copy destination changed. Check the drive before starting.".into());
-        }
-        s.copy_queue
-            .start(doc, s.volumes.clone(), destination, &mode, scope.as_deref())
-    })
+    tauri::async_runtime::spawn_blocking(move || copy_control::control(&s, &request, MutationOrigin::ManualUi))
     .await
     .map_err(error)?
-}
-
-#[tauri::command]
-fn pause_copy_queue(state: State<'_, Shared>) -> Result<(), String> {
-    state.copy_queue.pause();
-    Ok(())
 }
 
 fn audit_status_service(s: &AppState) -> Result<Value, String> {
@@ -1363,6 +1331,7 @@ fn main() {
         review: review::ReviewBridge::default(),
         assistance: assistance::Cache::default(),
         copy_queue,
+        copy_control: Mutex::new(()),
     });
     tauri::Builder::default()
         .manage(state.clone())
@@ -1398,11 +1367,14 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_control::report_ui_state,
+            ui_control::poll_ui_commands,
+            ui_control::validate_auto_copy,
+            ui_control::begin_ui_session,
             get_boot,
             assistance::get_assisted_review,
             copy_queue_snapshot,
-            start_copy_queue,
-            pause_copy_queue,
+            control_copy_queue,
             report_review_surface,
             poll_review_activity,
             plan_review_reveal,
@@ -1607,6 +1579,38 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_child_override_does_not_inherit_selected_parent_confirmation() {
+        let s=fixture();
+        let parent=PathBuf::from(&s.volumes[0].root).join("Work");
+        let child=parent.join("Child");
+        apply(&s,"parent-manual-confirm",json!({"type":"classify","path":parent.to_string_lossy(),"status":"manual-confirmed"}));
+        apply(&s,"child-keep-override",json!({"type":"classify","path":child.to_string_lossy(),"status":"last-moment"}));
+        assert_eq!(details_service(&s,child.to_string_lossy().into_owned()).unwrap()["effective"]["status"],"last-moment");
+        apply(&s,"undo-child-override",json!({"type":"undo"}));
+        let child=details_service(&s,child.to_string_lossy().into_owned()).unwrap();
+        assert!(child["decision"].is_null());
+        assert_eq!(child["effective"]["status"],"attention");
+        assert_eq!(child["effective"]["originalStatus"],"manual-confirmed");
+    }
+
+    #[test]
+    fn undo_preserves_stale_confirmation_barrier_after_source_metadata_changed() {
+        use std::fs::FileTimes;
+        let s=fixture();
+        let path=PathBuf::from(&s.volumes[0].root).join("Work").join("original.txt");
+        std::fs::write(&path,b"original").unwrap();
+        let initial=std::fs::metadata(&path).unwrap().modified().unwrap();
+        apply(&s,"confirm-before-change",json!({"type":"classify","path":path.to_string_lossy(),"status":"manual-confirmed"}));
+        apply(&s,"change-intent-before-undo",json!({"type":"classify","path":path.to_string_lossy(),"status":"last-moment"}));
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(FileTimes::new().set_modified(initial+std::time::Duration::from_secs(5))).unwrap();
+        apply(&s,"undo-after-source-change",json!({"type":"undo"}));
+        let result=details_service(&s,path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(result["decision"]["status"],"manual-confirmed");
+        assert_eq!(result["effective"]["status"],"attention");
+        assert_eq!(result["effective"]["stale"],true);
+    }
+
+    #[test]
     fn checksum_changes_return_manual_external_assertions_to_attention() {
         let s = fixture();
         let parent = PathBuf::from(&s.volumes[0].root).join("Work");
@@ -1721,6 +1725,7 @@ mod tests {
                 Vec::new(),
                 true,
             ),
+            copy_control: Mutex::new(()),
         }
     }
     fn apply(s: &AppState, id: &str, op: Value) -> Value {

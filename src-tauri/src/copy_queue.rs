@@ -49,7 +49,9 @@ struct Decision {
 #[serde(rename_all = "camelCase")]
 struct Progress {
     phase: String,
+    job_id: Option<String>,
     mode: Option<String>,
+    scope: Option<String>,
     source_revision: Option<u64>,
     planned: u64,
     copied: u64,
@@ -68,6 +70,8 @@ pub struct CopyQueue {
     progress: Mutex<Progress>,
     destination_gate: Mutex<()>,
     cancel: AtomicBool,
+    #[cfg(test)]
+    worker_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +111,8 @@ impl CopyQueue {
             }),
             destination_gate: Mutex::new(()),
             cancel: AtomicBool::new(false),
+            #[cfg(test)]
+            worker_barrier: Mutex::new(None),
         })
     }
 
@@ -194,12 +200,56 @@ impl CopyQueue {
         let progress = self.progress.lock().map_err(error)?;
         let mut value = serde_json::to_value(&*progress).map_err(error)?;
         value["running"] = json!(active(&progress.phase));
+        value["pauseRequested"] = json!(self.cancel.load(Ordering::SeqCst));
         value["scopeNotes"] = json!(SCOPE);
         Ok(value)
     }
 
     pub fn pause(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_worker(&self, barrier: Arc<std::sync::Barrier>) {
+        *self.worker_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    pub fn pause_job(&self, expected_job_id: &str) -> Result<Value, String> {
+        let progress = self.progress.lock().map_err(error)?;
+        if progress.job_id.as_deref() != Some(expected_job_id) {
+            return Err("The copy job changed. Inspect the current job before pausing.".into());
+        }
+        if !active(&progress.phase) && progress.phase != "paused" {
+            return Err("This copy job has already stopped.".into());
+        }
+        self.cancel.store(true, Ordering::SeqCst);
+        drop(progress);
+        self.status()
+    }
+
+    pub fn validate_start_request(
+        &self,
+        volumes: &[Volume],
+        destination: &Volume,
+        mode: &str,
+        scope: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let parsed_mode = Mode::parse(mode)?;
+        validate_destination(destination, volumes, self.fixture)?;
+        let scope = match (parsed_mode, scope) {
+            (Mode::LastMoment, Some(path)) => {
+                let path = filesystem::normalize(path)?;
+                filesystem::identify(&path, volumes)?;
+                Some(path)
+            }
+            (Mode::LastMoment, None) => return Err("Choose a Last Moment path explicitly".into()),
+            (_, Some(_)) => return Err("This copy action uses the full Migrate now queue".into()),
+            (_, None) => None,
+        };
+        if self.status()?["running"] == true {
+            return Err("A copy pass is already running".into());
+        }
+        Ok(scope)
     }
 
     pub fn start(
@@ -210,18 +260,22 @@ impl CopyQueue {
         mode: &str,
         scope: Option<&str>,
     ) -> Result<Value, String> {
+        let job_id = hash(format!("{}|{}|{mode}", std::process::id(), now()).as_bytes());
+        self.start_with_job(document, volumes, destination, mode, scope, &job_id, None)
+    }
+
+    pub fn start_with_job(
+        self: &Arc<Self>,
+        document: Value,
+        volumes: Vec<Volume>,
+        destination: Volume,
+        mode: &str,
+        scope: Option<&str>,
+        job_id: &str,
+        launch: Option<mpsc::Receiver<()>>,
+    ) -> Result<Value, String> {
         let parsed_mode = Mode::parse(mode)?;
-        validate_destination(&destination, &volumes, self.fixture)?;
-        let scope = match (parsed_mode, scope) {
-            (Mode::LastMoment, Some(path)) => {
-                let path = filesystem::normalize(path)?;
-                filesystem::identify(&path, &volumes)?;
-                Some(path)
-            }
-            (Mode::LastMoment, None) => return Err("Choose a Last Moment path explicitly".into()),
-            (_, Some(_)) => return Err("This copy action uses the full Migrate now queue".into()),
-            (_, None) => None,
-        };
+        let scope = self.validate_start_request(&volumes, &destination, mode, scope)?;
         {
             let mut progress = self.progress.lock().map_err(error)?;
             if active(&progress.phase) {
@@ -230,16 +284,32 @@ impl CopyQueue {
             self.cancel.store(false, Ordering::SeqCst);
             *progress = Progress {
                 phase: "planning".into(),
+                job_id: Some(job_id.into()),
                 mode: Some(mode.into()),
+                scope: scope.clone(),
                 source_revision: document["revision"].as_u64(),
                 ..Progress::default()
             };
         }
         let queue = self.clone();
+        #[cfg(test)]
+        let barrier = self.worker_barrier.lock().map_err(error)?.take();
         if let Err(problem) =
             thread::Builder::new()
                 .name("migration-copy".into())
                 .spawn(move || {
+                    // Shared API admission is journaled while this worker waits.
+                    // A lost/failed acknowledgement closes the gate without I/O.
+                    if let Some(launch) = launch {
+                        if launch.recv().is_err() {
+                            queue.finish(Err("Copy launch acknowledgement was not saved; file copying was not started".into()));
+                            return;
+                        }
+                    }
+                    #[cfg(test)]
+                    if let Some(barrier) = barrier {
+                        barrier.wait();
+                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         queue.run(
                             &document,

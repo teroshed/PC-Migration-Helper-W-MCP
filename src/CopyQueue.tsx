@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Copy, ListOrdered, Pause, TriangleAlert } from 'lucide-react';
 import { record } from './model';
 import { OverflowIndicators } from './OverflowIndicators';
+import type { UiControlRef, UiRequest } from './UIBridge';
 
 type CopyMode = 'ordered' | 'all' | 'last-moment';
 
@@ -12,6 +13,7 @@ interface QueueItem {
 }
 
 interface QueueStatus {
+  jobId: string;
   phase: string;
   currentPath: string;
   copied: number;
@@ -22,6 +24,8 @@ interface QueueStatus {
 }
 
 interface QueueSnapshot {
+  instanceId: string;
+  sourceVolumeSignature: string;
   revision: number;
   destination: { root: string; id: string; available: boolean; problem: string };
   migrateNow: QueueItem[];
@@ -55,6 +59,8 @@ function snapshot(value: unknown): QueueSnapshot {
   const status = record(queue.status);
   const migrateNow = items(queue.migrateNow);
   return {
+    instanceId: string(queue.instanceId),
+    sourceVolumeSignature: string(queue.sourceVolumeSignature),
     revision: count(queue.revision),
     destination: {
       root: string(destination.root),
@@ -69,6 +75,7 @@ function snapshot(value: unknown): QueueSnapshot {
     pendingMigrateNow: count(queue.pendingMigrateNow),
     queueSignature: string(queue.queueSignature),
     status: {
+      jobId: string(status.jobId),
       phase: string(status.phase),
       currentPath: string(status.currentPath),
       copied: count(status.copied),
@@ -83,7 +90,10 @@ function snapshot(value: unknown): QueueSnapshot {
   };
 }
 
-export function CopyQueue({ revision, enabled }: { revision: number; enabled: boolean }) {
+export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
+  revision: number; enabled: boolean; controlRef: UiControlRef;
+  onNativeWrite: <T>(operation: () => Promise<T>) => Promise<T>;
+}) {
   const [queue, setQueue] = useState<QueueSnapshot | null>(null);
   const [auto, setAuto] = useState(false);
   const [details, setDetails] = useState(false);
@@ -92,6 +102,7 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
   const read = useRef<() => void>(() => {});
   const request = useRef(false);
   const armedDestination = useRef('');
+  const armedSources = useRef('');
   const attempted = useRef('');
   const listRef = useRef<HTMLDivElement>(null);
   const countRef = useRef<HTMLButtonElement>(null);
@@ -105,10 +116,10 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
       try {
         const next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
         if (!active) return;
-        if (armedDestination.current && (!next.destination.available || next.destination.id !== armedDestination.current)) {
+        if (armedDestination.current && (!next.destination.available || next.destination.id !== armedDestination.current || next.sourceVolumeSignature !== armedSources.current)) {
           armedDestination.current = '';
           setAuto(false);
-          setIssue('Auto-copy paused because the destination changed. Check the drive before enabling it again.');
+          setIssue('Auto-copy paused because a source or destination changed. Check the drives before enabling it again.');
         }
         if (next.status.phase === 'paused' && armedDestination.current) {
           armedDestination.current = '';
@@ -142,18 +153,36 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
   const destinationId = queue?.destination.id ?? '';
   const ready = enabled && Boolean(queue?.destination.available && destinationId) && !copying && !busy;
 
-  async function start(mode: CopyMode, destination: string, expectedRevision: number, scope?: string): Promise<void> {
-    if (request.current) return;
+  function fences(next: QueueSnapshot): Record<string, unknown> {
+    return { expectedInstanceId: next.instanceId, expectedRevision: next.revision,
+      expectedQueueSignature: next.queueSignature, expectedSourceVolumeSignature: next.sourceVolumeSignature,
+      expectedDestinationId: next.destination.id, confirmed: true };
+  }
+  async function control(action: 'start' | 'pause' | 'resume', mode?: CopyMode, scope?: string): Promise<void> {
+    if (request.current) throw new Error('Another copy control is pending.');
+    if (!enabled) throw new Error('Recover the review data before copying.');
     request.current = true;
     setBusy(true);
     setIssue('');
     try {
-      await invoke('start_copy_queue', { mode, expectedDestinationId: destination, expectedRevision, scope });
+      await onNativeWrite(async () => {
+        const next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
+        if (auto && (next.destination.id !== armedDestination.current || next.sourceVolumeSignature !== armedSources.current)) {
+          throw new Error('Auto-copy stopped because the reviewed drives changed.');
+        }
+        const response = record(await invoke('control_copy_queue', { request: {
+          ...fences(next), action, operationId: crypto.randomUUID(),
+          ...(action === 'start' ? { mode, ...(scope ? { scope } : {}) } : { expectedJobId: next.status.jobId }),
+        } }));
+        if (record(response.receipt).phase === 'failed') throw new Error(string(record(response.receipt).error) || 'The copy run could not start. Its receipt was retained.');
+      });
       read.current();
     } catch (error) {
       if (String(error).includes('The review changed.')) attempted.current = '';
       setIssue(String(error));
+      armedDestination.current = ''; armedSources.current = ''; setAuto(false);
       read.current();
+      throw error;
     } finally {
       request.current = false;
       setBusy(false);
@@ -170,16 +199,35 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
     const timer = setTimeout(() => {
       if (armedDestination.current !== destinationId || attempted.current === key) return;
       attempted.current = key;
-      void start('ordered', destinationId, queueRevision);
+      void control('start', 'ordered').catch(() => {});
     }, 1400);
     return () => clearTimeout(timer);
   }, [auto, ready, pendingCount, queueSignature, destinationId, queueRevision]);
 
-  function toggleAuto(checked: boolean): void {
-    armedDestination.current = checked ? destinationId : '';
+  async function toggleAuto(checked: boolean, reviewed?: UiRequest): Promise<void> {
+    if (checked && !enabled) throw new Error('Recover the review data before enabling Auto-copy.');
+    let next: QueueSnapshot | null = null;
+    if (checked) {
+      await onNativeWrite(async () => {
+        next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
+        await invoke('validate_auto_copy', { request: reviewed ?? fences(next) });
+        if (!next.destination.available) throw new Error(next.destination.problem || 'The copy destination is unavailable.');
+        armedDestination.current = next.destination.id;
+        armedSources.current = next.sourceVolumeSignature;
+      });
+    } else { armedDestination.current = ''; armedSources.current = ''; }
     attempted.current = '';
     setAuto(checked);
   }
+  controlRef.current = {
+    read: () => ({ autoCopy: auto, detailsOpen: details, busy, issue, queue }),
+    execute: async (command, reviewed) => {
+      if (command.action === 'setAutoCopy') await toggleAuto(command.enabled === true, reviewed);
+      else if (command.action === 'setCopyDetails') setDetails(command.open === true);
+      else throw new Error('Unsupported copy presentation action');
+    },
+  };
+  useEffect(() => () => { controlRef.current = null; }, [controlRef]);
 
   if (!queue && !issue) return null;
   const status = queue?.status;
@@ -199,12 +247,12 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
         <Copy size={16}/><strong>{marked.toLocaleString()} entries marked for migration now</strong>
       </button>
       <div className="copy-queue-actions">
-        <button type="button" disabled={!ready || !marked} onClick={() => void start('ordered', destinationId, queueRevision)}><ListOrdered size={15}/>Start Copying In Order</button>
-        <button type="button" disabled={!ready || !marked} onClick={() => void start('all', destinationId, queueRevision)}><Copy size={15}/>Copy everything</button>
+        <button type="button" disabled={!ready || !marked} onClick={() => void control('start', 'ordered').catch(() => {})}><ListOrdered size={15}/>Start Copying In Order</button>
+        <button type="button" disabled={!ready || !marked} onClick={() => void control('start', 'all').catch(() => {})}><Copy size={15}/>Copy everything</button>
         <label className="copy-queue-auto" title="Copy new Migrate now marks after a short pause. Applies for this window session.">
-          <input type="checkbox" checked={auto} disabled={!enabled || !queue?.destination.available} onChange={event => toggleAuto(event.target.checked)}/>Auto-copy
+          <input type="checkbox" checked={auto} disabled={!enabled || !queue?.destination.available} onChange={event => { void toggleAuto(event.target.checked).catch(error => setIssue(String(error))); }}/>Auto-copy
         </label>
-        {copying && <button type="button" onClick={() => { toggleAuto(false); void invoke('pause_copy_queue').then(read.current).catch(error => setIssue(String(error))); }}><Pause size={15}/>Pause</button>}
+        {copying && <button type="button" onClick={() => { void toggleAuto(false); void control('pause').catch(() => {}); }}><Pause size={15}/>Pause</button>}
       </div>
     </div>
     {copyProblem && <p className="copy-queue-problem" role="status"><TriangleAlert size={15}/>{copyProblem}</p>}
@@ -224,7 +272,7 @@ export function CopyQueue({ revision, enabled }: { revision: number; enabled: bo
           {!marked && <p>Mark an entry Migrate now to add it here.</p>}
           {queue && marked > queue.migrateNow.length && <p>Showing {queue.migrateNow.length} of {marked.toLocaleString()} marked entries.</p>}
           <h3>Migrate Last Moment</h3>
-          {queue?.lastMoment.map(item => <div className="copy-queue-item" key={item.path}><span title={item.path}>{item.path}</span><button type="button" disabled={!ready} onClick={() => void start('last-moment', destinationId, queueRevision, item.path)}>Copy last moment</button></div>)}
+          {queue?.lastMoment.map(item => <div className="copy-queue-item" key={item.path}><span title={item.path}>{item.path}</span><button type="button" disabled={!ready} onClick={() => void control('start', 'last-moment', item.path).catch(() => {})}>Copy last moment</button></div>)}
           {!queue?.lastMomentCount && <p>No last-moment entries.</p>}
           {Boolean(status?.issues.length) && <><h3>Copy issues</h3>{status?.issues.map((item, index) =>
             <p key={`${item.path}:${index}`}>{item.path} · {item.problem}</p>

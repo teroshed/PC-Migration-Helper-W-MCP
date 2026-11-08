@@ -206,6 +206,8 @@ export class MutationQueue {
   private document: Document;
   private pending: PendingMutation[] = [];
   private running = false;
+  private externalHold = false;
+  private inspectionGeneration = 0;
   private failure: string | null = null;
   private waiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
   private transport: MutationTransport;
@@ -215,10 +217,12 @@ export class MutationQueue {
     this.transport = transport;
     this.changed = changed;
   }
-  get state(): QueueState { return { pending: this.pending.length, saving: this.running || this.pending.length > 0, error: this.failure }; }
+  get state(): QueueState { return { pending: this.pending.length, saving: this.externalHold || this.running || this.pending.length > 0, error: this.failure }; }
   get revision(): number { return this.document.revision; }
-  get idle(): boolean { return !this.running && !this.pending.length && !this.failure; }
+  get inspectionVersion(): number { return this.inspectionGeneration; }
+  get idle(): boolean { return !this.running && !this.pending.length && !this.failure && !this.externalHold; }
   get retainedOperations(): readonly Operation[] { return this.pending.map(item => item.operation); }
+  get retainedRequests(): readonly { id: string; operation: Operation }[] { return this.pending.map(({ id, operation }) => ({ id, operation })); }
   acceptExternal(value: unknown): boolean {
     if (!this.idle) return false;
     const document = parseDocument(value);
@@ -228,13 +232,33 @@ export class MutationQueue {
     return true;
   }
   rebaseAfterReview(value: unknown): boolean {
-    if (this.running || !this.failure || !this.pending.length) return false;
+    if (this.running || this.externalHold || !this.failure || !this.pending.length) return false;
     const document = parseDocument(value);
     if (document.revision < this.document.revision) return false;
     this.document = document;
     // Retain both requests and failure until the explicit retry that follows review.
     this.notify();
     return true;
+  }
+  holdForExternal(): void {
+    if (!this.idle) throw new Error('Finish pending saves before starting another native operation.');
+    this.externalHold = true;
+    this.notify();
+  }
+  finishExternal(value: unknown): void {
+    if (!this.externalHold || this.running) throw new Error('No serialized native operation is active.');
+    const document = parseDocument(value);
+    if (document.revision < this.document.revision) throw new Error('The native operation returned an older saved revision.');
+    this.document = document;
+    this.externalHold = false;
+    this.notify();
+    void this.drain();
+  }
+  failExternal(cause: unknown): void {
+    this.externalHold = false;
+    this.failure = `The native operation needs reconciliation before pending edits can save: ${String(cause)}`;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(new Error(this.failure));
+    this.notify();
   }
   request(operation: Operation): Promise<Document> {
     const promise = new Promise<Document>((resolve, reject) => {
@@ -247,12 +271,12 @@ export class MutationQueue {
   retry(): void { this.failure = null; void this.drain(); }
   flush(): Promise<void> {
     if (this.failure) return Promise.reject(new Error(this.failure));
-    if (!this.pending.length && !this.running) return Promise.resolve();
+    if (!this.pending.length && !this.running && !this.externalHold) return Promise.resolve();
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
-  private notify(): void { this.changed(this.document, this.state); }
+  private notify(): void { this.inspectionGeneration += 1; this.changed(this.document, this.state); }
   private async drain(): Promise<void> {
-    if (this.running || this.failure) return;
+    if (this.running || this.failure || this.externalHold) return;
     this.running = true;
     this.notify();
     while (this.pending.length) {

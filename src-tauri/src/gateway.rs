@@ -75,17 +75,14 @@ fn random_hex<const N: usize>() -> Result<String, String> {
     Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Caller retains the handle for the native application's lifetime. Only the healthy Store
-/// owner can publish a descriptor; blocked instances leave the owner's descriptor untouched.
+/// Only the Store owner publishes a descriptor. A damaged journal permits the
+/// restricted inspection/recovery routes; competing instances remain blocked.
 pub fn start(state: &Shared, runtime: &Path) -> Result<(GatewayHandle, Value), String> {
     {
         let locked = state.store.lock().map_err(error)?;
-        let store = locked
+        let _store = locked
             .as_ref()
             .ok_or("This instance does not own the data file")?;
-        if let Some(problem) = &store.problem {
-            return Err(problem.clone());
-        }
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(error)?;
     listener.set_nonblocking(true).map_err(error)?;
@@ -553,6 +550,8 @@ fn project_history(event: &Value) -> Value {
 }
 fn projected_details(state: &AppState, path: String) -> Result<Value, String> {
     let details = details_service(state, path)?;
+    let decision_key=filesystem::identify(details["path"].as_str().ok_or("Missing details path")?,&state.volumes)?.2;
+    let decision_record_id=format!("sha256:{}",crate::store::hash(decision_key.as_bytes()));
     let overrides = details["overrides"]
         .as_array()
         .map(|items| {
@@ -574,7 +573,7 @@ fn projected_details(state: &AppState, path: String) -> Result<Value, String> {
         })
         .unwrap_or_default();
     Ok(
-        json!({"path":details["path"],"effective":details["effective"],"decision":project_record(&details["decision"],16*1024),
+        json!({"path":details["path"],"decisionRecordId":decision_record_id,"effective":details["effective"],"decision":project_record(&details["decision"],16*1024),
         "overrides":overrides,"history":history,"exists":details["exists"],"inventory":details["inventory"],"audit":details["audit"],
         "truncation":{"projection":true,"notesLimitBytes":16*1024,"overrideNotesLimitBytes":4096,"historyNotesLimitBytes":4096,"storedOriginalPreserved":true}}),
     )
@@ -621,11 +620,24 @@ fn state_summary(state: &AppState) -> Result<Value, String> {
     let mut view_budget = 64;
     let view = project_metadata(&doc["view"], 3, &mut view_budget, &mut view_truncated);
     Ok(
-        json!({"revision":doc["revision"],"schemaVersion":doc["schemaVersion"],"view":view,
+        json!({"api":api_capabilities(),"revision":doc["revision"],"schemaVersion":doc["schemaVersion"],"view":view,
         "volumes":state.volumes,"dataPath":state.data_path,"fixture":state.fixture,"problem":null,
         "gateway":gateway,"decisionCount":doc["decisions"].as_object().map_or(0,|m|m.len()),
         "suggestionCount":doc["suggestions"].as_array().map_or(0,|a|a.len()),"historyCount":doc["history"].as_array().map_or(0,|a|a.len()),"backupReminder":doc["backupReminder"],"truncation":{"viewMetadataTruncated":view_truncated,"storedOriginalPreserved":true}}),
     )
+}
+
+pub(crate) fn api_capabilities()->Value {
+    json!({"version":"0.4.0","transport":"authenticated-loopback-rpc","methods":[
+        "get_state","get_review_view","list_folder","get_details","list_decisions","list_suggestions",
+        "read_review_text","get_status","get_assisted_review","next_attention","search_dirs","scan","mutate",
+        "audit_status","audit_control","audit_notifications","audit_read_notifications",
+        "copy_queue_snapshot","control_copy_queue","get_ui_state","control_ui","get_recovery_state","recover_review"],
+        "recoveryModeMethods":["get_recovery_state","recover_review","get_ui_state","control_ui"],
+        "copyControls":["start","pause","resume"],"sourceDeletion":false,
+        "uiControl":"registered native UI session; accepted commands require an applied/error acknowledgement",
+        "textContinuation":"read_review_text for saved text; control_ui listPending/readPendingText for retained drafts",
+        "authority":"Authenticated delegated clients must assert explicit user_instruction. This is actor provenance, not cryptographic human-presence proof."})
 }
 
 fn review_view_summary(state: &AppState) -> Result<Value, String> {
@@ -659,22 +671,24 @@ fn list_records(state: &AppState, params: &Value, suggestions: bool) -> Result<V
         return Err("Unknown classification filter".into());
     }
     let page = page(params)?;
+    let limit=params.get("limit").map(|v|v.as_u64().ok_or("Invalid record limit")).transpose()?.unwrap_or(100);
+    if limit==0 || limit>100 {return Err("Record limit must be 1 to 100".into());}
+    let limit=limit as usize;
     let lock = state.store.lock().map_err(error)?;
     let doc = &lock.as_ref().ok_or("Data unavailable")?.doc;
     let matches = |item: &Value| {
-        item["path"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains(&search)
+        format!("{}\n{}\n{}",item["path"].as_str().unwrap_or(""),item["notes"].as_str().unwrap_or(""),
+            if suggestions {item["reason"].as_str().unwrap_or("")}else{""}).to_lowercase().contains(&search)
             && (status == "all" || item["status"] == status)
     };
     let mut total = 0usize;
     let mut entries = Vec::new();
-    let mut visit = |item: &Value| {
+    let mut visit = |item: &Value, record_id: &str| {
         if matches(item) {
-            if total >= page * 100 && entries.len() < 100 {
-                entries.push(project_record(item, 16 * 1024));
+            if total >= page * limit && entries.len() < limit {
+                let mut entry=project_record(item,16*1024);
+                entry["recordId"]=json!(if suggestions {record_id.to_string()} else {format!("sha256:{}",crate::store::hash(record_id.as_bytes()))});
+                entries.push(entry);
             }
             total += 1;
         }
@@ -682,25 +696,92 @@ fn list_records(state: &AppState, params: &Value, suggestions: bool) -> Result<V
     if suggestions {
         if let Some(items) = doc["suggestions"].as_array() {
             for item in items {
-                visit(item);
+                visit(item,item["id"].as_str().or_else(||item["path"].as_str()).unwrap_or(""));
             }
         }
     } else if let Some(items) = doc["decisions"].as_object() {
-        for item in items.values() {
-            visit(item);
+        let mut ordered:Vec<_>=items.iter().collect();
+        ordered.sort_by(|(left_key,left),(right_key,right)|left["path"].as_str().unwrap_or("").to_lowercase()
+            .cmp(&right["path"].as_str().unwrap_or("").to_lowercase()).then(left_key.cmp(right_key)));
+        for (key,item) in ordered {
+            visit(item,key);
         }
     }
-    Ok(json!({"revision":doc["revision"],"total":total,"entries":entries}))
+    Ok(json!({"revision":doc["revision"],"total":total,"page":page,"limit":limit,"entries":entries}))
+}
+
+fn read_review_text(state:&AppState,params:&Value)->Result<Value,String> {
+    let collection=text(params,"collection",None)?;
+    let record_id=text(params,"recordId",None)?;
+    let field=text(params,"field",None)?;
+    let offset=params.get("offset").map(|v|v.as_u64().ok_or("offset must be a nonnegative UTF-8 byte offset")).transpose()?.unwrap_or(0);
+    let limit=params.get("limit").map(|v|v.as_u64().ok_or("limit must be a positive byte count")).transpose()?.unwrap_or(16*1024);
+    if limit<4 || limit>16*1024 {return Err("Text chunks must contain 4 to 16384 bytes".into());}
+    let lock=state.store.lock().map_err(error)?;
+    let doc=&lock.as_ref().ok_or("Data unavailable")?.doc;
+    let revision=doc["revision"].as_u64().ok_or("Invalid journal revision")?;
+    if params.get("expectedRevision").is_some_and(|v|v.as_u64()!=Some(revision)) {return Err("The journal changed. Restart this text read from offset zero.".into());}
+    if offset>0 && (params.get("expectedRevision").is_none() || params.get("expectedTextSha256").is_none()) {
+        return Err("Continuation requires the revision and text SHA-256 from the first chunk".into());
+    }
+    let item=match collection.as_str() {
+        "decisions"=>if let Some(digest)=record_id.strip_prefix("sha256:") {
+            doc["decisions"].as_object().and_then(|items|items.iter().find(|(key,_)|crate::store::hash(key.as_bytes())==digest).map(|(_,item)|item))
+        }else{doc["decisions"].get(&record_id)},
+        "suggestions"=>doc["suggestions"].as_array().and_then(|items|items.iter().rev().find(|item|item["id"].as_str().or_else(||item["path"].as_str())==Some(record_id.as_str()))),
+        "history"=>doc["history"].as_array().and_then(|items|items.iter().rev().find(|item|item["id"]==record_id)),
+        _=>return Err("Unknown review-text collection".into()),
+    }.ok_or("Review text record was not found")?;
+    let value=match field.as_str() {
+        "notes"=>&item["notes"],"reason"=>&item["reason"],"path"=>&item["path"],
+        "before.notes" if collection=="history"=>&item["before"]["notes"],
+        "after.notes" if collection=="history"=>&item["after"]["notes"],
+        "provenance.reason"=>&item["provenance"]["reason"],
+        _=>return Err("Unsupported review text field".into()),
+    };
+    let full=if value.is_null(){""}else{value.as_str().ok_or("The selected review field is not text")?};
+    let digest=crate::store::hash(full.as_bytes());
+    if params.get("expectedTextSha256").is_some_and(|v|v.as_str()!=Some(digest.as_str())) {return Err("The text changed. Restart this read from offset zero.".into());}
+    let offset=usize::try_from(offset).map_err(|_|"Text offset is too large")?;
+    if offset>full.len() || !full.is_char_boundary(offset) {return Err("Offset is outside this text or splits a UTF-8 character".into());}
+    let (chunk,cut)=limited_text(&full[offset..],limit as usize);
+    let next=offset+chunk.len();
+    Ok(json!({"revision":revision,"collection":collection,"recordId":record_id,"field":field,"text":chunk,
+        "offset":offset,"nextOffset":if cut{Some(next)}else{None},"totalBytes":full.len(),"textSha256":digest,"complete":!cut}))
+}
+
+fn agent_control_params(params: &Value) -> Result<(Value, MutationOrigin), String> {
+    let origin=MutationOrigin::Agent{basis:text(params,"basis",None)?,reason:text(params,"reason",None)?};
+    let mut request=params.clone();
+    if let Some(fields)=request.as_object_mut(){ fields.remove("basis"); fields.remove("reason"); }
+    Ok((request,origin))
+}
+
+fn copy_snapshot_for_rpc(state:&AppState)->Result<Value,String> {
+    let mut snapshot=crate::copy_control::snapshot(state)?;
+    for field in ["migrateNow","lastMoment"] {
+        if let Some(items)=snapshot[field].as_array_mut() {
+            for item in items {
+                if let Some(path)=item["path"].as_str().map(String::from) {
+                    let (preview,truncated)=limited_text(&path,4096);
+                    item["path"]=json!(preview);item["pathTruncated"]=json!(truncated);item["pathBytes"]=json!(path.len());
+                    if let Ok((_,_,key))=filesystem::identify(&path,&state.volumes) {item["recordId"]=json!(format!("sha256:{}",crate::store::hash(key.as_bytes())));}
+                }
+            }
+        }
+    }
+    snapshot["projection"]=json!({"queueEntryPathLimitBytes":4096,"completePathTool":"read_review_text","collection":"decisions","field":"path","storedOriginalPreserved":true});
+    Ok(snapshot)
 }
 
 fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, String> {
-    healthy(state)?;
+    if !matches!(method,"get_recovery_state"|"recover_review"|"get_ui_state"|"control_ui") { healthy(state)?; }
     if !params.is_null() && !params.is_object() {
         return Err("RPC params must be an object".into());
     }
     if matches!(
         method,
-        "mutate" | "scan" | "audit_control" | "audit_read_notifications"
+        "mutate" | "scan" | "audit_control" | "audit_read_notifications" | "control_copy_queue" | "control_ui" | "recover_review"
     ) {
         let expected=params["expectedInstanceId"].as_str().ok_or("Writes require expectedInstanceId from the current review state; reconnect before continuing")?;
         let current = state.gateway.lock().map_err(error)?;
@@ -709,6 +790,12 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         }
     }
     match method {
+        "get_recovery_state"=>crate::recovery_control::snapshot(state),
+        "recover_review"=>{let(request,origin)=agent_control_params(params)?;crate::recovery_control::control(state,&request,origin)},
+        "copy_queue_snapshot"=>copy_snapshot_for_rpc(state),
+        "control_copy_queue"=>{let(request,origin)=agent_control_params(params)?;crate::copy_control::control(state,&request,origin)},
+        "get_ui_state"=>crate::ui_control::status(state),
+        "control_ui"=>{let(request,origin)=agent_control_params(params)?;crate::ui_control::request(state,&request,origin)},
         "get_state"=>state_summary(state),
         "get_review_view"=>review_view_summary(state),
         "list_decisions"=>list_records(state,params,false),
@@ -732,6 +819,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         },
         "get_status"=>status_service(state),
         "get_assisted_review"=>crate::assistance::snapshot(state,&crate::document(state)?),
+        "read_review_text"=>read_review_text(state,params),
         "audit_status"=>crate::audit_status_service(state),
         "audit_control"=>crate::audit_control_service(state,&text(params,"action",None)?,&text(params,"scope",Some("all"))?,params.get("path").and_then(Value::as_str)),
         "audit_notifications"=>{
@@ -779,6 +867,85 @@ mod tests {
         }
         dispatch(state, method, &params).unwrap()
     }
+    #[test]
+    fn saved_note_search_and_utf8_continuation_preserve_complete_text_and_revision_fences() {
+        let state=Arc::new(crate::tests::fixture());
+        let path=format!("{}\\Work",state.volumes[0].root);
+        let notes=format!("Search Needle\n{}","猫".repeat(10_000));
+        crate::run_mutation(&state,document(&state).unwrap()["revision"].as_u64().unwrap(),"text-chunk-note".into(),json!({"type":"note","path":path,"notes":notes})).unwrap();
+        let found=call(&state,"list_decisions",json!({"search":"needle"}));
+        assert_eq!(found["total"],1);
+        let id=found["entries"][0]["recordId"].clone();
+        let mut params=json!({"collection":"decisions","recordId":id,"field":"notes","limit":16384});
+        let first=call(&state,"read_review_text",params.clone());
+        assert_eq!(first["complete"],false);
+        let mut reconstructed=first["text"].as_str().unwrap().to_string();
+        let mut next=first["nextOffset"].clone();
+        params["expectedRevision"]=first["revision"].clone();
+        params["expectedTextSha256"]=first["textSha256"].clone();
+        while !next.is_null() {
+            params["offset"]=next;
+            let part=call(&state,"read_review_text",params.clone());
+            reconstructed.push_str(part["text"].as_str().unwrap());
+            next=part["nextOffset"].clone();
+        }
+        assert_eq!(reconstructed,notes);
+        params["offset"]=json!(15); // inside the first three-byte character after the ASCII prefix
+        assert!(dispatch(&state,"read_review_text",&params).is_err());
+        params["offset"]=first["nextOffset"].clone();
+        crate::run_mutation(&state,document(&state).unwrap()["revision"].as_u64().unwrap(),"text-chunk-view-change".into(),json!({"type":"view","patch":{"search":"newer"}})).unwrap();
+        assert!(dispatch(&state,"read_review_text",&params).unwrap_err().contains("journal changed"));
+    }
+
+    #[test]
+    fn degraded_owner_gateway_allows_fenced_recovery_and_blocks_normal_mutations() {
+        let state=Arc::new(crate::tests::fixture());
+        let backup=document(&state).unwrap();
+        fs::write(state.data_path.with_extension("json.bak"),serde_json::to_vec(&backup).unwrap()).unwrap();
+        drop(state.store.lock().unwrap().take());
+        fs::write(&state.data_path,b"damaged fixture").unwrap();
+        *state.store.lock().unwrap()=Some(crate::store::Store::open(state.data_path.clone(),&state.volumes[0].root).unwrap());
+        let (handle,public)=start(&state,&state.runtime).unwrap();
+        *state.gateway.lock().unwrap()=public;
+        *state.gateway_server.lock().unwrap()=Some(handle);
+        let descriptor:Value=serde_json::from_slice(&fs::read(state.runtime.join("mcp-gateway.json")).unwrap()).unwrap();
+        let address=descriptor["endpoint"].as_str().unwrap().strip_prefix("http://").unwrap().strip_suffix("/rpc").unwrap().parse().unwrap();
+        let token=descriptor["token"].as_str().unwrap();let instance=descriptor["instanceId"].as_str().unwrap();
+        let (_,read)=exchange(address,r#"{"method":"get_recovery_state","params":{}}"#,token,instance,"");
+        assert_eq!(read["ok"],true);assert_eq!(read["result"]["available"],true);
+        assert!(dispatch(&state,"mutate",&json!({})).is_err());
+        let req=json!({"method":"recover_review","params":{"expectedInstanceId":instance,"operationId":"http-recover-fixture","expectedOriginalSha256":read["result"]["originalSha256"],"expectedBackupSha256":read["result"]["backupSha256"],"confirmed":true,"basis":"user_instruction","reason":"Explicit synthetic recovery"}}).to_string();
+        assert_eq!(exchange(address,&req,"wrong",instance,"").0,401);
+        let(_,done)=exchange(address,&req,token,instance,"");assert_eq!(done["ok"],true,"{done}");
+        let(_,again)=exchange(address,&req,token,instance,"");assert_eq!(again["result"]["replayed"],true);
+        assert_eq!(call(&state,"get_state",json!({}))["problem"],Value::Null);
+    }
+
+    #[test]
+    fn authenticated_copy_control_routes_share_fences_and_exact_retry_receipts() {
+        let state=Arc::new(crate::tests::fixture());
+        let source=std::path::Path::new(&state.volumes[0].root).join("Work").join("keep.txt");
+        fs::write(&source,b"synthetic original").unwrap();
+        fs::create_dir_all(state.data_path.parent().unwrap().join("destination")).unwrap();
+        crate::run_mutation(&state,document(&state).unwrap()["revision"].as_u64().unwrap(),"http-copy-mark".into(),json!({"type":"classify","path":source.to_string_lossy(),"status":"migrate-now"})).unwrap();
+        let (_handle,public)=start(&state,&state.runtime).unwrap();*state.gateway.lock().unwrap()=public;
+        let descriptor:Value=serde_json::from_slice(&fs::read(state.runtime.join("mcp-gateway.json")).unwrap()).unwrap();
+        let address=descriptor["endpoint"].as_str().unwrap().strip_prefix("http://").unwrap().strip_suffix("/rpc").unwrap().parse().unwrap();
+        let token=descriptor["token"].as_str().unwrap();let instance=descriptor["instanceId"].as_str().unwrap();
+        let q=call(&state,"copy_queue_snapshot",json!({}));
+        let mut request=json!({"expectedInstanceId":instance,"expectedRevision":q["revision"],"operationId":"http-copy-start-fixture","expectedQueueSignature":q["queueSignature"],"expectedSourceVolumeSignature":q["sourceVolumeSignature"],"expectedDestinationId":q["destination"]["id"],"confirmed":true,"action":"start","mode":"all","scope":null,"basis":"user_instruction","reason":"Explicit synthetic copy"});
+        request["confirmed"]=json!(false);assert!(dispatch(&state,"control_copy_queue",&request).is_err());request["confirmed"]=json!(true);
+        let body=json!({"method":"control_copy_queue","params":request}).to_string();
+        assert_eq!(exchange(address,&body,"wrong",instance,"").0,401);
+        let(_,started)=exchange(address,&body,token,instance,"");assert_eq!(started["ok"],true,"{started}");
+        let(_,again)=exchange(address,&body,token,instance,"");assert_eq!(again["result"]["replayed"],true,"{again}");
+        assert_eq!(again["result"]["receipt"]["jobId"],started["result"]["receipt"]["jobId"]);
+        let deadline=std::time::Instant::now()+Duration::from_secs(10);
+        while state.copy_queue.status().unwrap()["running"]==true {assert!(std::time::Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
+        assert_eq!(fs::read(&source).unwrap(),b"synthetic original");
+        assert_eq!(fs::read(state.data_path.parent().unwrap().join("destination\\Work\\keep.txt")).unwrap(),b"synthetic original");
+    }
+
     #[test]
     fn agent_suggestions_and_user_directed_changes_keep_provenance_and_idempotence() {
         let state = Arc::new(crate::tests::fixture());

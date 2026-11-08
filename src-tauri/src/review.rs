@@ -14,6 +14,7 @@ const SURFACE_MAX_AGE_MS: i64 = 15_000;
 #[derive(Default)]
 pub(crate) struct ReviewBridge {
     inner: Mutex<ReviewState>,
+    pub(crate) ui: crate::ui_control::UiControl,
 }
 
 #[derive(Default)]

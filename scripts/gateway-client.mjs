@@ -31,7 +31,7 @@ export class GatewayClient {
     } catch {
       throw new Error('PC Migration Helper is not ready. Open the updated native app and check its MCP status.');
     }
-    if (['mutate', 'scan', 'audit_control', 'audit_read_notifications'].includes(method)) {
+    if (['mutate', 'scan', 'audit_control', 'audit_read_notifications', 'control_copy_queue', 'control_ui', 'recover_review'].includes(method)) {
       if (params.expectedInstanceId !== descriptor.instanceId) {
         throw new Error('The app session changed or was not supplied. Read get_review_state again and review the intended edit before using its new gateway.instanceId. No write was sent.');
       }

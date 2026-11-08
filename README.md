@@ -98,7 +98,7 @@ Drag sidebar or folder-column dividers to resize them, or focus a divider and us
 
 Register the bundled stdio server with your MCP client and leave the native app open. An agent can read folder metadata, saved decisions, audit progress, and the currently rendered review columns. It can navigate or reveal a path without clearing your filter. **Follow AI’s movement** is a window preference that reveals paths as the agent touches them when the review is idle.
 
-Agent suggestions are stored separately. User-directed changes retain their provenance and use the current app session and journal revision. Starting a copy is a desktop action. See [MCP setup and tool usage](docs/MCP.md).
+Agent suggestions are stored separately. User-directed changes retain their provenance and use the current app session and journal revision. The 29-tool bridge also exposes guarded copying, damaged-journal recovery, window controls and retained draft inspection. Copying requires explicit confirmation and current queue/volume fences; an exact retry returns the original receipt without starting another job. See [MCP setup and tool usage](docs/MCP.md) and the [desktop/HTTP/MCP action map](docs/ACTION-PARITY.md).
 
 ## Data and coverage
 

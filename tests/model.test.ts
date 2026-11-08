@@ -2,10 +2,81 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { MutationQueue, parseDocument, parentPath, normalizeReviewPath, parseGateway, previewBranch, closePreviewBranch } from '../src/model.ts';
 import type { Document, Operation } from '../src/model.ts';
+import { inspectPending, pendingFingerprint, pendingJSON, pendingMetadata, textChunk, textHash } from '../src/pending-inspection.ts';
+import type { PendingSnapshot } from '../src/pending-inspection.ts';
 
 function doc(revision = 1): Document {
   return parseDocument({ schemaVersion: 1, revision, history: [], decisions: {}, futureField: { preserved: true }, view: { path: 'E:\\', selectedPath: null, search: '', filter: 'all', page: 0, scrollTop: 0, recentPaths: [] } });
 }
+
+test('large pending queues retain all text while reports and UTF-8 inspection stay bounded', async () => {
+  const requests = Array.from({ length: 24 }, (_, index) => ({ id: 'retained-' + index, operation: {
+    type: 'note', path: 'E:\\synthetic\\' + index, notes: '🙂é漢字'.repeat(10_000), unknownField: { preserved: true },
+  } }));
+  const snapshot: PendingSnapshot = { writer: { revision: 7, retainedRequests: requests }, drafts: {}, requests };
+  assert.ok(new TextEncoder().encode(pendingJSON(snapshot)).length > 2 * 1024 * 1024);
+  assert.ok(JSON.stringify(pendingMetadata(requests)).length < 10_000);
+  const fingerprint = await pendingFingerprint(snapshot);
+  const listed = await inspectPending(() => snapshot, { action: 'listPending', offset: 16, limit: 8, expectedPendingFingerprint: fingerprint });
+  assert.equal(listed.total, 24);
+  assert.equal(listed.nextOffset, null);
+  assert.ok(JSON.stringify(listed).length < 64 * 1024);
+  let offset = 0, text = '', hash = '';
+  do {
+    const chunk = await inspectPending(() => snapshot, { action: 'readPendingText', operationId: requests[0]!.id, offset, limit: 16_384, expectedPendingFingerprint: fingerprint });
+    assert.equal(chunk.pendingFingerprint, fingerprint);
+    assert.ok(JSON.stringify(chunk).length < 64 * 1024);
+    if (hash) assert.equal(chunk.sha256, hash);
+    hash = String(chunk.sha256); text += String(chunk.text);
+    offset = chunk.nextOffset === null ? -1 : Number(chunk.nextOffset);
+  } while (offset >= 0);
+  assert.deepEqual(JSON.parse(text), requests[0]);
+  assert.equal(hash, await textHash(pendingJSON(requests[0])));
+  assert.equal(requests.length, 24);
+});
+
+test('pending inspection rejects changed fingerprints and mid-character UTF-8 offsets', async () => {
+  const requests = [{ id: 'first', operation: { type: 'note', notes: 'Keep 🙂é' } }];
+  const before: PendingSnapshot = { writer: { retainedRequests: requests }, drafts: {}, requests };
+  const after: PendingSnapshot = { writer: { retainedRequests: [] }, drafts: {}, requests: [] };
+  const fingerprint = await pendingFingerprint(before);
+  let reads = 0;
+  await assert.rejects(inspectPending(() => reads++ === 0 ? before : after, { action: 'listPending', offset: 0, limit: 1, expectedPendingFingerprint: fingerprint }), /changed during inspection/);
+  await assert.rejects(inspectPending(() => after, { action: 'listPending', offset: 0, limit: 1, expectedPendingFingerprint: fingerprint }), /changed/);
+  assert.throws(() => textChunk('A🙂éB', 2, 4), /UTF-8 boundary/);
+  assert.deepEqual(textChunk('A🙂éB', 1, 4), { text: '🙂', totalBytes: 8, nextOffset: 5 });
+});
+
+test('native copy revisions are adopted before later retained edits drain', async () => {
+  const revisions: number[] = [];
+  const queue = new MutationQueue(doc(4), async (revision, id) => {
+    revisions.push(revision);
+    return { ...doc(revision + 1), recentOperations: [id] };
+  }, () => undefined);
+  queue.holdForExternal();
+  const pending = queue.request({ type: 'note', path: 'E:\\work', notes: 'Typed while copy control was saving its receipt' });
+  const retainedId = queue.retainedRequests[0]?.id;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(revisions, []);
+  assert.equal(queue.acceptExternal(doc(6)), false);
+  queue.finishExternal(doc(6));
+  await pending;
+  assert.deepEqual(revisions, [6]);
+  assert.ok(retainedId);
+  assert.equal(queue.revision, 7);
+});
+
+test('uncertain native revision reconciliation retains queued edits without replay', async () => {
+  const revisions: number[] = [];
+  const queue = new MutationQueue(doc(4), async revision => { revisions.push(revision); return doc(revision + 1); }, () => undefined);
+  queue.holdForExternal();
+  void queue.request({ type: 'classify', path: 'E:\\work', status: 'manual-pending' });
+  queue.failExternal('latest journal cannot be read');
+  await assert.rejects(queue.flush(), /needs reconciliation/);
+  assert.equal(queue.retainedRequests.length, 1);
+  assert.deepEqual(revisions, []);
+  assert.throws(() => queue.holdForExternal(), /Finish pending/);
+});
 test('serial native saves use the last acknowledged revision during rapid edits', async () => {
   const seen: Array<{ revision: number; operation: Operation }> = [];
   let native = doc();

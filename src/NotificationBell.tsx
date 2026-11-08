@@ -8,8 +8,9 @@ import type { AuditNotification, NotificationFeed } from './audit-model';
 import { notificationLocation } from './model';
 import type { Volume } from './model';
 import { OverflowIndicators } from './OverflowIndicators';
+import type { UiControlRef } from './UIBridge';
 
-export function NotificationBell({ enabled, unread: nativeUnread, volumes, onNavigate, onReadStateChanged, onError }: { enabled: boolean; unread: number; volumes: Volume[]; onNavigate: (path: string, selection?: string | null) => void; onReadStateChanged: () => Promise<void>; onError: (cause: unknown) => void }) {
+export function NotificationBell({ enabled, unread: nativeUnread, volumes, onNavigate, onReadStateChanged, onError, controlRef }: { enabled: boolean; unread: number; volumes: Volume[]; onNavigate: (path: string, selection?: string | null) => void; onReadStateChanged: () => Promise<void>; onError: (cause: unknown) => void; controlRef: UiControlRef }) {
   const [unread, setUnread] = useState(nativeUnread);
   const [preview, setPreview] = useState(false);
   const [full, setFull] = useState(false);
@@ -149,6 +150,21 @@ export function NotificationBell({ enabled, unread: nativeUnread, volumes, onNav
     requestAnimationFrame(() => { if (!mounted.current) return; const focus = window.document.activeElement; if (focus instanceof Node && !previewRef.current?.contains(focus) && !triggerRef.current?.contains(focus)) hidePreview(); });
   }
   const notificationItems = (items: AuditNotification[], compact = false) => items.map(item => <NotificationItem key={item.id} item={item} compact={compact} read={Boolean(item.readAt || readReceipts.has(item.id))} navigable={Boolean(notificationLocation(item, volumes))} onActivate={() => activate(item)}/>);
+  controlRef.current = {
+    read: () => ({ mode: full ? 'full' : preview ? 'preview' : 'closed', offset, unread, loading, marking, problem, newAvailable,
+      feed: full ? fullFeed : preview ? previewFeed : null }),
+    execute: async command => {
+      if (command.action !== 'setNotifications') throw new Error('Unsupported notifications presentation action');
+      if (command.mode === 'closed') { hidePreview(); if (fullOpen.current) closeFull(); }
+      else if (command.mode === 'preview') { if (fullOpen.current) closeFull(); showPreview(); await refreshPreview(); }
+      else if (command.mode === 'full') {
+        if (!fullOpen.current) openFull();
+        const target = typeof command.offset === 'number' ? command.offset : 0;
+        setOffset(target); await loadPage(target);
+      } else throw new Error('Unknown notifications mode');
+    },
+  };
+  useEffect(() => () => { controlRef.current = null; }, [controlRef]);
   return <>
     <button ref={triggerRef} className="notification-bell" aria-label={`Notifications, ${unread.toLocaleString()} unread`} aria-haspopup="dialog" aria-expanded={preview || full} aria-controls={full ? 'notifications-dialog' : preview ? 'notifications-preview' : undefined} onPointerEnter={event => { if (event.pointerType !== 'touch') showPreview(); }} onPointerLeave={leave} onFocus={() => { if (suppressFocusPreview.current) { suppressFocusPreview.current = false; return; } showPreview(); }} onBlur={event => { suppressFocusPreview.current = false; blur(event); }} onClick={openFull} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); showPreview(true); } }}><Bell size={18}/>{unread > 0 && <span className="notification-count" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>}</button>
     {preview && !full && createPortal(<div id="notifications-preview" ref={previewRef} role="dialog" aria-label="Recent notifications preview" data-notifications-preview="true" className="notifications-preview" style={position} onPointerEnter={clearLeave} onPointerLeave={leave} onFocus={clearLeave} onBlur={blur}><div className="notifications-preview-heading"><strong>Recent notifications</strong><span>{unread.toLocaleString()} unread</span></div><div className="notifications-list-frame"><div ref={previewListRef} className="notifications-preview-list">{previewFeed?.items.length ? notificationItems(previewFeed.items, true) : <p className="notifications-empty">{problem ?? (previewFeed ? 'No notifications recorded yet.' : 'Reading notifications…')}</p>}</div><OverflowIndicators targetRef={previewListRef} axis="vertical" refreshKey={previewFeed}/></div><div className="notifications-preview-footer"><button onClick={() => void refreshPreview()} title="Refresh the frozen preview list"><RefreshCw size={13}/>{newAvailable ? 'New updates' : 'Refresh'}</button><button onClick={openFull}>View all<ChevronRight size={14}/></button></div></div>, window.document.body)}
