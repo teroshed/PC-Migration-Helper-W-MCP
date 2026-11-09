@@ -18,7 +18,8 @@ import type {
   AppStatus, Boot, Decision, Details, Document, Effective, Entry, Listing,
   GroupTarget, Operation, QueueState, ScanStatus, Status, ViewState, Volume, GatewayStatus, PreviewColumn, ReviewLayout,
 } from './model';
-import { DECISION_CHOICES, DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
+import { DECISION_CHOICES, DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, MarkSaveBadge, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
+import type { MarkSaveFeedback } from './classifications';
 import { DirectoryColumn, PreviewFolderColumn, RowClassificationMenu, localRowSuggestion } from './FolderColumns';
 import type { RowMenuTarget, RowSuggestion } from './FolderColumns';
 import { OverflowIndicators } from './OverflowIndicators';
@@ -58,6 +59,8 @@ import type { SavedGroup, SelectionSets } from './review-selection';
 const EMPTY_STATUS: AppStatus = { scan: { pending: 0 }, gaps: [], decisionCount: 0 };
 const FOLLOW_PREFERENCE = 'migration-master.follow-ai';
 const SELECTION_PREFERENCE = 'migration-master.group-selection-v1';
+const MARK_FEEDBACK_MS = 1500;
+type TrackedMark = MarkSaveFeedback & { expiresAt?: number; decisionKey?: string; decidedAt?: string };
 
 function readSavedSelection(): SelectionSets {
   try { return loadSelection(localStorage.getItem(SELECTION_PREFERENCE)); }
@@ -97,12 +100,21 @@ function parseAppStatus(value: unknown): AppStatus {
   const s = record(v.scan);
   const number = (v: unknown): number => typeof v === 'number' ? v : 0;
   const scan: ScanStatus = { status: typeof s.status === 'string' ? s.status : undefined, pending: number(s.pending), processed: number(s.processed), files: number(s.files), bytes: number(s.bytes), skippedGenerated: number(s.skippedGenerated), currentPath: typeof s.currentPath === 'string' ? s.currentPath : undefined, error: typeof s.error === 'string' ? s.error : undefined };
+  if (typeof s.markedPending === 'number') scan.markedPending = s.markedPending;
+  if (typeof s.markedActive === 'number') scan.markedActive = s.markedActive;
+  if (Array.isArray(s.roots)) scan.roots = s.roots.filter((path): path is string => typeof path === 'string');
   const gaps = Array.isArray(v.gaps) ? v.gaps.map(value => {
     const g = record(value);
     return { path: String(g.path ?? ''), problem: String(g.problem ?? ''), observedAt: String(g.observedAt ?? '') };
   }) : [];
   return { scan, gaps, decisionCount: number(v.decisionCount),
     mirrorEvidenceStamp: typeof v.mirrorEvidenceStamp === 'string' ? v.mirrorEvidenceStamp : undefined };
+}
+function assistanceScope(document: Document | null): string | undefined {
+  const assistance = document?.assistance;
+  if (typeof assistance !== 'object' || assistance === null || Array.isArray(assistance)) return;
+  const scope = record(assistance).scope;
+  return typeof scope === 'string' && scope ? scope : undefined;
 }
 export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
@@ -132,6 +144,7 @@ export default function App() {
   const [lifecycleSnapshot, setLifecycleSnapshot] = useState<Record<string, unknown> | null>(null);
   const [gatewayDetailsOpen, setGatewayDetailsOpen] = useState(false);
   const [showAssistance, setShowAssistance] = useState(false);
+  const [startingScanAssistance, setStartingScanAssistance] = useState(false);
   const [assistanceFooter, setAssistanceFooter] = useState<HTMLDivElement | null>(null);
   const [showMirror, setShowMirror] = useState(false);
   const [mirrorReviewPath, setMirrorReviewPath] = useState<string | null>(null);
@@ -149,6 +162,10 @@ export default function App() {
   const [knownSearch, setKnownSearch] = useState(false);
   const [knownResults, setKnownResults] = useState<string[] | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [markFeedback, setMarkFeedback] = useState<ReadonlyMap<string, TrackedMark>>(() => new Map());
+  const [markAnnouncement, setMarkAnnouncement] = useState('');
+  const marksInFlight = useRef(new Set<string>());
+  const latestMarkRequest = useRef(0);
   const [rowMenu, setRowMenu] = useState<RowMenuTarget | null>(null);
   const [selectedEntryInfo, setSelectedEntryInfo] = useState<Entry | null>(null);
   const [followAi, setFollowAi] = useState(readFollowPreference);
@@ -258,6 +275,27 @@ export default function App() {
   const folderRefreshToken = JSON.stringify([folderReadScope, folderSourceScope, auditDataTick, appStatus.scan.status]);
   const reviewActivity = useReviewActivity(Boolean(boot), receiveReviewActivity);
   useReviewSurface(columnStripRef, view && document ? { view, appliedRevision: document.revision, followAi, following: localFollowView.current, knownSearch, loading } : null);
+
+  useEffect(() => {
+    let nextExpiry = Infinity;
+    for (const mark of markFeedback.values()) nextExpiry = Math.min(nextExpiry, mark.expiresAt ?? Infinity);
+    if (!Number.isFinite(nextExpiry)) return;
+    const expiry = setTimeout(() => {
+      const now = Date.now();
+      setMarkFeedback(current => new Map([...current].filter(([, mark]) => (mark.expiresAt ?? Infinity) > now)));
+    }, Math.max(0, nextExpiry - Date.now()));
+    return () => clearTimeout(expiry);
+  }, [markFeedback]);
+
+  function feedbackForMark(path: string): MarkSaveFeedback | undefined {
+    const feedback = markFeedback.get(reviewPathKey(path));
+    if (feedback?.phase === 'saving' && saveState.error) return { status: feedback.status, phase: 'waiting' };
+    if (feedback?.phase === 'saved' && feedback.decisionKey) {
+      const saved = document?.decisions[feedback.decisionKey];
+      if (saved?.status !== feedback.status || saved.decidedAt !== feedback.decidedAt) return;
+    }
+    return feedback;
+  }
 
   function canAdoptReview(): boolean {
     const hasBuffers = noteBuffer.current.size > 0 || Object.keys(viewBuffer.current).length > 0 || timer.current !== null;
@@ -516,6 +554,24 @@ export default function App() {
   function changeAssistance(open: boolean): void {
     if (open && window.innerHeight <= 740 && toolbar === 'expanded') setToolbar('compact');
     setShowAssistance(open);
+  }
+  async function startAssistanceFromInventory(scope: string): Promise<void> {
+    if (readOnly || startingScanAssistance) return;
+    setStartingScanAssistance(true);
+    try {
+      const existingScope = assistanceScope(documentRef.current);
+      if (!existingScope || reviewPathKey(existingScope) !== reviewPathKey(scope)) {
+        flushBuffers();
+        await edit({ type: 'assist', action: 'scope', path: scope });
+      }
+      setShowGaps(false);
+      changeAssistance(true);
+      requestAnimationFrame(() => {
+        const dom = window.document;
+        if (dom.activeElement === dom.body) dom.querySelector<HTMLButtonElement>('.assistance-trigger')?.focus();
+      });
+    } catch (cause) { report(cause); }
+    finally { setStartingScanAssistance(false); }
   }
   function focusSearch(): void {
     if (toolbar === 'expanded' || toolbar === 'search') searchRef.current?.focus();
@@ -1125,15 +1181,39 @@ export default function App() {
     await classifyPath(selectedPath, status);
   }
   async function classifyPath(path: string, status: Status): Promise<void> {
-    const contextPath = viewRef.current?.path;
+    const pathKey = reviewPathKey(path);
+    if (marksInFlight.current.has(pathKey)) return;
+    const startedFrom = viewRef.current;
+    const request = ++latestMarkRequest.current;
+    const name = baseName(path);
+    marksInFlight.current.add(pathKey);
+    setMarkFeedback(current => new Map(current).set(pathKey, { status, phase: 'saving' }));
+    setMarkAnnouncement(`Saving ${decisionChoiceLabel(status)} for ${name}.`);
     flushBuffers();
     try {
-      await edit({ type: 'classify', path, status });
-      if (viewRef.current?.path === contextPath) updateView({ selectedPath: path }, true);
+      const saved = await edit({ type: 'classify', path, status });
+      const volume = rootForSelection(path, boot?.volumes ?? []);
+      const decisionKey = volume ? selectionKey({
+        volumeId: volume.id, relativePath: pathKey.slice(reviewPathKey(volume.root).length).replace(/^\\/, ''),
+      }) : undefined;
+      const decidedAt = decisionKey ? saved.decisions[decisionKey]?.decidedAt : undefined;
+      setMarkFeedback(current => new Map(current).set(pathKey, {
+        status, phase: 'saved', decisionKey, decidedAt, expiresAt: Date.now() + MARK_FEEDBACK_MS,
+      }));
+      const currentView = viewRef.current;
+      if (request === latestMarkRequest.current && currentView?.path === startedFrom?.path &&
+        currentView?.selectedPath === startedFrom?.selectedPath) updateView({ selectedPath: path }, true);
       setDataTick(value => value + 1);
-      setMessage(`${LABELS[status]} saved for ${baseName(path)}.`);
+      setMessage(`${LABELS[status]} saved for ${name}.`);
       void refreshStatus().catch(report);
-    } catch (cause) { report(cause); }
+    } catch (cause) {
+      setMarkFeedback(current => new Map(current).set(pathKey, {
+        status, phase: 'rejected', expiresAt: Date.now() + MARK_FEEDBACK_MS,
+      }));
+      report(cause);
+    } finally {
+      marksInFlight.current.delete(pathKey);
+    }
   }
   async function undo(): Promise<void> {
     flushBuffers();
@@ -1223,7 +1303,8 @@ export default function App() {
         review: groupReview ? { mode: groupReview.mode, revision: groupReview.revision, operationId: groupReview.operationId,
           groupId: groupReview.mode === 'undo' ? groupReview.group.id : null, pending: groupBusy, outcomeUncertain: !groupBusy && groupAttempt !== null,
           problem: groupProblem } : null },
-      rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || Boolean(rowMenu.entry.problem) } : null,
+      rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || Boolean(rowMenu.entry.problem) ||
+        marksInFlight.current.has(reviewPathKey(rowMenu.entry.path)) } : null,
       gatewayDetailsOpen, knownFolders: { active: knownSearch, search: view?.search, results: knownResults },
       savedRecords: { search: savedSearch, filter: savedFilter, page: savedPage },
       writer: { ...queue.current?.state, revision: queue.current?.revision, retainedRequestCount: retainedMetadata.total,
@@ -1412,6 +1493,19 @@ export default function App() {
   const driveHome = rootForSelection(view.path, boot.volumes)?.root;
   const canUp = up !== null && driveHome !== undefined && reviewPathKey(view.path) !== reviewPathKey(driveHome);
   const scanRunning = appStatus.scan.status === 'running';
+  const scanRoots = appStatus.scan.roots ?? [];
+  const inScanRoot = (path: string, root: string): boolean => {
+    const key = reviewPathKey(path);
+    const rootKey = reviewPathKey(root);
+    return key === rootKey || key.startsWith(rootKey + '\\');
+  };
+  const savedInterviewScope = assistanceScope(document);
+  const continueScanAssistance = savedInterviewScope !== undefined &&
+    scanRoots.some(root => inScanRoot(savedInterviewScope, root));
+  const inventoryScope = continueScanAssistance ? savedInterviewScope
+    : scanRoots.find(root => inScanRoot(view.path, root)) ?? scanRoots[0];
+  const offerScanAssistance = !readOnly && scanRunning && inventoryScope &&
+    ((appStatus.scan.markedPending ?? 0) > 0 || (appStatus.scan.markedActive ?? 0) > 0);
   const saveError = saveState.error;
   const revisionConflict = Boolean(saveError && /newer saved state|revision conflict|outside this app|stale save response/i.test(saveError));
   const saving = buffered || saveState.saving;
@@ -1422,6 +1516,8 @@ export default function App() {
   const reviewed = Math.max(0, knownInView - (listing?.attention ?? 0));
   const percent = knownInView ? Math.round(reviewed / knownInView * 100) : 0;
   const ActiveIcon = ICONS[effective.status];
+  const selectedMark = selectedPath ? feedbackForMark(selectedPath) : undefined;
+  const selectedMarkPending = selectedMark?.phase === 'saving' || selectedMark?.phase === 'waiting';
   const classificationUnavailable = readOnly || !selectedPath || detailsLoading || !details || details.exists === false;
   const manualContext = effective.status === 'manual-pending' ? 'Manual backup pending · confirm after copying'
     : effective.status === 'manual-confirmed' ? 'Your manual-backup confirmation · checksum verification separate' : null;
@@ -1519,6 +1615,7 @@ export default function App() {
     reviewActivity,
     revealPath: view.revealPath,
     revealVersion,
+    markFeedbackFor: feedbackForMark,
     suggestionFor: showAssistance ? (entry: Entry) => assistanceSuggestions.get(reviewPathKey(entry.path)) ?? localRowSuggestion(entry) : undefined,
     onSelect: selectEntry,
     onToggleSelect: toggleEntry,
@@ -1541,7 +1638,11 @@ export default function App() {
     onReviewFolder: (path: string): void => { setSelectedEntryInfo(null); updateView({ selectedPath: path }, true); },
     onReadPendingChange: (delta: number): void => { activeAuditReads.current = Math.max(0, activeAuditReads.current + delta); },
   };
-  const rowMenuDisabled = readOnly ? 'Recover the saved data before changing decisions.' : rowMenu?.entry.problem ? 'This path is unavailable. Its saved record is retained; review its notes from Saved records.' : null;
+  const menuMark = rowMenu ? feedbackForMark(rowMenu.entry.path) : undefined;
+  const rowMenuDisabled = readOnly ? 'Recover the saved data before changing decisions.'
+    : rowMenu?.entry.problem ? 'This path is unavailable. Its saved record is retained; review its notes from Saved records.'
+    : menuMark?.phase === 'waiting' ? 'This mark is waiting for saving to resume.'
+    : menuMark?.phase === 'saving' ? 'Saving this mark in the background.' : null;
 
   const layout = view.layout ?? {};
   const layoutStyle = {
@@ -1649,6 +1750,10 @@ export default function App() {
           readOnly={readOnly} onEdit={editAssistance} controlRef={assistanceControl}
           footerHost={assistanceFooter} inspectQuestion={inspectAssistanceQuestion} browser={assistanceBrowser}
           onResizeScanDetails={scanDetailsHeight => updateView({ scanDetailsHeight }, true)}
+          inventoryReview={offerScanAssistance && !continueScanAssistance ? {
+            scope: inventoryScope, pending: startingScanAssistance,
+            start: () => void startAssistanceFromInventory(inventoryScope),
+          } : undefined}
           deferMarked={document.inventoryDeferMarked !== false}
           onOpenMirror={path => { setMirrorReviewPath(path); setShowMirror(true); }}/>}
         <div className="browse-interaction-hint"><span>Click to preview · focus button or row menu to center</span><span>Ctrl+Space selects · Space marks</span></div>
@@ -1689,7 +1794,12 @@ export default function App() {
       <div className="details-controls">
         <div className="selected-title"><div className="selected-icon">{selectedEntry?.kind === 'file' ? <File size={26}/> : selectedEntry?.kind === 'link' ? <Link2 size={26}/> : <Folder size={26}/>}</div><div><h2 title={selectedPath ?? ''}>{selectedPath ? baseName(selectedPath) : 'Select a folder'}</h2><p title={selectedPath ?? ''}>{selectedPath}</p></div></div>
         <div className="review-location-row">{selectedPath === view.path ? <span>Reviewing this folder itself</span> : <button className="text-button" onClick={() => updateView({ selectedPath: null }, true)}><ArrowLeft size={13}/>Review this folder instead</button>}{detailsLoading && <LoaderCircle size={13} className="spin" aria-label="Reading decision"/>}</div>
-        <button className={`decision-picker-trigger status-${effective.status}`} aria-haspopup="dialog" aria-expanded={showDecisionPicker} disabled={classificationUnavailable} onClick={() => setShowDecisionPicker(true)}><ActiveIcon size={20}/><span><strong>{effective.manualEvidence === 'mirror-verified' ? reviewStatusLabel(effective) : LABELS[effective.status]}{effective.status === 'migrate-now' ? ' · pending' : ''}</strong><small>Change decision</small></span><ChevronRight size={17}/></button>
+        <button className={`decision-picker-trigger status-${effective.status}`} aria-haspopup="dialog" aria-expanded={showDecisionPicker}
+          disabled={classificationUnavailable} aria-disabled={selectedMarkPending || undefined}
+          onClick={() => { if (!selectedMarkPending) setShowDecisionPicker(true); }}>
+          <ActiveIcon size={20}/><span><strong>{effective.manualEvidence === 'mirror-verified' ? reviewStatusLabel(effective) : LABELS[effective.status]}{effective.status === 'migrate-now' ? ' · pending' : ''}</strong>
+            {selectedMark ? <MarkSaveBadge key={selectedMark.phase} feedback={selectedMark}/> : <small>Change decision</small>}</span><ChevronRight size={17}/>
+        </button>
         <button className={`context-summary ${details?.exists === false || effective.stale || incompleteRollup ? 'warning' : ''}`} onClick={() => setShowContext(true)} title={contextSummary}><Info size={14}/><span>{contextSummary}</span><ChevronRight size={13}/></button>
         <div className="notes-section"><label className="notes-label" htmlFor="decision-notes">Notes <span>autosaved</span></label><textarea id="decision-notes" disabled={readOnly || !selectedPath || detailsLoading} placeholder="Exclusions, destination, exports needed…" value={noteText} onChange={event => { if (!selectedPath) return; const text = event.target.value; setNotes(current => ({ ...current, [selectedPath]: text })); noteBuffer.current.set(selectedPath, text); scheduleFlush(); }} rows={2}/></div>
         <div className="detail-actions"><button onClick={() => setShowContext(true)} title={pathSuggestions.length ? `${pathSuggestions.length} assistant proposals; separate from your decisions` : 'Review context and child exceptions'}><ListFilter size={14}/><span>Context{effective.mixed ? ` · ${effective.mixed}` : pathSuggestions.length ? ` · ${pathSuggestions.length} proposals` : ''}</span></button><button onClick={() => setShowHistory(true)}><History size={14}/><span>History</span></button></div>
@@ -1702,10 +1812,21 @@ export default function App() {
       <div className="data-location"><Database size={14}/><span title={boot.dataPath}>migration_master_data.json<small>Native JSON · version {document.schemaVersion} · revision {document.revision}</small></span></div>
     </aside>
     </ReviewSidebar>
-    {rowMenu && <RowClassificationMenu key={rowMenu.id} target={rowMenu} disabledReason={rowMenuDisabled} onDismiss={dismissRowMenu}
+    {rowMenu && <RowClassificationMenu key={rowMenu.id} target={rowMenu} disabledReason={rowMenuDisabled} savedMark={menuMark?.phase === 'saved' ? menuMark.status : undefined} onDismiss={dismissRowMenu}
       onCenterFolder={rowMenu.entry.kind === 'folder' && !rowMenu.entry.problem ? () => centerFolder(rowMenu.entry.path) : undefined}
-      onChoose={status => { const target = rowMenu; setSelectedEntryInfo(target.entry); dismissRowMenu(true); void classifyPath(target.entry.path, status).then(() => { if (target.invoker && !target.invoker.isConnected) window.document.querySelector<HTMLButtonElement>('.decision-picker-trigger')?.focus(); }); }}/>}
+      onChoose={status => {
+        const target = rowMenu;
+        setSelectedEntryInfo(target.entry);
+        dismissRowMenu(true);
+        void classifyPath(target.entry.path, status).then(() => {
+          const dom = window.document;
+          if (target.invoker && !target.invoker.isConnected && dom.activeElement === dom.body) {
+            dom.querySelector<HTMLButtonElement>('.decision-picker-trigger')?.focus();
+          }
+        });
+      }}/>}
     {message && <div className="toast" role="status"><CheckCircle2 size={16}/><span>{message}</span><button onClick={() => setMessage(null)} aria-label="Dismiss status"><X size={14}/></button></div>}
+    <span className="mark-save-announcement" role="status" aria-atomic="true">{markAnnouncement}</span>
     {showMcp && <Modal title="Local MCP gateway" compact onClose={() => setShowMcp(false)}><div className={`mcp-state-line mcp-${gateway.state}`}><Link2 size={19}/><strong>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'Gateway needs attention' : 'Gateway unavailable'}</strong></div><p className="modal-intro">Keep the native app open while using an MCP client. This indicator shows the local gateway’s readiness.</p>{gateway.problem && <div className="context-box warning"><TriangleAlert size={16}/><p>{gateway.problem}</p></div>}{gateway.endpoint && <label className="gateway-endpoint">Local endpoint<input aria-label="Local MCP gateway endpoint" readOnly value={gateway.endpoint}/></label>}<p className="modal-intro gateway-instructions">Register the included local stdio server with your MCP client. The bridge shares the app’s saved decisions and revision checks. Agent proposals remain separate from decisions; accepted edits retain their provenance.</p><details className="gateway-diagnostics" open={gatewayDetailsOpen} onToggle={event => setGatewayDetailsOpen(event.currentTarget.open)}><summary>Session details</summary>{gateway.startedAt && <p>Gateway started: {new Date(gateway.startedAt).toLocaleString()}</p>}{gateway.instanceId && <p>Instance: {gateway.instanceId}</p>}<p>Authentication credentials are never displayed here.</p></details></Modal>}
     {showConflict && <Modal title="Saved-state conflict" onClose={closeConflictReview}><p className="modal-intro">Another reviewer saved a newer version while your edit was pending. The newer file was not overwritten. Your pending requests below remain in this window and will not be replayed automatically. Compare both versions, then explicitly choose whether to apply your pending edits to the displayed revision.</p><div className="context-box warning"><TriangleAlert size={17}/><p>Keep this window open while resolving the conflict. Pending edits are still held in memory. You can select and copy this text to preserve a separate record before any manual recovery.</p></div><p className="conflict-revisions">This window last acknowledged revision {queue.current?.revision ?? document.revision}.{externalDocument ? ` The newer saved version is revision ${externalDocument.revision}.` : ' The latest saved revision will be read on the next status check.'}</p><label className="conflict-draft-label">Retained pending requests<textarea aria-label="Retained pending requests" readOnly value={JSON.stringify(queue.current?.retainedOperations ?? [], null, 2)}/></label>{externalDocument && <div className="conflict-saved-summary"><h3>Newer saved decisions for pending paths</h3>{Array.from(new Set((queue.current?.retainedOperations ?? []).flatMap(operation => 'path' in operation ? [operation.path] : []))).map(path => { const decision = Object.values(externalDocument.decisions).find(decision => resolveDecisionPath(decision, boot.volumes).path?.toLowerCase() === path.toLowerCase()); return <article key={path}><strong>{path}</strong><p>{decision ? LABELS[decision.status] : 'No explicit saved decision'}</p>{decision?.notes && <p>{decision.notes}</p>}</article>; })}</div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'view') && <div className="conflict-saved-summary"><h3>Saved review position in this revision</h3><p>{externalDocument.view.path}</p><p>Selection: {externalDocument.view.selectedPath ?? 'folder itself'} · filter: {externalDocument.view.filter} · search: {externalDocument.view.search || '(empty)'}</p></div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') && <ReviewedUndoTarget document={externalDocument}/>}<div className="conflict-recovery-actions"><button disabled={conflictLoading || !queue.current?.state.error} onClick={() => void loadConflictComparison()}><RefreshCw size={14}/>{conflictLoading ? 'Reading saved version…' : 'Refresh comparison'}</button><button className="primary" disabled={conflictLoading || !externalDocument || !queue.current?.state.error || (externalDocument?.revision ?? 0) < (queue.current?.revision ?? 0)} onClick={() => { void applyReviewedPending().catch(() => {}); }}>Apply my pending edits{(queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') ? ' + reviewed Undo' : ''} to revision {externalDocument?.revision ?? '…'}</button></div>{conflictProblem && <div className="context-box warning" role="alert"><TriangleAlert size={17}/><p>{conflictProblem}</p></div>}<p className="modal-intro conflict-footnote">Applying uses the displayed revision and the original request identifiers. Unrelated saved fields stay intact. For fields changed in both versions, this action deliberately chooses your pending edit. If the saved file changes again, the revision check stops the edit for another review.</p><p className="modal-intro">No pending request is discarded and no revision fence is bypassed by closing this panel.</p></Modal>}
     {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{DECISION_CHOICES.map(status => { const Icon = ICONS[status]; const isSelected = isDecisionChoiceSelected(effective, status); return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); if (!isSelected) void classify(status); }}><Icon size={18}/><span><strong>{decisionChoiceLabel(status)}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
@@ -1715,7 +1836,14 @@ export default function App() {
         <input type="checkbox" checked={includeGeneratedForIndex} onChange={event => setIncludeGeneratedForIndex(event.target.checked)}/>
         <span>Include generated folders in the next new index</span>
       </label>}
-      <div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued
+      <div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}
+        {offerScanAssistance && <button className="primary" disabled={startingScanAssistance}
+          title={`Review ready folders in ${inventoryScope} while inventory continues`} aria-controls="inline-assistance"
+          onClick={() => void startAssistanceFromInventory(inventoryScope)}>
+          <Sparkles size={14} aria-hidden="true"/>{startingScanAssistance ? 'Starting review…' : continueScanAssistance ? 'Continue AI Assistance' : 'Start AI Assistance'}
+        </button>}
+      </div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued
+      {appStatus.scan.markedPending !== undefined && <> · {appStatus.scan.markedPending.toLocaleString()} queued in marked branches</>}
       {Boolean(appStatus.scan.skippedGenerated) && <> · {appStatus.scan.skippedGenerated?.toLocaleString()} generated folders skipped</>}
       </p><p className="modal-intro">This list shows up to 200 entries, including a sample of skipped generated folders and the latest filesystem gaps.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
     {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item} onGroupUndo={readOnly ? undefined : groupId => { void prepareGroupUndo(groupId, true).catch(report); }}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}

@@ -19,6 +19,8 @@ const MISSING: &str = "Missing or changed type since the previous observation; r
 #[derive(Clone, Default)]
 struct PriorityPlan {
     revision: u64,
+    rules_revision: u64,
+    equal_priority: bool,
     rules: Vec<(String, i64)>,
 }
 
@@ -79,47 +81,52 @@ impl Index {
     pub(crate) fn update_priority(&self, doc: &Value, volumes: &[Volume]) {
         let Some(revision) = doc["revision"].as_u64() else { return };
         let mut rules = Vec::new();
-        if doc["inventoryDeferMarked"] != false {
-            for mark in doc["decisions"].as_object().into_iter().flat_map(|marks| marks.values()) {
-                if mark["noteOnly"] == true { continue; }
-                let (Some(id), Some(relative), Some(status)) =
-                    (mark["volumeId"].as_str(), mark["relativePath"].as_str(), mark["status"].as_str())
-                else { continue };
-                let Some(volume) = volumes.iter().find(|volume| volume.id == id && volume.available) else { continue };
-                let path = if relative.is_empty() { volume.root.clone() } else {
-                    format!("{}\\{relative}", volume.root.trim_end_matches('\\'))
-                };
-                if filesystem::locate(&path, volumes).is_ok() {
-                    rules.push((path, i64::from(status != "attention")));
-                }
+        for mark in doc["decisions"].as_object().into_iter().flat_map(|marks| marks.values()) {
+            if mark["noteOnly"] == true { continue; }
+            let (Some(id), Some(relative), Some(status)) =
+                (mark["volumeId"].as_str(), mark["relativePath"].as_str(), mark["status"].as_str())
+            else { continue };
+            let Some(volume) = volumes.iter().find(|volume| volume.id == id && volume.available) else { continue };
+            let path = if relative.is_empty() { volume.root.clone() } else {
+                format!("{}\\{relative}", volume.root.trim_end_matches('\\'))
+            };
+            if filesystem::locate(&path, volumes).is_ok() {
+                rules.push((path, i64::from(status != "attention")));
             }
         }
         // Apply parent rules first. A nearer explicit decision can override them.
         rules.sort_unstable_by_key(|(path, _)| path.len());
         if let Ok(mut plan) = self.priority_plan.lock() {
-            if revision >= plan.revision && plan.rules != rules {
-                *plan = PriorityPlan { revision, rules };
+            if revision >= plan.revision {
+                if plan.rules != rules {
+                    plan.rules = rules;
+                    plan.rules_revision = revision;
+                }
+                plan.revision = revision;
+                plan.equal_priority = doc["inventoryDeferMarked"] == false;
             }
         }
     }
-    fn apply_priority(&self, db: &mut Connection) -> Result<(), String> {
+    fn apply_priority(&self, db: &mut Connection) -> Result<bool, String> {
         let mut applied = self.priority_applied.lock().map_err(error)?;
         let plan = {
             let plan = self.priority_plan.lock().map_err(error)?;
-            if *applied == Some(plan.revision) { return Ok(()) }
+            if *applied == Some(plan.rules_revision) { return Ok(plan.equal_priority); }
             plan.clone()
         };
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
-        tx.execute_batch("DELETE FROM queue_priority_rules; UPDATE queue SET priority=0 WHERE priority<>0;").map_err(error)?;
+        tx.execute_batch("DELETE FROM queue_priority_rules;
+            UPDATE queue SET priority=0 WHERE state IN ('pending','working') AND priority<>0;").map_err(error)?;
         for (path, defer) in plan.rules {
             tx.execute("INSERT OR REPLACE INTO queue_priority_rules VALUES(?1,?2)", params![path,defer]).map_err(error)?;
             let prefix = path.trim_end_matches('\\');
-            tx.execute("UPDATE queue SET priority=?1 WHERE priority<>?1 AND (path=?2 OR (path>=?3 AND path<?4))",
+            tx.execute("UPDATE queue SET priority=?1 WHERE state IN ('pending','working')
+                AND priority<>?1 AND (path=?2 OR (path>=?3 AND path<?4))",
                 params![defer,path,format!("{prefix}\\"),format!("{prefix}]")]).map_err(error)?;
         }
         tx.commit().map_err(error)?;
-        *applied = Some(plan.revision);
-        Ok(())
+        *applied = Some(plan.rules_revision);
+        Ok(plan.equal_priority)
     }
     pub fn connect(&self) -> Result<Connection, String> {
         let c = Connection::open(&self.path).map_err(error)?;
@@ -175,6 +182,9 @@ impl Index {
     }
     pub fn scan_status(&self) -> Result<Value, String> {
         let mut db = self.connect()?;
+        if !self.running.load(Ordering::SeqCst) {
+            self.apply_priority(&mut db)?;
+        }
         let db = db.transaction().map_err(error)?;
         let raw: String = db
             .query_row("SELECT value FROM meta WHERE key='scan'", [], |r| r.get(0))
@@ -194,6 +204,13 @@ impl Index {
                 |r| r.get::<_, i64>(0)
             )
             .map_err(error)?);
+        let (marked_pending, marked_active): (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM queue WHERE state='pending' AND priority=1),
+                    (SELECT count(*) FROM queue WHERE state='working' AND priority=1)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(error)?;
+        v["markedPending"] = json!(marked_pending);
+        v["markedActive"] = json!(marked_active);
         v["currentPath"] = json!(db
             .query_row(
                 "SELECT path FROM queue WHERE state='working' ORDER BY path LIMIT 1",
@@ -835,11 +852,16 @@ impl Index {
                 return Ok(());
             }
             // IMMEDIATE avoids concurrent read-to-write upgrades and duplicate claims.
-            self.apply_priority(&mut db)?;
+            let equal_priority = self.apply_priority(&mut db)?;
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(error)?;
-            let path: Option<String> = tx.query_row("SELECT path FROM queue WHERE state='pending' ORDER BY priority,length(path),path LIMIT 1", [], |r| r.get(0)).optional().map_err(error)?;
+            let claim = if equal_priority {
+                "SELECT path FROM queue WHERE state='pending' ORDER BY length(path),path LIMIT 1"
+            } else {
+                "SELECT path FROM queue WHERE state='pending' ORDER BY priority,length(path),path LIMIT 1"
+            };
+            let path: Option<String> = tx.query_row(claim, [], |r| r.get(0)).optional().map_err(error)?;
             let Some(path) = path else {
                 let working: bool = tx
                     .query_row(
@@ -1102,11 +1124,13 @@ mod tests {
         let s = crate::tests::fixture();
         let root = &s.volumes[0].root;
         let marked = format!("{root}\\Work");
+        let inherited = format!("{marked}\\Inherited");
         let exception = format!("{marked}\\Child");
+        let inherited_attention = format!("{exception}\\NeedsReview");
         let unmarked = format!("{root}\\Other");
         let volume = &s.volumes[0].id;
         let mut db = s.index.connect().unwrap();
-        for path in [&marked, &exception, &unmarked] {
+        for path in [&marked, &inherited, &exception, &inherited_attention, &unmarked] {
             db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path]).unwrap();
         }
         let mut policy = serde_json::json!({"revision":1,"decisions":{
@@ -1114,20 +1138,32 @@ mod tests {
             "exception":{"volumeId":volume,"relativePath":"Work\\Child","status":"attention"}
         }});
         s.index.update_priority(&policy, &s.volumes);
-        s.index.apply_priority(&mut db).unwrap();
+        assert!(!s.index.apply_priority(&mut db).unwrap());
         let priority = |db: &rusqlite::Connection, path: &str| -> i64 {
             db.query_row("SELECT priority FROM queue WHERE path=?1", [path], |row| row.get(0)).unwrap()
         };
         assert_eq!(priority(&db, &marked), 1);
+        assert_eq!(priority(&db, &inherited), 1);
         assert_eq!(priority(&db, &exception), 0);
+        assert_eq!(priority(&db, &inherited_attention), 0);
         assert_eq!(priority(&db, &unmarked), 0);
+        db.execute("UPDATE queue SET state='working' WHERE path=?1", [&inherited]).unwrap();
+        let counts = s.index.scan_status().unwrap();
+        assert_eq!(counts["pending"], 4);
+        assert_eq!(counts["markedPending"], 1);
+        assert_eq!(counts["markedActive"], 1);
         policy["revision"] = serde_json::json!(2);
         policy["inventoryDeferMarked"] = serde_json::json!(false);
         s.index.update_priority(&policy, &s.volumes);
-        s.index.apply_priority(&mut db).unwrap();
-        assert_eq!(priority(&db, &marked), 0);
-        let pending: i64 = db.query_row("SELECT count(*) FROM queue WHERE state='pending'", [], |row| row.get(0)).unwrap();
-        assert_eq!(pending, 3);
+        assert!(s.index.apply_priority(&mut db).unwrap());
+        assert_eq!(s.index.scan_status().unwrap()["markedPending"], 1);
+        policy["revision"] = serde_json::json!(3);
+        policy["decisions"]["marked"]["status"] = serde_json::json!("attention");
+        s.index.update_priority(&policy, &s.volumes);
+        let counts = s.index.scan_status().unwrap();
+        assert_eq!(counts["pending"], 4);
+        assert_eq!(counts["markedPending"], 0);
+        assert_eq!(counts["markedActive"], 0);
     }
 
     use super::*;

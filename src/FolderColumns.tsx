@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
@@ -7,7 +7,8 @@ import { MAX_COLUMN, MIN_COLUMN, baseName, parentPath, parseEntry } from './mode
 import type { Entry, Listing, PreviewColumn, Status } from './model';
 import type { FolderReadCache, FolderReadContext } from './folder-read-cache';
 import { isStaleRead } from './read-cache';
-import { DECISION_CHOICES, DESCRIPTIONS, ICONS, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, StatusBadge } from './classifications';
+import { DECISION_CHOICES, DESCRIPTIONS, ICONS, MarkSaveBadge, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, StatusBadge } from './classifications';
+import type { MarkSaveFeedback } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
 import { ResizeGrip } from './ReviewLayout';
@@ -72,6 +73,7 @@ export interface ColumnActions {
   revealPath: string | null;
   revealVersion: number;
   suggestionFor?: (entry: Entry) => RowSuggestion;
+  markFeedbackFor: (path: string) => MarkSaveFeedback | undefined;
   previewPath?: string | null;
 }
 interface DirectoryColumnProps extends ColumnActions {
@@ -239,6 +241,7 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
         return <EntryRow key={entryKey} entry={entry} selected={props.selectedPath !== null && reviewPathKey(props.selectedPath) === entryKey}
           groupSelected={props.isGroupSelected(entry)} canGroupSelect={props.canGroupSelect(entry)}
           menuOpen={props.menuPath === entry.path} pinned={entry === pinned} activity={props.reviewActivity.paths.get(entryKey)}
+          markFeedback={props.markFeedbackFor(entry.path)}
           nowMs={props.reviewActivity.nowMs} onSelect={() => props.onSelect(entry)} onGroupToggle={() => props.onToggleSelect(entry)}
           onOpen={() => props.onOpen(entry.path)} onPreview={() => props.onPreview(entry, props.depth)} onMenu={props.onMenu}
           suggestion={props.suggestionFor?.(entry)}
@@ -314,6 +317,7 @@ interface EntryRowProps {
   activity?: ActivityRow;
   nowMs: number;
   suggestion?: RowSuggestion;
+  markFeedback?: MarkSaveFeedback;
   previewing: boolean;
   onSelect: () => void;
   onGroupToggle: () => void;
@@ -321,12 +325,15 @@ interface EntryRowProps {
   onPreview: () => void;
   onMenu: (target: RowMenuTarget) => void;
 }
-function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pinned, activity, nowMs, suggestion, previewing,
+function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pinned, activity, nowMs, suggestion, markFeedback, previewing,
   onSelect, onGroupToggle, onOpen, onPreview, onMenu }: EntryRowProps) {
   const Icon = entry.kind === 'folder' ? Folder : entry.kind === 'link' ? Link2 : entry.kind === 'unavailable' ? TriangleAlert : File;
   const activityLabel = reviewActivityLabel(activity, nowMs);
   const reviewLabel = [pinned ? 'Revealed · outside current results' : null, activityLabel].filter(Boolean).join(' · ');
   const suggestionLabel = suggestion ? (suggestion.source === 'ai' ? 'AI suggestion' : 'Local suggestion') : null;
+  const showsChoice = markFeedback?.phase === 'saving' || markFeedback?.phase === 'saved';
+  const status = showsChoice ? markFeedback.status : entry.effective.status;
+  const entryFeedbackId = useId();
   const nameLabel = useRef<HTMLElement>(null);
   function prepareNameMarquee(): void {
     const label = nameLabel.current;
@@ -345,7 +352,7 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
     const rectangle = invoker.getBoundingClientRect();
     onMenu({ id: crypto.randomUUID(), entry, x: x ?? rectangle.right, y: y ?? rectangle.bottom, invoker });
   }
-  return <div className={`entry-row status-${entry.effective.status} ${selected ? 'selected' : ''}`} data-entry-path={entry.path} data-entry-name={entry.name} data-entry-kind={entry.kind} data-entry-status={entry.effective.rollup?.kind === 'mixed' ? 'mixed' : entry.effective.status} data-review-pinned={pinned || undefined} data-review-activity={activity?.pulse?.kind} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); const target = event.target instanceof HTMLElement ? event.target.closest<HTMLElement>('button') : null; const invoker = target ?? event.currentTarget.querySelector<HTMLElement>('.entry-select') ?? event.currentTarget; menu(invoker, event.clientX || undefined, event.clientY || undefined); }} onKeyDown={event => {
+  return <div className={`entry-row status-${status} ${selected ? 'selected' : ''}`} data-entry-path={entry.path} data-entry-name={entry.name} data-entry-kind={entry.kind} data-entry-status={entry.effective.rollup?.kind === 'mixed' ? 'mixed' : entry.effective.status} data-mark-save={markFeedback?.phase} data-review-pinned={pinned || undefined} data-review-activity={activity?.pulse?.kind} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); const target = event.target instanceof HTMLElement ? event.target.closest<HTMLElement>('button') : null; const invoker = target ?? event.currentTarget.querySelector<HTMLElement>('.entry-select') ?? event.currentTarget; menu(invoker, event.clientX || undefined, event.clientY || undefined); }} onKeyDown={event => {
     const target = event.target instanceof HTMLElement ? event.target.closest<HTMLElement>('button') : null;
     const space = event.key === ' ' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && target?.classList.contains('entry-select');
     if (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10' || space) {
@@ -361,6 +368,7 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
     <button className="entry-select" data-entry-path={entry.path} aria-current={selected ? 'true' : undefined}
       aria-expanded={entry.kind === 'folder' ? previewing : undefined}
       aria-label={`${entry.kind === 'folder' ? 'Preview folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${suggestion ? `, ${suggestionLabel}: ${suggestion.label}` : ''}${reviewLabel ? `, ${reviewLabel}` : ''}`}
+      aria-describedby={markFeedback ? entryFeedbackId : undefined}
       title={suggestion ? `${entry.path}\n${suggestionLabel}: ${suggestion.reason}` : `${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`}
       onFocus={prepareNameMarquee} onPointerEnter={prepareNameMarquee} onClick={entry.kind === 'folder' ? onPreview : onSelect}>
       <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong className="entry-name-label" ref={nameLabel}><span>{entry.name}</span></strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span>
@@ -368,7 +376,9 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
         {suggestion.source === 'ai' && <Sparkles size={11} aria-hidden="true"/>}
         <span>{suggestionLabel} · {suggestion.label}</span>
       </span>}
-      <span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
+      <span className="review-row-status">{markFeedback
+        ? <MarkSaveBadge key={markFeedback.phase} id={entryFeedbackId} feedback={markFeedback}/>
+        : <StatusBadge effective={entry.effective} compact/>}{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
     </button>
     {entry.kind === 'folder' && <button className="entry-preview" disabled={Boolean(entry.problem)} title={`Center on ${entry.name}`} aria-label={`Center on folder ${entry.name}`} onClick={onOpen}><Focus size={17}/></button>}
     <button className="entry-more" title={`Mark ${entry.name}`} aria-label={`Mark ${entry.name}: more actions`} aria-haspopup="menu" aria-expanded={menuOpen} aria-controls={menuOpen ? 'row-classification-menu' : undefined} onClick={event => menu(event.currentTarget)}><MoreHorizontal size={17}/></button>
@@ -376,8 +386,9 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
   </div>;
 }
 
-export function RowClassificationMenu({ target, disabledReason, onChoose, onDismiss, onCenterFolder, portalRoot }: {
+export function RowClassificationMenu({ target, disabledReason, savedMark, onChoose, onDismiss, onCenterFolder, portalRoot }: {
   target: RowMenuTarget; disabledReason: string | null; onChoose: (status: Status) => void;
+  savedMark?: Status;
   onDismiss: (restoreFocus: boolean) => void; onCenterFolder?: () => void; portalRoot?: HTMLElement;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -421,7 +432,7 @@ export function RowClassificationMenu({ target, disabledReason, onChoose, onDism
     </button>}
     {DECISION_CHOICES.map(status => {
       const Icon = ICONS[status];
-      const chosen = isDecisionChoiceSelected(target.entry.effective, status);
+      const chosen = savedMark !== undefined ? savedMark === status : isDecisionChoiceSelected(target.entry.effective, status);
       return <button key={status} role="menuitemradio" aria-checked={chosen} tabIndex={-1}
         disabled={disabledReason !== null} className={`row-menu-item status-${status}`} title={DESCRIPTIONS[status]}
         onClick={() => { if (chosen) onDismiss(true); else onChoose(status); }}>

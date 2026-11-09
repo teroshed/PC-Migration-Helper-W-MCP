@@ -3,18 +3,20 @@ import assert from 'node:assert/strict';
 import { inventoryElapsed, inventoryProgressLabel, parseInventoryProgress } from '../src/assistance-progress.ts';
 
 test('inventory counts completed and current files, without guessing a percentage', () => {
-  const progress = parseInventoryProgress({ processed: 12, pending: 20, active: 4, workers: 4,
+  const progress = parseInventoryProgress({ processed: 12, pending: 20, markedPending: 7, active: 4, workers: 4,
     files: 100, currentFiles: 8, bytes: 200, currentBytes: 16, gaps: 2 });
   assert.equal(progress.files, 108);
   assert.equal(progress.bytes, 216);
   assert.equal(progress.gaps, 2);
-  assert.equal(inventoryProgressLabel(progress), '12 directories processed, 20 queued, 4 active. Final total unknown.');
+  assert.equal(progress.markedPending, 7);
+  assert.equal(inventoryProgressLabel(progress), '12 directories processed, 20 queued, 7 in marked branches, 4 active. Final total unknown.');
   assert.doesNotMatch(inventoryProgressLabel(progress), /%/);
 });
 
 test('older snapshots do not present a missing queue count as zero', () => {
   const progress = parseInventoryProgress({ processed: 12 });
   assert.equal(progress.pending, null);
+  assert.equal(progress.markedPending, null);
   assert.equal(inventoryProgressLabel(progress), '12 directories processed. Final total unknown.');
   assert.equal(parseInventoryProgress({ pending: 0 }).pending, 0);
 });

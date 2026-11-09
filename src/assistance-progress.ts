@@ -3,6 +3,7 @@ import { record } from './model.ts';
 export interface InventoryProgress {
   processed: number;
   pending: number | null;
+  markedPending: number | null;
   active: number;
   workers: number;
   files: number;
@@ -28,6 +29,7 @@ export function parseInventoryProgress(input: unknown): InventoryProgress {
   return {
     processed: count(scan.processed),
     pending: scan.pending === undefined || scan.pending === null ? null : count(scan.pending),
+    markedPending: scan.markedPending === undefined || scan.markedPending === null ? null : count(scan.markedPending),
     active: count(scan.active), workers: count(scan.workers),
     files: total(scan.files, scan.currentFiles),
     bytes: total(scan.bytes, scan.currentBytes),
@@ -40,8 +42,10 @@ export function parseInventoryProgress(input: unknown): InventoryProgress {
 // Discovery has no stable denominator. Reuse the audit UI's indeterminate
 // semantics rather than interpreting the growing queue as percent complete.
 export function inventoryProgressLabel(progress: InventoryProgress): string {
-  return `${progress.processed.toLocaleString()} directories processed${progress.pending === null ? ''
-    : `, ${progress.pending.toLocaleString()} queued`}${progress.active ? `, ${progress.active} active` : ''}. Final total unknown.`;
+  const queued = progress.pending === null ? '' : `, ${progress.pending.toLocaleString()} queued`;
+  const marked = progress.markedPending === null ? '' : `, ${progress.markedPending.toLocaleString()} in marked branches`;
+  const active = progress.active ? `, ${progress.active} active` : '';
+  return `${progress.processed.toLocaleString()} directories processed${queued}${marked}${active}. Final total unknown.`;
 }
 
 export function inventoryElapsed(startedAt: string | null, now: number): string | null {

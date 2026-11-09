@@ -272,6 +272,57 @@
 
 .review-layout .column-entry-list .entry-row { min-block-size: 66px; }
 
+.mark-save-announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.mark-save-badge > span:first-of-type { flex-shrink: 0; }
+.mark-save-choice { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mark-save-badge { vertical-align: middle; }
+.decision-picker-trigger .mark-save-badge { align-self: flex-start; }
+.entry-row[data-mark-save='saving'] {
+  background-color: color-mix(in srgb, var(--state-color), transparent 84%);
+}
+
+@container (max-width: 290px) {
+  .review-row-status .mark-save-choice {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    clip-path: inset(50%);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .mark-save-badge[data-mark-save='saved'] > svg {
+    animation: mark-save-check 200ms ease-out both;
+  }
+  .entry-row[data-mark-save='saved']::after {
+    content: '';
+    position: absolute;
+    inset: 1px;
+    border: 1px solid var(--state-color);
+    border-radius: inherit;
+    pointer-events: none;
+    animation: mark-save-fade 600ms ease-out both;
+  }
+}
+
+@keyframes mark-save-check {
+  from { transform: scale(.75); opacity: .5; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+@keyframes mark-save-fade {
+  from { opacity: .8; }
+  to { opacity: 0; }
+}
+
 @media (max-width: 1200px) {
   .app-shell.review-layout {
     --default-drives-width: 180px;

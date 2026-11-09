@@ -1534,6 +1534,9 @@ fn main() {
     };
     let index = Index::open(cache_runtime.join(format!("inventory-{}.sqlite", &namespace[..12])))
         .expect("Cannot open inventory cache");
+    if let Some(journal) = &store {
+        index.update_priority(&journal.doc, &roots);
+    }
     let exclusions = vec![
         cache_runtime.to_string_lossy().to_string(),
         data_path.with_extension("*").to_string_lossy().to_string(),

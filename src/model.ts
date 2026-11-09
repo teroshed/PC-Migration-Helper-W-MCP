@@ -100,7 +100,10 @@ export interface GatewayStatus { state: 'running' | 'error' | 'unavailable'; end
 export interface Boot { document: Document; volumes: Volume[]; dataPath: string; fixture: boolean; problem: string | null; recoveryAvailable: boolean; gateway: GatewayStatus }
 export interface Listing { path: string; entries: Entry[]; total: number; attention: number; counts: Record<string, number>; observedAt: string | null; nameFitSample?: string[] }
 export interface Details { path: string; effective: Effective; decision: Decision | null; overrides: Decision[]; history: unknown[]; exists: boolean; audit?: AuditStats }
-export interface ScanStatus { status?: string; pending: number; processed?: number; files?: number; bytes?: number; skippedGenerated?: number; currentPath?: string; error?: string }
+export interface ScanStatus {
+  status?: string; pending: number; markedPending?: number; markedActive?: number; roots?: string[];
+  processed?: number; files?: number; bytes?: number; skippedGenerated?: number; currentPath?: string; error?: string;
+}
 export interface AppStatus { scan: ScanStatus; gaps: Array<{ path: string; problem: string; observedAt: string }>; decisionCount: number; mirrorEvidenceStamp?: string }
 export type Operation =
   | { type: 'classify'; path: string; status: Status }

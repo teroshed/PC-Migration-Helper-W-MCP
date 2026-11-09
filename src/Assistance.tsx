@@ -134,7 +134,7 @@ function parseInterview(input: unknown): Interview {
 }
 
 export function AssistanceInterview({ currentPath, revision, scanSignal, readOnly, onEdit, controlRef,
-  footerHost, inspectQuestion, browser, deferMarked, onOpenMirror, onResizeScanDetails }: {
+  footerHost, inspectQuestion, browser, deferMarked, onOpenMirror, onResizeScanDetails, inventoryReview }: {
   currentPath: string;
   revision: number;
   scanSignal: string | undefined;
@@ -147,6 +147,7 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
   deferMarked: boolean;
   onOpenMirror: (path: string) => void;
   onResizeScanDetails: (height: number) => void;
+  inventoryReview?: { scope: string; pending: boolean; start: () => void };
 }) {
   const [interview, setInterview] = useState<Interview | null>(null);
   const [reading, setReading] = useState(true);
@@ -290,7 +291,7 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
     void perform(() => invoke('scan', { mode, path, includeGenerated }));
   }
 
-  const locked = readOnly || reading || working;
+  const locked = readOnly || reading || working || inventoryReview?.pending === true;
   const phase = interview?.phase;
   const scope = interview?.scope;
   const scopeCandidate = currentPath;
@@ -317,6 +318,10 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
     ? `Approve keep · ${LABELS[question.status]}`
     : question ? `Approve ${decisionChoiceLabel(question.status)}` : 'Approve';
   const scopeActions = <div className="assistance-actions assistance-scope-actions">
+    {inventoryReview && <button className="primary" disabled={locked}
+      title={`Review ready folders in ${inventoryReview.scope} while inventory continues`} onClick={inventoryReview.start}>
+      <Sparkles size={14} aria-hidden="true"/>{inventoryReview.pending ? 'Starting review…' : 'Review scanned folders'}
+    </button>}
     {(phase === 'idle' || problem || canChangeScope) && <button disabled={locked}
       onClick={() => edit({ type: 'assist', action: 'scope', path: scopeCandidate })}>
       {scope ? 'Use current folder' : 'Review this folder'}
@@ -558,7 +563,10 @@ function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriority
         <div className="assistance-scan-details" ref={detailScroll} tabIndex={0} role="region" aria-label="Inventory details">
           {progress && phase ? <>
             <dl>
-              <div><dt>Queued</dt><dd>{progress.pending?.toLocaleString() ?? 'Unknown'}</dd></div>
+              <div className="assistance-queued">
+                <dt title="Queued folders and the subset in marked branches">{progress.markedPending === null ? 'Queued' : 'Queued / marked'}</dt>
+                <dd>{progress.pending?.toLocaleString() ?? 'Unknown'}{progress.markedPending !== null && <> / {progress.markedPending.toLocaleString()}</>}</dd>
+              </div>
               <div><dt>Files found</dt><dd>{progress.files.toLocaleString()}</dd></div>
               <div><dt>Logical size</dt><dd>{readableBytes(progress.bytes)}</dd></div>
               <div><dt>Active folders</dt><dd>{progress.active.toLocaleString()}</dd></div>

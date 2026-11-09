@@ -240,6 +240,7 @@
 }
 .assistance-scan-details dt, .assistance-scan-note { color: #9fb4cf; }
 .assistance-scan-details dt { font-size: 10px; }
+.assistance-scan-details .assistance-queued dt { font-size: 9px; }
 .assistance-scan-details dd { margin: 0; color: #e1edff; font-weight: 600; }
 .assistance-progress-path { overflow-wrap: anywhere; }
 .assistance-progress-path > span { color: #9fb4cf; }

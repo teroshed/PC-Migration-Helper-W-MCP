@@ -1,4 +1,4 @@
-import { ArrowDownToLine, CheckCircle2, CircleHelp, Clock3, Download, FolderCheck, FolderClock, Info, Trash2, TriangleAlert } from 'lucide-react';
+import { ArrowDownToLine, CheckCircle2, CircleHelp, Clock3, Download, FolderCheck, FolderClock, Info, LoaderCircle, Trash2, TriangleAlert } from 'lucide-react';
 import { STATUSES } from './model';
 import type { Effective, Status } from './model';
 
@@ -51,6 +51,24 @@ export function StatusBadge({ effective, compact = false }: { effective: Effecti
     <span>{reviewStatusLabel(effective)}{effective.status === 'migrate-now' && !rolledUp ? ' · pending' : ''}</span>
     {effective.mixed > 0 && !rolledUp && <span className="mixed-tag">Mixed</span>}
     {effective.stale && <TriangleAlert size={13} aria-label="Changed since decision" />}
+  </span>;
+}
+
+export interface MarkSaveFeedback {
+  status: Status;
+  phase: 'saving' | 'waiting' | 'saved' | 'rejected';
+}
+
+export function MarkSaveBadge({ feedback, id }: { feedback: MarkSaveFeedback; id?: string }) {
+  const { phase, status } = feedback;
+  const problem = phase === 'waiting' || phase === 'rejected';
+  const label = phase === 'saving' ? 'Saving…' : phase === 'saved' ? 'Saved' : phase === 'waiting' ? 'Waiting to save' : 'Not saved';
+  const Icon = problem ? TriangleAlert : phase === 'saved' ? CheckCircle2 : LoaderCircle;
+  const decision = decisionChoiceLabel(status);
+  return <span id={id} className={`status-badge compact mark-save-badge status-${problem ? 'attention' : status}`}
+    data-mark-save={phase} title={`${label} · ${decision}`}>
+    <Icon className={phase === 'saving' ? 'spin' : undefined} size={13} aria-hidden="true"/>
+    <span>{label}</span><span className="mark-save-choice">· {decision}</span>
   </span>;
 }
 
