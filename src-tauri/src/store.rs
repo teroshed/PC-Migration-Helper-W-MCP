@@ -102,6 +102,12 @@ pub fn validate(doc: &Value) -> Result<(), String> {
         || view
             .get("layout")
             .is_some_and(|value| !valid_review_layout(value))
+        || view
+            .get("toolbarHeight")
+            .is_some_and(|value| !valid_toolbar_height(value))
+        || view
+            .get("scanDetailsHeight")
+            .is_some_and(|value| !valid_scan_details_height(value))
     {
         return Err(
             "The saved preview-column position has an unsupported format. Original preserved."
@@ -163,6 +169,12 @@ pub fn valid_column_width(value: &Value) -> bool {
         .as_f64()
         .is_some_and(|number| number.is_finite() && (240.0..=800.0).contains(&number))
 }
+pub fn valid_toolbar_height(value: &Value) -> bool {
+    value.is_null() || value.as_u64().is_some_and(|n| (44..=230).contains(&n))
+}
+pub fn valid_scan_details_height(value: &Value) -> bool {
+    value.is_null() || value.as_u64().is_some_and(|n| (36..=220).contains(&n))
+}
 pub fn valid_review_layout(value: &Value) -> bool {
     value.as_object().is_some_and(|fields| {
         fields.iter().all(|(key, value)| match key.as_str() {
@@ -194,7 +206,7 @@ pub fn valid_preview_columns(value: &Value) -> bool {
 pub fn fresh(root: &str) -> Value {
     json!({"schemaVersion":1,"revision":0,"createdAt":now(),"updatedAt":now(),
         "decisions":{},"history":[],"evidence":[],"suggestions":[],"volumes":{},
-        "view":{"path":root,"selectedPath":null,"search":"","filter":"all","page":0,"scrollTop":0,"recentPaths":[],"previewColumns":[],"previewScrollLeft":0,"browserColumnWidth":320},
+        "view":{"path":root,"selectedPath":null,"search":"","filter":"all","page":0,"scrollTop":0,"recentPaths":[],"previewColumns":[],"previewScrollLeft":0},
         "provenance":{"application":"PC Migration Helper","purpose":"Read-only source review; classifications never execute migration or deletion"},
         "backupReminder":"Include this review journal in your external backup."})
 }

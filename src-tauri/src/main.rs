@@ -373,6 +373,7 @@ fn list_folder_service(
     search: String,
     filter: String,
     page: usize,
+    sample_names: bool,
 ) -> Result<Value, String> {
     let _observation = s.background.observe()?;
     let path = filesystem::normalize(&path)?;
@@ -384,6 +385,9 @@ fn list_folder_service(
     }
     let doc = document(&s)?;
     let mut entries = Vec::new();
+    const NAME_SAMPLE_LIMIT: usize = 256;
+    let mut name_sample = Vec::new();
+    let mut name_stride = 1;
     let mut total = 0usize;
     let mut attention = 0usize;
     let mut counts = serde_json::Map::new();
@@ -399,6 +403,19 @@ fn list_folder_service(
         }
         if !matches_review_filter(&result, &filter) {
             return true;
+        }
+        if sample_names && total % name_stride == 0 {
+            if name_sample.len() == NAME_SAMPLE_LIMIT {
+                // Keep the sample evenly spaced over the full sorted result.
+                let mut index = 0;
+                name_sample.retain(|_| {
+                    let keep = index % 2 == 0;
+                    index += 1;
+                    keep
+                });
+                name_stride *= 2;
+            }
+            name_sample.push(entry.name.clone());
         }
         if total >= page.saturating_mul(100) && entries.len() < 100 {
             let mut value = serde_json::to_value(entry).unwrap();
@@ -419,9 +436,12 @@ fn list_folder_service(
         }
     }
     let info = s.index.directory_info(&path)?;
-    Ok::<_, String>(
-        json!({"path":path,"entries":entries,"total":total,"attention":attention,"counts":counts,"observedAt":info.as_ref().and_then(|i|i["listingObservedAt"].as_str())}),
-    )
+    let mut listing = json!({"path":path,"entries":entries,"total":total,"attention":attention,"counts":counts,
+        "observedAt":info.as_ref().and_then(|i|i["listingObservedAt"].as_str())});
+    if sample_names && total > entries.len() {
+        listing["nameFitSample"] = json!(name_sample);
+    }
+    Ok(listing)
 }
 #[tauri::command]
 async fn list_folder(
@@ -434,7 +454,7 @@ async fn list_folder(
 ) -> Result<Value, String> {
     let s = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        list_folder_service(&s, path, refresh, search, filter, page)
+        list_folder_service(&s, path, refresh, search, filter, page, true)
     })
     .await
     .map_err(error)?
@@ -611,7 +631,9 @@ fn apply_view_patch(
                     filesystem::identify(column["path"].as_str().unwrap(), &s.volumes)?;
                 }
             }
-            "browserColumnWidth" if store::valid_column_width(value) => {}
+            "browserColumnWidth" if value.is_null() || store::valid_column_width(value) => {}
+            "toolbarHeight" if store::valid_toolbar_height(value) => {}
+            "scanDetailsHeight" if store::valid_scan_details_height(value) => {}
             "layout" if store::valid_review_layout(value) => {}
             _ => return Err(format!("Invalid or unsupported review preference: {key}")),
         }
@@ -629,7 +651,13 @@ fn apply_view_patch(
         }
     }
     for (key, value) in patch {
-        view[key] = value.clone();
+        if key == "browserColumnWidth" && value.is_null() {
+            if let Some(fields) = view.as_object_mut() {
+                fields.remove(key);
+            }
+        } else {
+            view[key] = value.clone();
+        }
     }
     let preview_depth = view["previewColumns"].as_array().map_or(0, Vec::len);
     if view["layout"]["fillDepth"].as_u64().is_some_and(|n| n > preview_depth as u64) {
@@ -2080,8 +2108,8 @@ mod tests {
             path.push_str(&format!("\\Preview-{number}"));
             columns.push(json!({"path":path,"page":number,"scrollTop":number as f64*21.5,"width":320,"futureColumnField":"preserved"}));
         }
-        let patch =
-            json!({"previewColumns":columns,"previewScrollLeft":225.5,"browserColumnWidth":360});
+        let patch = json!({"previewColumns":columns,"previewScrollLeft":225.5,
+            "browserColumnWidth":360,"toolbarHeight":111,"scanDetailsHeight":77});
         let saved = apply(&s, "preview-columns", json!({"type":"view","patch":patch}));
         assert_eq!(
             saved["view"]["previewColumns"].as_array().unwrap().len(),
@@ -2114,5 +2142,7 @@ mod tests {
         );
         assert_eq!(reopened.doc["view"]["previewScrollLeft"], 225.5);
         assert_eq!(reopened.doc["view"]["browserColumnWidth"], 360);
+        assert_eq!(reopened.doc["view"]["toolbarHeight"], 111);
+        assert_eq!(reopened.doc["view"]["scanDetailsHeight"], 77);
     }
 }

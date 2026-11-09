@@ -564,7 +564,7 @@ fn action_patch(s: &AppState, doc: &Value, view: &Value, op: &Value) -> Result<V
                     patch["page"] = promoted["page"].clone();
                     patch["scrollTop"] = promoted["scrollTop"].clone();
                 }
-                patch["browserColumnWidth"] = promoted.get("width").cloned().unwrap_or_else(|| json!(360));
+                patch["browserColumnWidth"] = promoted.get("width").cloned().unwrap_or(Value::Null);
                 patch["previewColumns"] = json!(columns[index + 1..]);
             }
             clear_navigation_overlays(view, &mut patch);
@@ -572,6 +572,9 @@ fn action_patch(s: &AppState, doc: &Value, view: &Value, op: &Value) -> Result<V
         }
         "backFolder" => {
             let closing = depth(op.get("depth"))?;
+            if closing > 1 {
+                return close_preview_patch(view, closing);
+            }
             let current = text_path(&view["path"])?;
             let (volume, _, _) = filesystem::identify(&current, &s.volumes)?;
             if same_path(&current, &volume.root) {
@@ -656,10 +659,25 @@ fn layout_settings_patch(view: &Value, op: &Value) -> Result<Value, String> {
         }
         layout.extend(fields.clone());
         patch.insert("layout".into(), Value::Object(layout));
+        if fields.contains_key("toolbar") {
+            patch.insert("toolbarHeight".into(), Value::Null);
+        }
+    }
+    if let Some(height) = op.get("toolbarHeight") {
+        if !crate::store::valid_toolbar_height(height) {
+            return Err("Toolbar height must be between 44 and 230 pixels or null for automatic height".into());
+        }
+        patch.insert("toolbarHeight".into(), height.clone());
+    }
+    if let Some(height) = op.get("scanDetailsHeight") {
+        if !crate::store::valid_scan_details_height(height) {
+            return Err("Scan details height must be between 36 and 220 pixels or null for automatic height".into());
+        }
+        patch.insert("scanDetailsHeight".into(), height.clone());
     }
     if let Some(width) = op.get("width") {
-        if !width.as_f64().is_some_and(|n| (280.0..=800.0).contains(&n)) {
-            return Err("Folder column width must be between 280 and 800 pixels".into());
+        if !width.is_null() && !crate::store::valid_column_width(width) {
+            return Err("Folder column width must be between 240 and 800 pixels or null for automatic width".into());
         }
         let depth = depth(op.get("depth"))?;
         if depth == 0 {
@@ -667,7 +685,11 @@ fn layout_settings_patch(view: &Value, op: &Value) -> Result<Value, String> {
         } else {
             let mut columns = previews(view);
             let column = columns.get_mut(depth - 1).ok_or("The preview column is not open")?;
-            column["width"] = width.clone();
+            if width.is_null() {
+                column.as_object_mut().ok_or("Invalid preview column")?.remove("width");
+            } else {
+                column["width"] = width.clone();
+            }
             patch.insert("previewColumns".into(), json!(columns));
         }
     }
@@ -831,14 +853,24 @@ mod tests {
         let work = format!("{root}\\Work");
         let child = format!("{work}\\Child");
         let leaf = format!("{child}\\Leaf");
-        std::fs::create_dir_all(&leaf).unwrap();
+        let deep = format!("{leaf}\\Deep");
+        std::fs::create_dir_all(&deep).unwrap();
         mutate(&s, "start-in-work", json!({"type":"review","action":"openMain","path":work}));
         mutate(&s, "set-main-position", json!({"type":"review","action":"setView","page":2,"scrollTop":30.5}));
         mutate(&s, "show-child", json!({"type":"review","action":"openPreview","path":child,"depth":0}));
         mutate(&s, "set-child-position", json!({"type":"review","action":"setView","depth":1,"page":3,"scrollTop":14.5}));
         mutate(&s, "set-child-width", json!({"type":"review","action":"setLayout","depth":1,"width":420}));
         mutate(&s, "show-leaf", json!({"type":"review","action":"openPreview","path":leaf,"depth":1}));
-        let backed = mutate(&s, "back-with-previews", json!({"type":"review","action":"backFolder","depth":2}));
+        mutate(&s, "show-deep", json!({"type":"review","action":"openPreview","path":deep,"depth":2}));
+        let closed = mutate(&s, "back-from-second-preview", json!({"type":"review","action":"backFolder","depth":2}));
+        assert_eq!(closed["view"]["path"], work);
+        assert_eq!(closed["view"]["selectedPath"], leaf);
+        assert_eq!(closed["view"]["page"], 2);
+        assert_eq!(closed["view"]["scrollTop"], 30.5);
+        assert_eq!(previews(&closed["view"]), vec![json!({"path":child,"page":3,"scrollTop":14.5,"width":420})]);
+
+        mutate(&s, "reopen-leaf", json!({"type":"review","action":"openPreview","path":leaf,"depth":1}));
+        let backed = mutate(&s, "back-with-previews", json!({"type":"review","action":"backFolder","depth":1}));
         assert_eq!(backed["view"]["path"], *root);
         assert_eq!(backed["view"]["selectedPath"], work);
         let columns = previews(&backed["view"]);

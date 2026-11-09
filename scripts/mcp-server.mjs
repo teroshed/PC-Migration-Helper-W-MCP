@@ -247,7 +247,9 @@ const reviewAction = z.discriminatedUnion('action', [
   z.strictObject({
     action: z.literal('setLayout'),
     depth: previewDepth.optional(),
-    width: z.number().min(280).max(800).optional(),
+    width: z.number().min(240).max(800).nullable().optional(),
+    toolbarHeight: z.number().int().min(44).max(230).nullable().optional(),
+    scanDetailsHeight: z.number().int().min(36).max(220).nullable().optional(),
     layout: z.strictObject({
       drivesWidth: z.number().min(148).max(520).optional(),
       decisionWidth: z.number().min(246).max(520).optional(),
@@ -268,7 +270,7 @@ const reviewAction = z.discriminatedUnion('action', [
   }),
 ]);
 
-register('control_review_view', 'Control the native review window', 'Commit a review action and observe its adoption with get_review_view. centerFolder makes a folder the root and retains its open descendants. backFolder keeps the previous root and branch as previews; at drive home it closes the preview at the supplied depth. openPreview depth is the parent column (0 is main); closePreview depth is the preview to close with its dependent columns. select targets an existing column; reveal may open the target’s parent and can show a labeled row outside the current filter. setView controls search, filter, zero-based page and pixel scrolling. setLayout sets sidebar widths or collapse, toolbar mode, fillDepth (null restores the strip), and the width of a folder column by depth. Only an explicit filter change changes the filter. Use control_ui for the user-directed Follow AI preference.', {
+register('control_review_view', 'Control the native review window', 'Commit a review action and observe its adoption with get_review_view. centerFolder makes a folder the root and retains its open descendants. backFolder in the main column or first preview opens the parent when available and keeps the previous branch. At depth two or deeper, or at drive home, it closes the supplied preview and its descendants. openPreview depth is the parent column (0 is main); closePreview depth is the preview to close with its dependent columns. select targets an existing column; reveal may open the target’s parent and can show a labeled row outside the current filter. setView controls search, filter, zero-based page and pixel scrolling. setLayout sets sidebar widths or collapse, toolbar mode and height, AI scan details height, fillDepth (null restores the strip), and the width of a folder column by depth. Only an explicit filter change changes the filter. Use control_ui for the user-directed Follow AI preference.', {
   ...write,
   command: reviewAction,
 }, 'mutate', input => reviewMutation(input, input.command), false);

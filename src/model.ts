@@ -5,6 +5,12 @@ export const STATUSES = [
   'manual-pending', 'manual-confirmed',
 ] as const;
 export type Status = typeof STATUSES[number];
+export const MIN_COLUMN = 240;
+export const MAX_COLUMN = 800;
+export const MIN_TOOLBAR_HEIGHT = 44;
+export const MAX_TOOLBAR_HEIGHT = 230;
+export const MIN_SCAN_DETAILS_HEIGHT = 36;
+export const MAX_SCAN_DETAILS_HEIGHT = 220;
 export interface PreviewColumn { path: string; page: number; scrollTop: number; width?: number }
 export interface ReviewLayout {
   drivesWidth?: number;
@@ -24,7 +30,9 @@ export interface ViewState {
   recentPaths: string[];
   previewColumns: PreviewColumn[];
   previewScrollLeft: number;
-  browserColumnWidth?: number;
+  browserColumnWidth?: number | null;
+  toolbarHeight?: number | null;
+  scanDetailsHeight?: number | null;
   layout?: ReviewLayout;
   revealPath: string | null;
 }
@@ -90,7 +98,7 @@ export interface GroupTarget {
 }
 export interface GatewayStatus { state: 'running' | 'error' | 'unavailable'; endpoint?: string; instanceId?: string; problem?: string; startedAt?: string }
 export interface Boot { document: Document; volumes: Volume[]; dataPath: string; fixture: boolean; problem: string | null; recoveryAvailable: boolean; gateway: GatewayStatus }
-export interface Listing { path: string; entries: Entry[]; total: number; attention: number; counts: Record<string, number>; observedAt: string | null }
+export interface Listing { path: string; entries: Entry[]; total: number; attention: number; counts: Record<string, number>; observedAt: string | null; nameFitSample?: string[] }
 export interface Details { path: string; effective: Effective; decision: Decision | null; overrides: Decision[]; history: unknown[]; exists: boolean; audit?: AuditStats }
 export interface ScanStatus { status?: string; pending: number; processed?: number; files?: number; bytes?: number; skippedGenerated?: number; currentPath?: string; error?: string }
 export interface AppStatus { scan: ScanStatus; gaps: Array<{ path: string; problem: string; observedAt: string }>; decisionCount: number; mirrorEvidenceStamp?: string }
@@ -150,7 +158,11 @@ export function parseView(value: unknown): ViewState {
       recentPaths: Array.isArray(view.recentPaths) ? view.recentPaths.filter((p): p is string => typeof p === 'string') : [],
       previewColumns: Array.isArray(view.previewColumns) ? view.previewColumns.map(parsePreviewColumn) : [],
       previewScrollLeft: typeof view.previewScrollLeft === 'number' && Number.isFinite(view.previewScrollLeft) ? Math.max(0, view.previewScrollLeft) : 0,
-      browserColumnWidth: typeof view.browserColumnWidth === 'number' && Number.isFinite(view.browserColumnWidth) ? Math.max(280, Math.min(800, view.browserColumnWidth)) : undefined,
+      browserColumnWidth: parseColumnWidth(view.browserColumnWidth),
+      toolbarHeight: typeof view.toolbarHeight === 'number' && Number.isInteger(view.toolbarHeight)
+        && view.toolbarHeight >= MIN_TOOLBAR_HEIGHT && view.toolbarHeight <= MAX_TOOLBAR_HEIGHT ? view.toolbarHeight : undefined,
+      scanDetailsHeight: typeof view.scanDetailsHeight === 'number' && Number.isInteger(view.scanDetailsHeight)
+        && view.scanDetailsHeight >= MIN_SCAN_DETAILS_HEIGHT && view.scanDetailsHeight <= MAX_SCAN_DETAILS_HEIGHT ? view.scanDetailsHeight : undefined,
       layout: parseReviewLayout(view.layout),
   };
 }
@@ -174,7 +186,10 @@ function layoutWidth(value: unknown, min: number): number | undefined {
 function parsePreviewColumn(value: unknown): PreviewColumn {
   const column = record(value);
   if (typeof column.path !== 'string' || typeof column.page !== 'number' || !Number.isSafeInteger(column.page) || column.page < 0 || typeof column.scrollTop !== 'number' || !Number.isFinite(column.scrollTop) || column.scrollTop < 0) throw new Error('The saved folder preview has an unsupported format.');
-  return { path: column.path, page: column.page, scrollTop: column.scrollTop, width: typeof column.width === 'number' && Number.isFinite(column.width) ? Math.max(280, Math.min(800, column.width)) : undefined };
+  return { path: column.path, page: column.page, scrollTop: column.scrollTop, width: parseColumnWidth(column.width) };
+}
+function parseColumnWidth(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(MIN_COLUMN, Math.min(MAX_COLUMN, value)) : undefined;
 }
 export function previewBranch(columns: readonly PreviewColumn[], fromDepth: number, path: string): PreviewColumn[] {
   if (!Number.isSafeInteger(fromDepth) || fromDepth < 0 || fromDepth > columns.length) throw new Error('Invalid preview depth.');
@@ -226,7 +241,10 @@ export function parseListing(value: unknown): Listing {
   const entries = v.entries.map(parseEntry);
   const counts: Record<string, number> = {};
   for (const [key, value] of Object.entries(record(v.counts))) if (typeof value === 'number') counts[key] = value;
-  return { path: v.path, entries, total: v.total, attention: v.attention, counts, observedAt: typeof v.observedAt === 'string' ? v.observedAt : null };
+  const nameFitSample = Array.isArray(v.nameFitSample)
+    ? v.nameFitSample.slice(0, 256).filter((name): name is string => typeof name === 'string') : undefined;
+  return { path: v.path, entries, total: v.total, attention: v.attention, counts, nameFitSample,
+    observedAt: typeof v.observedAt === 'string' ? v.observedAt : null };
 }
 export function parseEntry(value: unknown): Entry {
   const e = record(value);

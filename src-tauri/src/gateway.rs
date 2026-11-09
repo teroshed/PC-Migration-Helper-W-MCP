@@ -864,7 +864,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         "list_suggestions"=>list_records(state,params,true),
         "list_folder"=>{
             let refresh=params.get("refresh").map(|v|v.as_bool().ok_or("refresh must be true or false")).transpose()?.unwrap_or(false);
-            let listing = list_folder_service(state,text(params,"path",None)?,refresh,text(params,"search",Some(""))?,text(params,"filter",Some("all"))?,page(params)?)?;
+            let listing = list_folder_service(state,text(params,"path",None)?,refresh,text(params,"search",Some(""))?,text(params,"filter",Some("all"))?,page(params)?,false)?;
             if let Some(target) = listing["path"].as_str() {
                 state.review.activity("read", target, None);
             }

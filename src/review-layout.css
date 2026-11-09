@@ -100,12 +100,13 @@
 
 .review-layout .review-resize-grip.resize-x {
   inset-block: 0;
-  width: 10px;
+  width: var(--column-grip-width, 10px);
   cursor: ew-resize;
 }
 
 .review-layout .review-resize-grip.resize-y {
   position: relative;
+  flex-shrink: 0;
   width: 100%;
   height: 8px;
   cursor: ns-resize;
@@ -161,11 +162,16 @@
 .review-resize-grip.resize-y[data-edge]::after { bottom: 100%; }
 
 .review-layout .folder-column {
+  --column-grip-width: 10px;
   position: relative;
   container-type: inline-size;
   flex-basis: var(--drag-column-width, var(--column-width, 360px));
   width: var(--drag-column-width, var(--column-width, 360px));
-  min-width: 280px;
+  min-width: 240px;
+}
+
+.review-layout .folder-column:has(> .review-resize-grip) {
+  padding-inline-end: var(--column-grip-width);
 }
 
 .review-layout .folder-column[data-fill] {
@@ -187,9 +193,22 @@
 }
 
 .review-toolbar {
+  display: flex;
+  flex-direction: column;
+  block-size: var(--drag-toolbar-height, var(--saved-toolbar-height, auto));
   min-width: 0;
   flex-shrink: 0;
 }
+
+.review-toolbar-content {
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.review-toolbar > .review-resize-grip { margin-block-start: auto; }
+
+.review-toolbar-content:has(.review-filter-options) { overflow: visible; }
 
 .review-toolbar [hidden] { display: none; }
 
@@ -227,7 +246,30 @@
 
 .review-layout .review-toolbar[data-mode='search'] .browser-tools { padding-top: 4px; }
 
-.review-layout .column-entry-list .entry-name > strong { font-size: clamp(.85rem, 3.6cqi, .93rem); }
+.review-layout .column-entry-list .entry-name > strong { font-size: .85rem; }
+
+@keyframes review-name-marquee {
+  0%, 15% { transform: translateX(0); }
+  85%, 100% { transform: translateX(calc(-1 * var(--name-overflow))); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .entry-select:is(:hover, :focus-visible) .entry-name-label[data-overflow='true'] {
+    text-overflow: clip;
+  }
+  .entry-select:is(:hover, :focus-visible) .entry-name-label[data-overflow='true'] > span {
+    display: inline-block;
+    animation: review-name-marquee var(--name-duration) linear both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .entry-select:focus-visible .entry-name-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
 .review-layout .column-entry-list .entry-row { min-block-size: 66px; }
 
 @media (max-width: 1200px) {

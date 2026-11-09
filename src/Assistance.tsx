@@ -4,12 +4,13 @@ import { invoke } from '@tauri-apps/api/core';
 import type { UiControlRef } from './UIBridge';
 import { Check, ChevronDown, FolderTree, Pause, Play, ScanSearch, Sparkles } from 'lucide-react';
 import { DECISION_CHOICES, LABELS, StatusBadge, EMPTY_EFFECTIVE, decisionChoiceLabel } from './classifications';
-import { isStatus, parentPath, readableBytes, record } from './model';
+import { MIN_SCAN_DETAILS_HEIGHT, MAX_SCAN_DETAILS_HEIGHT, isStatus, parentPath, readableBytes, record } from './model';
 import type { Operation, Status } from './model';
 import { inventoryElapsed, inventoryProgressLabel, parseInventoryProgress } from './assistance-progress';
 import type { InventoryProgress } from './assistance-progress';
 import { OverflowIndicators } from './OverflowIndicators';
 import { reviewPathKey } from './ReviewActivity';
+import { ResizeGrip } from './ReviewLayout';
 import './assistance.css';
 
 interface Question {
@@ -133,7 +134,7 @@ function parseInterview(input: unknown): Interview {
 }
 
 export function AssistanceInterview({ currentPath, revision, scanSignal, readOnly, onEdit, controlRef,
-  footerHost, inspectQuestion, browser, deferMarked, onOpenMirror }: {
+  footerHost, inspectQuestion, browser, deferMarked, onOpenMirror, onResizeScanDetails }: {
   currentPath: string;
   revision: number;
   scanSignal: string | undefined;
@@ -145,6 +146,7 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
   browser: NonNullable<UiControlRef['current']>;
   deferMarked: boolean;
   onOpenMirror: (path: string) => void;
+  onResizeScanDetails: (height: number) => void;
 }) {
   const [interview, setInterview] = useState<Interview | null>(null);
   const [reading, setReading] = useState(true);
@@ -334,7 +336,7 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
   return <section id="inline-assistance" className="assistance-interview inline-assistance" aria-label="AI Assistance" aria-busy={reading || working}>
     <div className="assistance-topline">
       <div className="assistance-scope">
-        {question ? <h3 id="assistance-question-title" ref={heading} tabIndex={-1}>{question.prompt}</h3>
+        {question ? <h3 id="assistance-question-title" ref={heading} tabIndex={-1} title={question.prompt}>{question.prompt}</h3>
           : <strong>AI Assistance</strong>}
         <span title={scope ?? currentPath}>{scope ? 'Review scope' : 'Current folder'} · {scope ?? currentPath}</span>
       </div>
@@ -449,7 +451,7 @@ export function AssistanceInterview({ currentPath, revision, scanSignal, readOnl
     {footerHost && createPortal(<div className="assistance-footer" aria-label="Assistance and inventory controls">
       <InventoryDock interview={interview} detailsOpen={scanDetailsOpen} locked={locked}
         deferMarked={deferMarked} onPriorityChange={value => edit({ type: 'inventoryPriority', deferMarked: value })}
-        onDetailsChange={changeScanDetails} onScanControl={scan}/>
+        onDetailsChange={changeScanDetails} onScanControl={scan} onResizeDetails={onResizeScanDetails}/>
       {!question ? scopeActions : choosing ? <div className="assistance-actions assistance-review-actions">
         <button onClick={() => chooseOverride(false)}>Back</button>
         {changedChoice && <>
@@ -499,7 +501,7 @@ function reviewStage(interview: Interview | null): string {
     ? 'Questions finished · items remain' : 'Review complete';
 }
 
-function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriorityChange, onDetailsChange, onScanControl }: {
+function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriorityChange, onDetailsChange, onScanControl, onResizeDetails }: {
   interview: Interview | null;
   detailsOpen: boolean;
   locked: boolean;
@@ -507,6 +509,7 @@ function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriority
   onPriorityChange: (value: boolean) => void;
   onDetailsChange: (open: boolean) => void;
   onScanControl: (mode: 'pause' | 'resume') => void;
+  onResizeDetails: (height: number) => void;
 }) {
   const phase = interview?.scanPhase;
   const progress = interview?.progress;
@@ -523,12 +526,14 @@ function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriority
   const label = phase === 'running' ? 'Discovering folders' : phase === 'paused' ? 'Inventory paused'
     : phase === 'complete' ? 'Inventory finished' : phase === 'error' ? 'Inventory needs attention' : 'Metadata inventory idle';
   return <section className="assistance-scan-dock" aria-label="Background inventory">
+    {detailsOpen && <ResizeGrip axis="y" direction={-1} controls="assistance-scan-details"
+      label="Resize AI Assistance scan details" min={MIN_SCAN_DETAILS_HEIGHT} max={MAX_SCAN_DETAILS_HEIGHT}
+      size={() => detailScroll.current?.getBoundingClientRect().height ?? MIN_SCAN_DETAILS_HEIGHT}
+      target={() => detailScroll.current} variable="--drag-scan-details-height" onCommit={onResizeDetails}/>}
     <div className="assistance-scan-main">
       <div className="assistance-scan-caption">
         <strong>{label}</strong>
-        {progress && phase && <span>{progress.processed.toLocaleString()} folders
-          {phase === 'running' && progress.workers > 0 && <> · {progress.workers} workers</>}
-        </span>}
+        {progress && phase && <span>{progress.processed.toLocaleString()} folders · {progress.workers} workers</span>}
       </div>
       <div className="assistance-scan-controls">
         <button aria-expanded={detailsOpen} aria-controls="assistance-scan-details"
@@ -551,31 +556,29 @@ function InventoryDock({ interview, detailsOpen, locked, deferMarked, onPriority
     <div id="assistance-scan-details" className="assistance-scan-details-frame" hidden={!detailsOpen}>
       {detailsOpen && <>
         <div className="assistance-scan-details" ref={detailScroll} tabIndex={0} role="region" aria-label="Inventory details">
-          <label className="assistance-inventory-priority">
-            <input type="checkbox" checked={deferMarked} disabled={locked} onChange={event => onPriorityChange(event.target.checked)}/>
-            Scan marked folders last
-          </label>
-          <div>
-            {progress && phase ? <>
-              <dl>
-                <div><dt>Folders processed</dt><dd>{progress.processed.toLocaleString()}</dd></div>
-                <div><dt>Queued</dt><dd>{progress.pending?.toLocaleString() ?? 'Unknown'}</dd></div>
-                <div><dt>Files found</dt><dd>{progress.files.toLocaleString()}</dd></div>
-                <div><dt>Logical size</dt><dd>{readableBytes(progress.bytes)}</dd></div>
-                <div><dt>Active folders</dt><dd>{progress.active.toLocaleString()}</dd></div>
-                <div><dt>Workers</dt><dd>{progress.workers.toLocaleString()}</dd></div>
-                <div><dt>Generated skipped</dt><dd>{(interview?.scanSkippedGenerated ?? 0).toLocaleString()}</dd></div>
-                <div><dt>Coverage gaps</dt><dd>{progress.gaps.toLocaleString()}</dd></div>
-              </dl>
-              {progress.currentPath && <p className="assistance-progress-path">
-                <span>Current path</span> {progress.currentPath}
-              </p>}
-              <p className="assistance-scan-note">
-                {elapsed && <>{elapsed} since scan started · </>}
-                {phase === 'running' ? 'Final total and finish time are unknown during discovery.' : 'Metadata inventory.'}
-              </p>
-              {phase === 'error' && interview?.scanProblem && <p className="assistance-error">{interview.scanProblem}</p>}
-            </> : <p>Start a metadata scan to see folder counts and coverage here.</p>}
+          {progress && phase ? <>
+            <dl>
+              <div><dt>Queued</dt><dd>{progress.pending?.toLocaleString() ?? 'Unknown'}</dd></div>
+              <div><dt>Files found</dt><dd>{progress.files.toLocaleString()}</dd></div>
+              <div><dt>Logical size</dt><dd>{readableBytes(progress.bytes)}</dd></div>
+              <div><dt>Active folders</dt><dd>{progress.active.toLocaleString()}</dd></div>
+              <div><dt title="Generated folders skipped">Gen. skipped</dt><dd>{(interview?.scanSkippedGenerated ?? 0).toLocaleString()}</dd></div>
+              <div><dt>Coverage gaps</dt><dd>{progress.gaps.toLocaleString()}</dd></div>
+            </dl>
+            {progress.currentPath && <p className="assistance-progress-path">
+              <span>Current path</span> {progress.currentPath}
+            </p>}
+            {phase === 'error' && interview?.scanProblem && <p className="assistance-error">{interview.scanProblem}</p>}
+          </> : <p>Start a metadata scan to see folder counts and coverage here.</p>}
+          <div className="assistance-scan-notes">
+            {progress && phase && <p className="assistance-scan-note">
+              {elapsed && <>{elapsed} elapsed · </>}
+              {phase === 'running' ? 'Total and ETA unknown' : 'Metadata inventory'}
+            </p>}
+            <label className="assistance-inventory-priority">
+              <input type="checkbox" checked={deferMarked} disabled={locked} onChange={event => onPriorityChange(event.target.checked)}/>
+              Scan marked folders last
+            </label>
           </div>
         </div>
         <OverflowIndicators targetRef={detailScroll} axis="vertical"/>

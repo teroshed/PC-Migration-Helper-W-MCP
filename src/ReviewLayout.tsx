@@ -1,15 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { KeyboardEvent, PointerEvent, ReactNode } from 'react';
+import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { restoreReviewScroll } from './ReviewActivity';
 
-export const MIN_COLUMN = 280;
-export const MAX_COLUMN = 800;
 export const MIN_DRIVES = 148;
 export const MIN_DECISION = 246;
 export const MAX_SIDEBAR = 520;
 
-type Edge = (event: PointerEvent<HTMLDivElement>, rawSize: number) => boolean;
+type Edge = (event: PointerEvent, rawSize: number) => boolean;
 
 interface GripProps {
   label: string;
@@ -25,6 +23,7 @@ interface GripProps {
   edge?: Edge;
   edgeLabel?: string;
   edgeShortcut?: boolean;
+  onAutoFit?: () => void;
   onCommit: (size: number, edge: boolean) => void;
 }
 
@@ -40,21 +39,23 @@ interface Drag {
   app: HTMLElement | null;
   strip: HTMLElement | null;
   scrollLeft: number;
+  listeners: AbortController;
 }
 
-export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x', step = 16, size, target, variable, edge, edgeLabel, edgeShortcut, onCommit }: GripProps) {
+export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x', step = 16, size, target, variable, edge, edgeLabel, edgeShortcut, onAutoFit, onCommit }: GripProps) {
   const drag = useRef<Drag | null>(null);
   const frame = useRef<number | null>(null);
   const [preview, setPreview] = useState<{ size: number; edge: boolean } | null>(null);
   const [committed, setCommitted] = useState(min);
   const bound = (value: number): number => Math.round(Math.max(min, Math.min(max, value)));
-  const coordinate = (event: PointerEvent<HTMLDivElement>): number => axis === 'x' ? event.clientX : event.clientY;
+  const coordinate = (event: PointerEvent | ReactPointerEvent<HTMLDivElement>): number => axis === 'x' ? event.clientX : event.clientY;
 
   function reset(): void {
     if (frame.current !== null) cancelAnimationFrame(frame.current);
     frame.current = null;
     const active = drag.current;
     drag.current = null;
+    active?.listeners.abort();
     if (variable && active?.target) {
       if (active.previous) active.target.style.setProperty(variable, active.previous);
       else active.target.style.removeProperty(variable);
@@ -68,7 +69,7 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
     if (!drag.current) setCommitted(bound(size()));
   });
 
-  function start(event: PointerEvent<HTMLDivElement>): void {
+  function start(event: ReactPointerEvent<HTMLDivElement>): void {
     const app = event.currentTarget.closest<HTMLElement>('.review-layout');
     if (event.button !== 0 || drag.current || app?.hasAttribute('data-resize-active')) return;
     event.preventDefault();
@@ -77,16 +78,21 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
     const element = target?.() ?? null;
     const initial = size();
     const strip = app?.querySelector<HTMLElement>('.folder-columns-strip') ?? null;
+    const listeners = new AbortController();
     app?.setAttribute('data-resize-active', '');
     drag.current = {
       pointer: event.pointerId, start: coordinate(event), initial, size: initial,
       edge: false, moved: false, target: element,
       previous: variable ? element?.style.getPropertyValue(variable) ?? '' : '',
-      app, strip, scrollLeft: strip?.scrollLeft ?? 0,
+      app, strip, scrollLeft: strip?.scrollLeft ?? 0, listeners,
     };
+    const options = { capture: true, signal: listeners.signal };
+    window.addEventListener('pointermove', move, options);
+    window.addEventListener('pointerup', event => stop(event, true), options);
+    window.addEventListener('pointercancel', event => stop(event, false), options);
   }
 
-  function sample(event: PointerEvent<HTMLDivElement>): Drag | null {
+  function sample(event: PointerEvent): Drag | null {
     const active = drag.current;
     if (!active || active.pointer !== event.pointerId) return null;
     const delta = coordinate(event) - active.start;
@@ -97,7 +103,7 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
     return active;
   }
 
-  function move(event: PointerEvent<HTMLDivElement>): void {
+  function move(event: PointerEvent): void {
     const active = sample(event);
     if (!active?.moved || frame.current !== null) return;
     frame.current = requestAnimationFrame(() => {
@@ -107,7 +113,7 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
     });
   }
 
-  function stop(event: PointerEvent<HTMLDivElement>, commit: boolean): void {
+  function stop(event: PointerEvent, commit: boolean): void {
     const active = commit ? sample(event) : drag.current;
     if (!active || active.pointer !== event.pointerId) return;
     reset();
@@ -129,6 +135,11 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
       onCommit(size(), true);
       return;
     }
+    if (event.key === 'Home' && event.ctrlKey && onAutoFit) {
+      event.preventDefault();
+      onAutoFit();
+      return;
+    }
     if (event.ctrlKey || event.altKey || event.metaKey) return;
     const increase = axis === 'x' ? 'ArrowRight' : 'ArrowDown';
     const decrease = axis === 'x' ? 'ArrowLeft' : 'ArrowUp';
@@ -146,12 +157,13 @@ export function ResizeGrip({ label, controls, min, max, direction = 1, axis = 'x
     aria-label={label} aria-controls={controls} aria-orientation={axis === 'x' ? 'vertical' : 'horizontal'}
     aria-valuemin={min} aria-valuemax={max} aria-valuenow={preview?.size ?? committed}
     aria-valuetext={preview?.edge ? edgeLabel : undefined}
-    aria-keyshortcuts={edgeShortcut ? 'Control+End' : undefined}
+    aria-keyshortcuts={onAutoFit ? 'Control+Home Control+End' : edgeShortcut ? 'Control+End' : undefined}
     data-dragging={preview ? 'true' : undefined} data-edge={preview?.edge ? 'true' : undefined}
     data-edge-label={edgeLabel}
-    title={label + '. Drag or use the arrow keys.' + (edgeShortcut ? ' Ctrl+End fills the folder pane.' : '')}
-    onPointerDown={start} onPointerMove={move} onPointerUp={event => stop(event, true)}
-    onPointerCancel={event => stop(event, false)} onLostPointerCapture={event => stop(event, false)}
+    title={label + '. Drag or use the arrow keys.' + (edgeShortcut ? ' Ctrl+End fills the folder pane.' : '') +
+      (onAutoFit ? ' Double-click or Ctrl+Home to fit names.' : '')}
+    onPointerDown={start} onLostPointerCapture={event => stop(event.nativeEvent, false)}
+    onDoubleClick={onAutoFit}
     onKeyDown={key}/>;
 }
 

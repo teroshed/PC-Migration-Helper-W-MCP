@@ -3,17 +3,36 @@ import type { RefObject, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Check, ChevronLeft, ChevronRight, File, Focus, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, Sparkles, Square, SquareCheck, TriangleAlert, X } from 'lucide-react';
-import { baseName, parentPath, parseEntry } from './model';
+import { MAX_COLUMN, MIN_COLUMN, baseName, parentPath, parseEntry } from './model';
 import type { Entry, Listing, PreviewColumn, Status } from './model';
 import type { FolderReadCache, FolderReadContext } from './folder-read-cache';
 import { isStaleRead } from './read-cache';
 import { DECISION_CHOICES, DESCRIPTIONS, ICONS, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, StatusBadge } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
-import { MAX_COLUMN, MIN_COLUMN, ResizeGrip } from './ReviewLayout';
+import { ResizeGrip } from './ReviewLayout';
 import { allocatedLabel, auditDescription, AuditProgress } from './Audit';
 import { isRestoredScroll, restoreReviewScroll, reviewActivityLabel, reviewPathKey, showReviewRow } from './ReviewActivity';
 import type { ActivityRow, ReviewActivitySnapshot } from './ReviewActivity';
+
+const AUTO_COLUMN_MAX = 520;
+let nameMeasure: CanvasRenderingContext2D | null | undefined;
+
+function fittedColumnWidth(column: HTMLElement, listing: Listing): number {
+  const folderLabel = column.querySelector<HTMLElement>('[data-entry-kind=folder] .entry-name-label');
+  const label = folderLabel ?? column.querySelector<HTMLElement>('.entry-name-label');
+  if (!label || !listing.entries.length) return MIN_COLUMN;
+  const measure = nameMeasure ??= document.createElement('canvas').getContext('2d');
+  if (!measure) return 320;
+  const font = getComputedStyle(label);
+  measure.font = `${font.fontWeight} ${font.fontSize} ${font.fontFamily}`;
+  const names = listing.nameFitSample ?? listing.entries.map(entry => entry.name);
+  const widths = names.map(name => measure.measureText(name).width).sort((left, right) => left - right);
+  const percentile = widths[Math.ceil(widths.length * .95) - 1] ?? 0;
+  const centerButton = folderLabel ? 0 : column.querySelector<HTMLElement>('.entry-more')?.offsetWidth ?? 0;
+  const chrome = column.offsetWidth - label.clientWidth + centerButton;
+  return Math.max(MIN_COLUMN, Math.min(AUTO_COLUMN_MAX, Math.ceil(percentile + chrome + 2)));
+}
 
 export interface RowMenuTarget { id: string; entry: Entry; x: number; y: number; invoker: HTMLElement | null }
 export interface RowSuggestion { label: string; reason: string; source: 'ai' | 'local' }
@@ -44,7 +63,7 @@ export interface ColumnActions {
   onCloseByKey: (depth: number) => void;
   onEscapeRows: () => void;
   onFirstAttention: (path: string, depth: number) => void;
-  onResizeColumn: (depth: number, width: number, fill: boolean) => void;
+  onResizeColumn: (depth: number, width: number | null, fill: boolean) => void;
   fillDepth: number | null;
   onMenu: (target: RowMenuTarget) => void;
   onReviewFolder: (path: string) => void;
@@ -59,7 +78,7 @@ interface DirectoryColumnProps extends ColumnActions {
   path: string;
   depth: number;
   page: number;
-  width: number;
+  width?: number | null;
   listing: Listing | null;
   loading: boolean;
   scrollTop: number;
@@ -80,6 +99,8 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
   const columnRef = useRef<HTMLElement>(null);
   const listRef = props.listRef ?? ownRef;
   const listing = props.listing?.path.toLowerCase() === props.path.toLowerCase() ? props.listing : null;
+  const [fittedWidth, setFittedWidth] = useState(MIN_COLUMN);
+  const width = props.width ?? fittedWidth;
   const pages = Math.max(1, Math.ceil((listing?.total ?? 0) / 100));
   const columnKey = reviewPathKey(props.path);
   const revealPath = props.revealPath;
@@ -98,6 +119,12 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
   const folderActivity = props.reviewActivity.paths.get(columnKey);
   const folderActivityLabel = reviewActivityLabel(folderActivity, props.reviewActivity.nowMs);
   const { depth, path, knownSearch, onRowsDisplayed } = props;
+
+  useLayoutEffect(() => {
+    const column = columnRef.current;
+    if (props.width != null || props.fillDepth === depth || !column || !listing || knownSearch) return;
+    setFittedWidth(fittedColumnWidth(column, listing));
+  }, [props.width, props.fillDepth, depth, listing, knownSearch]);
 
   useLayoutEffect(() => {
     const paths = knownSearch ? [] : (listing?.entries ?? []).map(entry => entry.path);
@@ -197,7 +224,7 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       if (!event.repeat) props.onCloseByKey(props.depth);
     }
   }
-  return <section ref={columnRef} id={columnId} className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-fill={props.fillDepth === props.depth ? 'true' : undefined} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${props.width}px` } as React.CSSProperties}>
+  return <section ref={columnRef} id={columnId} className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-fill={props.fillDepth === props.depth ? 'true' : undefined} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${width}px` } as React.CSSProperties}>
     <div className="column-heading"><button ref={headingRef} className="column-review" onKeyDown={headingKey} aria-label={`Review folder ${props.path}`} data-review-activity={folderActivity?.pulse?.kind} title={`Review this folder: ${props.path}${folderActivityLabel ? ` · ${folderActivityLabel}` : ''}`} onClick={() => props.onReviewFolder(props.path)}><FolderOpen size={15}/><span><small>{props.depth ? `PREVIEW ${props.depth}` : 'CURRENT LOCATION'}{folderActivityLabel && ` · ${folderActivityLabel}`}</small><strong>{baseName(props.path)}</strong></span>{folderActivity?.pulse && <i key={folderActivity.pulse.sequence} className="review-activity-pulse" aria-hidden="true"/>}</button>{props.loading && <LoaderCircle size={14} className="spin" aria-label="Reading folder"/>}<button className="column-icon" title="Refresh immediate contents" aria-label={`Refresh column ${props.path}`} disabled={props.loading} onClick={props.onRefresh}><RefreshCw size={14}/></button>{props.onClose && <button className="column-icon" aria-label={`Close preview ${props.depth} and deeper previews`} onClick={props.onClose}><X size={15}/></button>}</div>
     <div className="column-path" title={props.path}>{props.path}</div>
     <div className="column-labels"><span>{props.knownSearch ? 'KNOWN FOLDERS' : 'FOLDER / FILE'}</span><span>{props.suggestionFor ? 'DECISION / SUGGESTION' : 'DECISION · ⋯ TO MARK'}</span></div>
@@ -223,11 +250,12 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
     </div><OverflowIndicators targetRef={listRef} axis="vertical" refreshKey={pinned ?? listing}/></div>
     <div className="column-footer"><span>{props.loading ? 'Reading…' : `${(listing?.total ?? 0).toLocaleString()} items`}</span>{!props.knownSearch && <div className="pagination"><button aria-label={`Previous page in ${props.path}`} disabled={!props.page || props.loading} onClick={() => props.onPage(Math.max(0, props.page - 1))}><ChevronLeft size={15}/></button><span>{props.page + 1} / {pages}</span><button aria-label={`Next page in ${props.path}`} disabled={props.page + 1 >= pages || props.loading} onClick={() => props.onPage(props.page + 1)}><ChevronRight size={15}/></button></div>}</div>
     {props.fillDepth !== props.depth && <ResizeGrip label={`Resize folder column ${props.depth + 1}`}
-      controls={columnId} min={MIN_COLUMN} max={MAX_COLUMN} size={() => columnRef.current?.getBoundingClientRect().width ?? props.width}
+      controls={columnId} min={MIN_COLUMN} max={MAX_COLUMN} size={() => columnRef.current?.getBoundingClientRect().width ?? width}
       target={() => columnRef.current} variable="--drag-column-width" edgeLabel="Release to fill the folder pane"
+      onAutoFit={() => props.onResizeColumn(props.depth, null, false)}
       edge={(event, raw) => {
         const frame = columnRef.current?.closest('.folder-strip-frame')?.getBoundingClientRect();
-        return Boolean(frame && raw > props.width + 6 && event.clientX >= frame.right - 46);
+        return Boolean(frame && raw > width + 6 && event.clientX >= frame.right - 46);
       }}
       onCommit={(width, fill) => props.onResizeColumn(props.depth, width, fill)}/>}
   </section>;
@@ -273,7 +301,7 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
     }).catch(cause => { if (active) { if (!isStaleRead(cause)) { if (foreground) setListing(null); setError(String(cause)); } setLoading(false); } }).finally(() => props.onReadPendingChange(-1));
     return () => { active = false; };
   }, [props.column.path, props.column.page, props.refreshToken, refresh]);
-  return <DirectoryColumn {...props} path={props.column.path} width={props.column.width ?? 360} page={props.column.page} scrollTop={props.column.scrollTop} listing={listing} loading={loading} error={error} listRef={listRef} onScroll={scrollTop => props.onChange({ scrollTop })} onPage={page => props.onChange({ page, scrollTop: 0 })} onRefresh={() => { forceRefresh.current = true; setRefresh(value => value + 1); }}/>
+  return <DirectoryColumn {...props} path={props.column.path} width={props.column.width} page={props.column.page} scrollTop={props.column.scrollTop} listing={listing} loading={loading} error={error} listRef={listRef} onScroll={scrollTop => props.onChange({ scrollTop })} onPage={page => props.onChange({ page, scrollTop: 0 })} onRefresh={() => { forceRefresh.current = true; setRefresh(value => value + 1); }}/>
 }
 
 interface EntryRowProps {
@@ -299,6 +327,20 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
   const activityLabel = reviewActivityLabel(activity, nowMs);
   const reviewLabel = [pinned ? 'Revealed · outside current results' : null, activityLabel].filter(Boolean).join(' · ');
   const suggestionLabel = suggestion ? (suggestion.source === 'ai' ? 'AI suggestion' : 'Local suggestion') : null;
+  const nameLabel = useRef<HTMLElement>(null);
+  function prepareNameMarquee(): void {
+    const label = nameLabel.current;
+    const text = label?.firstElementChild;
+    if (!label || !text) return;
+    const overflow = Math.ceil(text.getBoundingClientRect().width - label.clientWidth);
+    if (overflow > 1) {
+      label.style.setProperty('--name-overflow', `${overflow}px`);
+      label.style.setProperty('--name-duration', `${Math.max(3, 2 + overflow / 40)}s`);
+      label.dataset.overflow = 'true';
+    } else {
+      delete label.dataset.overflow;
+    }
+  }
   function menu(invoker: HTMLElement, x?: number, y?: number): void {
     const rectangle = invoker.getBoundingClientRect();
     onMenu({ id: crypto.randomUUID(), entry, x: x ?? rectangle.right, y: y ?? rectangle.bottom, invoker });
@@ -320,8 +362,8 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
       aria-expanded={entry.kind === 'folder' ? previewing : undefined}
       aria-label={`${entry.kind === 'folder' ? 'Preview folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${suggestion ? `, ${suggestionLabel}: ${suggestion.label}` : ''}${reviewLabel ? `, ${reviewLabel}` : ''}`}
       title={suggestion ? `${entry.path}\n${suggestionLabel}: ${suggestion.reason}` : `${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`}
-      onClick={entry.kind === 'folder' ? onPreview : onSelect}>
-      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span>
+      onFocus={prepareNameMarquee} onPointerEnter={prepareNameMarquee} onClick={entry.kind === 'folder' ? onPreview : onSelect}>
+      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong className="entry-name-label" ref={nameLabel}><span>{entry.name}</span></strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span>
       {suggestion && <span className="assistance-row-suggestion" data-source={suggestion.source} title={suggestion.reason}>
         {suggestion.source === 'ai' && <Sparkles size={11} aria-hidden="true"/>}
         <span>{suggestionLabel} · {suggestion.label}</span>

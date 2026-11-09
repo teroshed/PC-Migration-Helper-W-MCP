@@ -11,7 +11,7 @@ import {
   TriangleAlert, Undo2, X, CircleHelp, Trash2, ChevronsDown, ChevronsUp,
 } from 'lucide-react';
 import {
-  MutationQueue, STATUSES, baseName, parentPath, parseDetails, parseDocument,
+  MutationQueue, STATUSES, MIN_TOOLBAR_HEIGHT, MAX_TOOLBAR_HEIGHT, baseName, parentPath, parseDetails, parseDocument,
   parseEntry, parseView, readableBytes, record, normalizeReviewPath, isStatus, resolveDecisionPath, parseGateway, previewBranch, closePreviewBranch,
 } from './model';
 import type {
@@ -76,8 +76,10 @@ function isEditingField(): boolean {
   return focus.isContentEditable || ['TEXTAREA', 'SELECT'].includes(focus.tagName);
 }
 function savedViewFields(view: ViewState): Partial<ViewState> {
-  const { path, selectedPath, search, filter, page, scrollTop, recentPaths, previewColumns, previewScrollLeft, browserColumnWidth, revealPath, layout } = view;
-  return { path, selectedPath, search, filter, page, scrollTop, recentPaths, previewColumns, previewScrollLeft, browserColumnWidth, revealPath, layout };
+  const { path, selectedPath, search, filter, page, scrollTop, recentPaths, previewColumns,
+    previewScrollLeft, browserColumnWidth, toolbarHeight, scanDetailsHeight, revealPath, layout } = view;
+  return { path, selectedPath, search, filter, page, scrollTop, recentPaths, previewColumns,
+    previewScrollLeft, browserColumnWidth, toolbarHeight, scanDetailsHeight, revealPath, layout };
 }
 
 function parseBoot(value: unknown): Boot {
@@ -488,7 +490,9 @@ export default function App() {
     setView(next);
     if (localFollowView.current) {
       const resizedPreview = patch.previewColumns?.some((column, index) => column.width !== current.previewColumns[index]?.width);
-      if (!semantic && !resizedPreview && patch.browserColumnWidth === undefined && patch.layout === undefined) return;
+      const resizedLayout = patch.browserColumnWidth !== undefined || patch.toolbarHeight !== undefined ||
+        patch.scanDetailsHeight !== undefined || patch.layout !== undefined;
+      if (!semantic && !resizedPreview && !resizedLayout) return;
       localFollowView.current = false;
       patch = savedViewFields(next);
     }
@@ -503,7 +507,11 @@ export default function App() {
   function setToolbar(mode: NonNullable<ReviewLayout['toolbar']>, focus = false): void {
     if (mode === toolbar) return;
     if (focus) toolbarFocus.current = mode;
-    setLayout({ toolbar: mode });
+    updateView({ layout: { ...viewRef.current?.layout, toolbar: mode }, toolbarHeight: null }, true);
+  }
+  function resizeToolbar(height: number): void {
+    const mode = height <= 56 ? 'compact' : toolbar === 'compact' ? 'expanded' : toolbar;
+    updateView({ layout: { ...viewRef.current?.layout, toolbar: mode }, toolbarHeight: height }, true);
   }
   function changeAssistance(open: boolean): void {
     if (open && window.innerHeight <= 740 && toolbar === 'expanded') setToolbar('compact');
@@ -513,12 +521,12 @@ export default function App() {
     if (toolbar === 'expanded' || toolbar === 'search') searchRef.current?.focus();
     else setToolbar('search', true);
   }
-  function resizeColumn(depth: number, width: number, fill: boolean): void {
+  function resizeColumn(depth: number, width: number | null, fill: boolean): void {
     if (fill) {
       columnFocus.current = 'restore';
       setLayout({ fillDepth: depth });
     } else if (depth === 0) updateView({ browserColumnWidth: width }, true);
-    else changePreview(depth, { width });
+    else changePreview(depth, { width: width ?? undefined });
   }
   function navigate(path: string, selection: string | null = null, keepFilter = false, movement?: 'center' | 'back'): string | null {
     const current = viewRef.current;
@@ -564,6 +572,10 @@ export default function App() {
     if (folder) keyboard.requestFocus({ depth: 0, folder, target: 'heading', preventScroll: true });
   }
   function backFolder(depth = 0): void {
+    if (depth > 1) {
+      closePreviewByKey(depth);
+      return;
+    }
     const current = viewRef.current;
     if (!current) return;
     const parent = parentPath(current.path);
@@ -785,7 +797,7 @@ export default function App() {
     const current = viewRef.current;
     if (!current || !current.previewColumns[depth - 1]) return;
     const columns = current.previewColumns.map((column, index) => index === depth - 1 ? { ...column, ...patch } : column);
-    updateView({ previewColumns: columns }, patch.page !== undefined || patch.width !== undefined);
+    updateView({ previewColumns: columns }, patch.page !== undefined || 'width' in patch);
   }
   function closePreview(depth: number): void {
     const current = viewRef.current;
@@ -1447,7 +1459,7 @@ export default function App() {
   }
   const assistanceBrowser: UiParticipant = {
     read: () => ({ root: view.path, selectedPath, columns: [
-      { path: view.path, page: view.page, width: view.browserColumnWidth ?? 360, scrollTop: view.scrollTop },
+      { path: view.path, page: view.page, width: view.browserColumnWidth ?? undefined, scrollTop: view.scrollTop },
       ...view.previewColumns,
     ], menuPath: rowMenu?.entry.path ?? null }),
     execute: async command => {
@@ -1535,6 +1547,8 @@ export default function App() {
   const layoutStyle = {
     '--saved-drives-width': layout.drivesWidth === undefined ? undefined : layout.drivesWidth + 'px',
     '--saved-decision-width': layout.decisionWidth === undefined ? undefined : layout.decisionWidth + 'px',
+    '--saved-toolbar-height': view.toolbarHeight == null ? undefined : view.toolbarHeight + 'px',
+    '--saved-scan-details-height': view.scanDetailsHeight == null ? undefined : view.scanDetailsHeight + 'px',
   } as CSSProperties;
   return <div className="app-shell review-layout" ref={appRef} style={layoutStyle}
     data-drives-collapsed={layout.drivesCollapsed || undefined} data-decision-collapsed={layout.decisionCollapsed || undefined}>
@@ -1596,6 +1610,7 @@ export default function App() {
           </section>
         </div>
         <div ref={toolbarRef} id="review-toolbar" className="review-toolbar" data-mode={toolbar}>
+          <div className="review-toolbar-content">
           {toolbar !== 'expanded' && <div className="review-compact-tools">
             <button ref={compactTrigger} aria-expanded={toolbar === 'path'} aria-controls="review-path-tools"
               onClick={() => toolbar === 'path' ? setToolbar('compact') : setToolbar('path', true)}><FolderOpen size={15}/>Path</button>
@@ -1622,15 +1637,18 @@ export default function App() {
             updateView({ filter, page: 0, scrollTop: 0 }, true);
           }} onMoveLeft={() => knownButtonRef.current?.focus()} onEscape={focusDrive}/>
         </div>
-          <ResizeGrip axis="y" controls="review-toolbar" label="Resize path and search tools" min={36} max={230} step={230}
-            size={() => toolbarRef.current?.getBoundingClientRect().height ?? 36}
+          </div>
+          <ResizeGrip axis="y" controls="review-toolbar" label="Resize path and search tools" min={MIN_TOOLBAR_HEIGHT} max={MAX_TOOLBAR_HEIGHT}
+            size={() => toolbarRef.current?.getBoundingClientRect().height ?? MIN_TOOLBAR_HEIGHT}
+            target={() => toolbarRef.current} variable="--drag-toolbar-height"
             edge={(_, raw) => raw <= 56} edgeLabel="Release for compact path and search tools"
-            onCommit={height => setToolbar(height <= 56 ? 'compact' : 'expanded', true)}/>
+            onCommit={resizeToolbar}/>
         </div>
         {showAssistance && <AssistanceInterview currentPath={view.path} revision={Math.max(document.revision, observedRevision)}
           scanSignal={`${appStatus.scan.status}:${appStatus.mirrorEvidenceStamp}`}
           readOnly={readOnly} onEdit={editAssistance} controlRef={assistanceControl}
           footerHost={assistanceFooter} inspectQuestion={inspectAssistanceQuestion} browser={assistanceBrowser}
+          onResizeScanDetails={scanDetailsHeight => updateView({ scanDetailsHeight }, true)}
           deferMarked={document.inventoryDeferMarked !== false}
           onOpenMirror={path => { setMirrorReviewPath(path); setShowMirror(true); }}/>}
         <div className="browse-interaction-hint"><span>Click to preview · focus button or row menu to center</span><span>Ctrl+Space selects · Space marks</span></div>
@@ -1648,9 +1666,9 @@ export default function App() {
           </div>
         </div>}
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
-          <DirectoryColumn {...columnActions} previewPath={view.previewColumns[0]?.path} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onBack={canUp ? () => backFolder() : undefined} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
+          <DirectoryColumn {...columnActions} previewPath={view.previewColumns[0]?.path} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onBack={canUp ? () => backFolder() : undefined} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
           {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>Click a folder to preview its contents in the next column.</p><p>Right-click for the folder actions and decision menu.</p></div>}
-          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={reviewPathKey(column.path)} {...columnActions} previewPath={view.previewColumns[index + 1]?.path} column={column} depth={index + 1} cache={folderReads} cacheContext={{ derived: folderReadScope, source: folderSourceScope }} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onBack={() => backFolder(index + 1)} backPreservesBranch={canUp} onClose={() => closePreview(index + 1)}/>)}
+          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={reviewPathKey(column.path)} {...columnActions} previewPath={view.previewColumns[index + 1]?.path} column={column} depth={index + 1} cache={folderReads} cacheContext={{ derived: folderReadScope, source: folderSourceScope }} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onBack={() => backFolder(index + 1)} backPreservesBranch={index === 0 && canUp} onClose={() => closePreview(index + 1)}/>)}
         </div>
         <OverflowIndicators targetRef={columnStripRef} axis="horizontal" refreshKey={view.previewColumns}/>
         {fillDepth !== null && <button ref={restoreColumnsRef} className="review-restore-columns"
