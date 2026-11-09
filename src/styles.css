@@ -106,3 +106,17 @@ dialog.modal.compact-modal{height:fit-content}
     grid-template-columns: 1fr;
   }
 }
+
+.toast {
+  pointer-events: none;
+}
+
+.toast > button {
+  pointer-events: auto;
+}
+
+@media (max-width: 1000px) {
+  .toast {
+    bottom: 84px;
+  }
+}
