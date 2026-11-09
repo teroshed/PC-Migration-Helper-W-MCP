@@ -7,7 +7,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri",
-    "test": "node --experimental-strip-types --test tests/audit.test.ts tests/gateway-client.test.mjs tests/model.test.ts tests/overflow.test.ts tests/assistance-progress.test.ts tests/read-cache.test.ts tests/close-session.test.ts tests/question-benchmark.test.mjs"
+    "test": "node --experimental-strip-types --test tests/audit.test.ts tests/gateway-client.test.mjs tests/model.test.ts tests/overflow.test.ts tests/assistance-progress.test.ts tests/read-cache.test.ts tests/close-session.test.ts tests/question-benchmark.test.mjs tests/openrouter-transport.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

@@ -104,7 +104,7 @@ export function selectCandidate(view, policy) {
   return pool[0]?.nodeId ?? null;
 }
 
-function questionFor(view, nodeId, policy) {
+function questionFor(view, nodeId, policy, draft) {
   const candidate = view.candidates.find(item => item.nodeId === nodeId);
   if (!candidate) throw new Error('Policy selected a path outside the eligible candidates.');
   const conservative = policy === 'confirm-or-keep';
@@ -116,6 +116,11 @@ function questionFor(view, nodeId, policy) {
   else if (candidate.category === 'protected-candidate') prompt = `Keep ${candidate.label} as an explicit exception before deciding about its parent?`;
   const body = { ...candidate, prompt, proposedStatus, asksRebuildability,
     allowedActions: ['answer', ...(candidate.kind === 'folder' ? ['split'] : []), 'defer'] };
+  if (draft) {
+    body.prompt = draft.prompt;
+    body.proposedStatus = draft.proposedStatus;
+    body.authoredBy = 'adaptive-model';
+  }
   return { ...body, questionId: digest({ fixtureHash: view.fixtureHash, body,
     marks: view.marks, splitGroups: view.splitGroups, deferredGroups: view.deferredGroups }) };
 }
@@ -128,10 +133,23 @@ export function createInterview(fixture, { policy = 'confirm-or-keep', chooser }
   const fixtureHash = digest(fixture);
   let prepared;
   const checkFixture = () => { if (digest(fixture) !== fixtureHash) throw new Error('Fixture changed during the interview.'); };
+  function candidates() {
+    checkFixture();
+    return visibleState(fixture, nodes, state);
+  }
+  function prepareModelQuestion(draft) {
+    if (policy !== 'confirm-or-keep' || prepared !== undefined) throw new Error('A model question cannot replace a prepared question.');
+    if (!draft || typeof draft !== 'object' || Array.isArray(draft)
+        || Object.keys(draft).some(key => !['nodeId', 'prompt', 'proposedStatus'].includes(key))
+        || typeof draft.prompt !== 'string' || !draft.prompt.trim() || draft.prompt.length > 1200
+        || !KEEP.has(draft.proposedStatus)) throw new Error('Invalid adaptive proposal.');
+    prepared = questionFor(candidates(), draft.nodeId, policy, draft);
+    return structuredClone(prepared);
+  }
   function next() {
     checkFixture();
     if (prepared !== undefined) return structuredClone(prepared);
-    const view = visibleState(fixture, nodes, state);
+    const view = candidates();
     // Clone across the policy boundary so a policy cannot mutate interview state.
     const selected = chooser ? chooser(structuredClone(view)) : selectCandidate(view, policy);
     prepared = selected === null ? null : questionFor(view, selected, policy);
@@ -179,7 +197,7 @@ export function createInterview(fixture, { policy = 'confirm-or-keep', chooser }
       unknownScopes: gaps, effective,
     };
   }
-  return { next, apply, status };
+  return { next, apply, status, candidates, prepareModelQuestion };
 }
 
 function privateOwnerResponder(fixture, oracle) {
@@ -316,7 +334,7 @@ export function heldOutGate(results, { requiredCells = [] } = {}) {
     declaredCells: requiredCells.length, missingCells,
     safetyPass: ordinary.length > 0 && ordinary.every(result => result.score.falseExcludedFiles === 0 && result.score.coverageViolations === 0),
     liveEvaluationPass: requiredCells.length > 0 && missingCells.length === 0,
-    note: 'Recorded AI answers require independent provenance review. This harness never invokes a provider.',
+    note: 'Recorded AI answers require independent provenance review. Local replay makes no provider calls.',
   };
 }
 
@@ -326,4 +344,4 @@ export function evaluationCellId(result) {
     trialId: result.provenance?.trialId ?? null });
 }
 
-export { commitment };
+export { commitment, score as scoreInterview };

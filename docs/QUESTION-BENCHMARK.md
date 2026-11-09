@@ -2,7 +2,7 @@
 
 This harness builds sanitized folder-shape fixtures, commits independent virtual owner intentions before the first question, and records each question and answer against that fixed truth. It is the early M5 harness for the production roadmap. The adaptive production interview and the complete live-model evaluation matrix need separate integration and execution.
 
-The harness uses Node.js built-ins and makes no network or provider calls. All examples below use new output directories on E. An existing output directory is rejected, so a later run preserves earlier fixtures, commitments and traces.
+The local snapshot, commitment, suite and replay commands use Node.js built-ins. All examples below use new output directories on E. An existing output directory is rejected, so a later run preserves earlier fixtures, commitments and traces.
 
 ```powershell
 node scripts/question-benchmark.mjs suite --out E:\Temp\question-suite-001
@@ -43,7 +43,7 @@ A physical dummy optionally recreates the sanitized hierarchy with new empty fil
 node scripts/question-benchmark.mjs materialize --fixture E:\Temp\question-fixture-001\fixture.json --out E:\Temp\question-physical-001 --max-files 10000
 ```
 
-Assign the virtual owner's intentions independently, before asking a policy to generate any questions. `commit` accepts a separate author-controlled intent input. Assignments reference sanitized file node IDs. Supported statuses are `migrate-now`, `last-moment`, `redownload` and `erase`. Unspecified files receive a seeded virtual choice independent of filenames and category clues. A seed is used only while creating the oracle. It is never consulted during the interview. These choices describe a synthetic owner and cannot infer Daniel's actual intent for undecided files.
+Assign the virtual owner's intentions independently, before asking a policy to generate any questions. `commit` accepts a separate author-controlled intent input. Assignments reference sanitized file node IDs. Supported statuses are `migrate-now`, `last-moment`, `redownload` and `erase`. Unspecified files receive a seeded virtual choice independent of filenames and category clues. A seed is used only while creating the oracle. It is never consulted during the interview. These choices describe a synthetic owner and cannot infer the migration owner's actual intent for undecided files.
 
 ```json
 {
@@ -79,4 +79,75 @@ For held-out evaluation, an independent fixture owner should prepare a new scope
 
 Actual AI answers can later be scored using `--responses` and `--evidence-kind recorded-ai-responses`, plus `--provenance` containing `model`, `route`, `trialId`, `authorizationRef`, SHA-256 `promptLogHash` and `responseLogHash`, and boolean `reviewed`. Optional `providerLatencyMs`, `costUsd`, `inputTokens` and `outputTokens` record measured provider use. Missing provider measurements remain absent. The response records must contain the exact question IDs. These fields are operator-supplied receipts requiring independent review. The harness does not authenticate their origin. Its declared-cell gate requires reviewed model/route/trial provenance and a complete recorded interview for every required cell. Human and scripted answers retain their separate evidence labels. JSON inputs are bounded to 64 MiB. Credentials and raw provider payloads are rejected as provenance fields.
 
-Before paid execution, Daniel must authorize the exact models/routes, sanitized input scope, concurrent request/token/spend caps and stop conditions. An adapter must reserve concurrent costs, retain failures and uncertain acknowledgements, and stop at its budget. None of these commands consumes provider credentials or performs live evaluation. Do not claim M5 complete until the declared live-answer matrix and held-out policy gates have actually passed.
+The live driver adds an explicit transport interface. It performs a serial run with one adapter for the policy and one for the simulated owner. The policy prompt contains a bounded slate of sanitized candidates and prior decisions. The owner prompt contains the exact question and the limited facts that persona knew before the trial. An adaptive reply can propose a keep decision for one eligible candidate. The question ID binds its exact wording, and the owner reply is fenced to that ID. The template and conservative comparators use local questions and the same owner role. A failed adaptive call remains a failed cell.
+
+The proposed corpus has six ordinary scenarios with three policies each and one separately scored false owner confirmation scenario with three policies. The scopes cover coherent originals, confirmed rebuildability, an unnamed original in a cache, local patches, mixed file decisions, and gaps and deferral. Eight questions per cell allow up to 168 owner attempts and 56 adaptive policy attempts. These are ceilings. The report lists every declared cell, including omitted or failed cells. Fixture invalidation during a reply has a separate simulated transport regression.
+
+Create the private pack, bind exact routes and budgets, then provide a separately reviewed authorization receipt and adapter.
+
+```powershell
+node scripts/question-benchmark/live-cli.mjs precommit --out E:\Temp\question-live-pack-001
+node scripts/question-benchmark/live-cli.mjs freeze --corpus E:\Temp\question-live-pack-001\corpus.private.json --config E:\Temp\question-live-config.json --out E:\Temp\question-live-frozen-001
+node scripts/question-benchmark/live-cli.mjs run --corpus E:\Temp\question-live-pack-001\corpus.private.json --matrix E:\Temp\question-live-frozen-001\matrix.json --authorization E:\Temp\question-live-authorization.json --adapter E:\Temp\question-live-adapter.mjs --out E:\Temp\question-live-run-001
+node scripts/question-benchmark/live-cli.mjs inspect --journal E:\Temp\question-live-run-001\attempts.jsonl
+```
+
+Use the exact model identifiers, route labels, settings and ceilings for both roles. The following example configures a local fake test. It illustrates the envelope, with zero direct cost and reserved token allowances of 2,048 input and 512 output tokens per attempt.
+
+```json
+{
+  "trialId": "local-fake-example",
+  "routes": {
+    "policy": {
+      "kind": "injected-fake",
+      "model": "fixture-policy",
+      "route": "fake:policy",
+      "settings": { "contextMode": "stateless", "temperature": 0, "seed": 42 },
+      "limits": {
+        "inputTokens": 2048, "outputTokens": 512, "costMicros": 0,
+        "timeoutMs": 30000, "inputBytes": 32768, "responseBytes": 8192
+      }
+    },
+    "owner": {
+      "kind": "injected-fake",
+      "model": "fixture-owner",
+      "route": "fake:owner",
+      "settings": { "contextMode": "stateless", "temperature": 0, "seed": 42 },
+      "limits": {
+        "inputTokens": 2048, "outputTokens": 512, "costMicros": 0,
+        "timeoutMs": 30000, "inputBytes": 32768, "responseBytes": 8192
+      }
+    }
+  },
+  "budget": { "attempts": 224, "inputTokens": 458752, "outputTokens": 114688, "costMicros": 0 }
+}
+```
+
+The authorization JSON contains the frozen matrix's `manifestHash`, `kind`, an opaque `reference` to the actual authorization, and the trusted module's lowercase SHA-256 `adapterSha256`. The fake kind is `synthetic-test-only`. A live run requires `explicit-live-authorization` after the operator authorizes the exact routes, models, input scope, total cost and token/request ceilings. Authorize a cap of at most 168 times the owner attempt ceiling plus 56 times the policy attempt ceiling to reserve the full proposed matrix. A smaller cap can leave cells omitted. Prior review funding covers its own review.
+
+The trusted standalone module exports `createTransports()` returning distinct `policy` and `owner` adapters. Each adapter has a `kind` matching the frozen route and an `invoke(request)` function. The request carries `attemptId`, `role`, `model`, `route`, `configHash`, `settings`, `limits`, `messages` and an abort `signal`. The adapter must enforce the exact configuration and token limits before dispatch. It returns `status` as `ok` or `failed`, the actual model and route, the configuration hash, `body` as one JSON string for a successful response, and any reported `usage` fields named `inputTokens`, `outputTokens` and `costMicros`. Preserve the actual provider request ID as `upstreamRequestId`. Missing usage remains unknown. The CLI executes the bytes whose hash was approved. Module initialization must be free of effects. Built-in Node imports are supported in this standalone module. Any external dependencies need their own review. The CLI includes neither a built-in route nor credential lookup.
+
+The driver syncs each attempt reservation to the private journal before dispatch. Actual reported usage replaces its reservation when available. Uncertain failures, cancellation after dispatch and timeouts retain the reservation and stop further dispatch. An over-cap receipt retains the reported charge and stops the run. A later journal inspection lists unmatched reservations without replaying them. The private journal retains the prompts and replies. Review these before exporting evidence. A paused or interrupted trial requires reconciliation and fresh authorization before another trial.
+
+A separately reviewed `codex-roleplay` route can record live role-play through isolated subagent prompts and host-reported model, effort, route and response identifiers. This route accounts for direct API charges only. Codex account limit windows are shared usage reports, with no per-attempt measured token or billed-cost receipt exposed by the available tools. Record those measurements as unknown. Its request cap is a session turn limit. A role-play coverage pass and the metered-provider qualification are separate gates.
+
+The full provider gate requires completed cells, the selected policy's safety results, exact model and route receipts with measured usage, and independent review of the result and journal hashes, held-out independence and owner fidelity. The injected fake suite exercises transport and ledger behavior and cannot qualify as live evidence. Provider execution and the independent held-out review are pending.
+
+The standalone `scripts/question-benchmark/openrouter-transport.mjs` adapter proposes `google/gemini-3.1-flash-lite` through OpenRouter / Google AI Studio, with the route label `openrouter/google-ai-studio` in the frozen matrix. It sends one non-streaming JSON request per authorized attempt to the pinned Chat Completions endpoint. Provider allowlisting, provider order, disabled fallbacks, required parameters and the default service tier pin the standard Google AI Studio endpoint. The request also sets maximum provider prices of $0.25 per million input tokens, $1.50 per million output tokens and $0 per request. [Model pricing](https://openrouter.ai/google/gemini-3.1-flash-lite/), [public endpoint metadata](https://openrouter.ai/api/v1/models/google/gemini-3.1-flash-lite/endpoints), [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection), [service tiers](https://openrouter.ai/docs/guides/features/service-tiers)
+
+The proposed settings are stateless context, temperature zero, seed 42 and minimal reasoning effort. The configuration hash binds those settings and each role's limits. The adapter verifies first-attempt routing metadata, the exact model and selected provider, and a non-BYOK receipt. It bounds the JSON response envelope and the assistant text separately. A verified receipt retains the OpenRouter generation ID, reported prompt and completion tokens, and `usage.cost` in USD-denominated credits. The journal stores that decimal as `reportedCostUsd` and rounds up to integer microdollars for budget accounting. [Chat Completions response metadata](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion), [usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting), [credit denomination](https://openrouter.ai/support)
+
+| Role | Maximum attempts | Input token allowance | Output token limit | Listed-price estimate per attempt | Reserved per attempt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Owner | 168 | 3,072 | 2,048 | $0.003840 | $0.004000 |
+| Adaptive policy | 56 | 6,144 | 2,048 | $0.004608 | $0.004800 |
+
+At all 224 planned attempts, the listed-price estimate is $0.903168 and the local budget reservation is $0.940800. The input allowance uses serialized UTF-8 message bytes plus 256 bytes for framing as a local proxy. A saved fake journal contained 44 owner prompts with a 1,228-byte maximum and 15 policy prompts with a 3,119-byte maximum. Actual token counts and charges come from the provider receipt. The driver stops if reported usage exceeds the reservation. Provider billing and live receipt shape still require a verified run. [Usage accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+
+Generate the proposed route config with `proposedOpenRouterConfig()` and freeze it with the live CLI. After the operator authorizes the exact manifest and adapter hash, the adapter reads `PC_MIGRATION_BENCHMARK_OPENROUTER_KEY` inside its approved dispatch function. Use a dedicated benchmark key and an independently authorized credit limit. Test the transport locally with the following command.
+
+```powershell
+node --test tests/openrouter-transport.test.mjs tests/question-benchmark.test.mjs
+```
+
+The focused tests inject fake fetch responses, covering route pins, redirects, oversized or invalid JSON, usage projection and the request ceiling. The private preflight retains measured fake prompt sizes separately from its proposed token and cost reservations.
