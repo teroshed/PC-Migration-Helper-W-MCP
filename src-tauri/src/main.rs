@@ -5,6 +5,7 @@ mod background;
 mod audit;
 mod bulk_mark;
 mod copy_control;
+mod copy_effect_ledger;
 mod copy_queue;
 mod filesystem;
 mod gateway;
@@ -48,6 +49,7 @@ struct AppState {
     review: review::ReviewBridge,
     copy_queue: Arc<copy_queue::CopyQueue>,
     copy_control: Mutex<()>,
+    copy_inspection_only: bool,
     assistance: assistance::Cache,
     adaptive: adaptive_review::Runtime,
     mirrors: mirror_service::Runtime,
@@ -304,7 +306,7 @@ fn boot(s: &AppState) -> Value {
     let mut result = match s.store.lock() {
         Ok(lock) => match lock.as_ref() {
             Some(store) => {
-                json!({"document":store.doc,"volumes":s.volumes,"dataPath":s.data_path,"fixture":s.fixture,"problem":store.problem,"recoveryAvailable":store.problem.is_some() && s.data_path.with_extension("json.bak").is_file()})
+                json!({"document":store.doc,"volumes":s.volumes,"dataPath":s.data_path,"fixture":s.fixture,"problem":store.problem,"recoveryAvailable":store.can_recover()})
             }
             None => {
                 json!({"document":store::fresh(&s.volumes[0].root),"volumes":s.volumes,"dataPath":s.data_path,"fixture":s.fixture,"problem":s.startup_problem,"recoveryAvailable":false})
@@ -551,7 +553,8 @@ fn canonical_json(value: &Value) -> Value {
 
 fn operation_id_used(doc: &Value, id: &str) -> bool {
     ["agentOperations","groupOperations","copyOperations","recoveryOperations",
-        "mirrorOperations","mirrorEditOperations"].iter()
+        "mirrorOperations","mirrorEditOperations","copyReconciliationOperations",
+        "reconciledCopyOperations"].iter()
         .any(|field| doc[*field].get(id).is_some())
         || doc["recentOperations"].as_array().is_some_and(|ids| ids.iter().any(|value| value == id))
         || doc["history"].as_array().is_some_and(|history| history.iter().any(|event| event["id"] == id))
@@ -712,7 +715,8 @@ fn run_mutation_as(
     let store = guard
         .as_mut()
         .ok_or("Data file is not writable in this instance")?;
-    if ["copyOperations","recoveryOperations","mirrorOperations"].iter()
+    if ["copyOperations","recoveryOperations","mirrorOperations",
+        "copyReconciliationOperations","reconciledCopyOperations"].iter()
         .any(|key| store.doc[*key].get(&operation_id).is_some()) {
         return Err("This operationId belongs to a durable job or recovery receipt and cannot be reused for an edit".into());
     }
@@ -1421,6 +1425,7 @@ fn runtime_path_arg(args: &[String], name: &str) -> Option<PathBuf> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let compact_window = args.iter().any(|arg| arg == "--compact-window");
+    let copy_inspection_only = args.iter().any(|arg| arg == "--copy-inspection-only");
     let fixture = runtime_path_arg(&args, "--fixture-root");
     let data_directory = runtime_path_arg(&args, "--data-dir");
     let journal = runtime_path_arg(&args, "--journal-file");
@@ -1432,10 +1437,14 @@ fn main() {
         eprintln!("Use --fixture-root with a source directory for isolated runs. For regular runs, --data-dir sets the runtime directory and --journal-file selects an existing review journal.");
         std::process::exit(2);
     }
-    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let executable = std::env::current_exe().unwrap_or_else(|problem| {
+        eprintln!("Cannot locate the application executable: {problem}");
+        std::process::exit(2);
+    });
+    let base = executable.parent().unwrap_or_else(|| {
+        eprintln!("Cannot locate the application directory.");
+        std::process::exit(2);
+    });
     let runtime = fixture
         .as_ref()
         .map(|path| path.join("runtime"))
@@ -1467,14 +1476,11 @@ fn main() {
     };
     let index = Index::open(cache_runtime.join(format!("inventory-{}.sqlite", &namespace[..12])))
         .expect("Cannot open inventory cache");
-    let mut exclusions = vec![
+    let exclusions = vec![
         cache_runtime.to_string_lossy().to_string(),
         data_path.with_extension("*").to_string_lossy().to_string(),
-        base.join("target").to_string_lossy().to_string(),
+        executable.to_string_lossy().to_string(),
     ];
-    if let Ok(executable) = std::env::current_exe() {
-        exclusions.push(executable.to_string_lossy().to_string());
-    }
     let audit = audit::Audit::open(
         cache_runtime.join(format!("audit-{}.sqlite", &namespace[..12])),
         namespace,
@@ -1510,6 +1516,7 @@ fn main() {
         mirrors: mirror_service::Runtime::default(),
         copy_queue,
         copy_control: Mutex::new(()),
+        copy_inspection_only,
     });
     tauri::Builder::default()
         .manage(state.clone())
@@ -1567,6 +1574,8 @@ fn main() {
             copy_queue_snapshot,
             control_copy_queue,
             copy_control::preview_copy_conflict,
+            copy_control::reconcile_copy_history,
+            copy_control::read_copy_effect_history,
             report_review_surface,
             poll_review_activity,
             plan_review_reveal,
@@ -1924,6 +1933,7 @@ mod tests {
                 true,
             ),
             copy_control: Mutex::new(()),
+            copy_inspection_only: false,
         }
     }
     fn apply(s: &AppState, id: &str, op: Value) -> Value {

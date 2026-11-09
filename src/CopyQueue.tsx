@@ -35,7 +35,26 @@ interface QueueSnapshot {
   pendingMigrateNow: number;
   queueSignature: string;
   latestOperation: { operationId: string; phase: string; error: string } | null;
+  copyAuthority: CopyAuthority;
   status: QueueStatus;
+}
+interface CopyEffect {
+  operationId: string;
+  jobId: string;
+  phase: string;
+  action: string;
+  destinationId: string;
+  requestedAt: string;
+  committedRevision: number | null;
+}
+interface CopyAuthority {
+  phase: string;
+  ready: boolean;
+  ledgerDigest: string;
+  historyCount: number;
+  unreconciledCount: number;
+  unreconciled: CopyEffect[];
+  problem: string;
 }
 
 interface ReviewedConflict {
@@ -65,6 +84,27 @@ function items(value: unknown): QueueItem[] {
   });
 }
 
+function copyEffect(value: unknown): CopyEffect {
+  const effect = record(value);
+  return {
+    operationId: string(effect.operationId), jobId: string(effect.jobId), phase: string(effect.phase),
+    action: string(effect.action), destinationId: string(effect.destinationId), requestedAt: string(effect.requestedAt),
+    committedRevision: typeof effect.committedRevision === 'number' ? count(effect.committedRevision) : null,
+  };
+}
+
+function copyAuthority(value: unknown): CopyAuthority {
+  const authority = value == null ? {} : record(value);
+  const phase = string(authority.phase) || 'unavailable';
+  return {
+    phase, ready: (phase === 'ready' || phase === 'uninitialized') && authority.ready === true,
+    ledgerDigest: string(authority.ledgerDigest),
+    historyCount: count(authority.historyCount), unreconciledCount: count(authority.unreconciledCount),
+    unreconciled: Array.isArray(authority.unreconciled) ? authority.unreconciled.map(copyEffect) : [],
+    problem: string(authority.problem) || (value == null ? 'Copy authority status is unavailable.' : ''),
+  };
+}
+
 function snapshot(value: unknown): QueueSnapshot {
   const queue = record(value);
   const destination = record(queue.destination);
@@ -88,6 +128,7 @@ function snapshot(value: unknown): QueueSnapshot {
     pendingMigrateNow: count(queue.pendingMigrateNow),
     queueSignature: string(queue.queueSignature),
     latestOperation: latest ? { operationId: string(latest.operationId), phase: string(latest.phase), error: string(latest.error) } : null,
+    copyAuthority: copyAuthority(queue.copyAuthority),
     status: {
       jobId: string(status.jobId),
       phase: string(status.phase),
@@ -124,6 +165,7 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
   const [busy, setBusy] = useState(false);
   const [issue, setIssue] = useState('');
   const [separateSource, setSeparateSource] = useState<string | null>(null);
+  const [authorityReview, setAuthorityReview] = useState<QueueSnapshot | null>(null);
   const read = useRef<() => void>(() => {});
   const request = useRef(false);
   const armedDestination = useRef('');
@@ -141,7 +183,12 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
       try {
         const next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
         if (!active) return;
-        if (armedDestination.current && (!next.destination.available || next.destination.id !== armedDestination.current || next.sourceVolumeSignature !== armedSources.current)) {
+        if (armedDestination.current && !next.copyAuthority.ready) {
+          armedDestination.current = '';
+          armedSources.current = '';
+          setAuto(false);
+          setIssue('Auto-copy paused while recorded copy effects need review.');
+        } else if (armedDestination.current && (!next.destination.available || next.destination.id !== armedDestination.current || next.sourceVolumeSignature !== armedSources.current)) {
           armedDestination.current = '';
           setAuto(false);
           setIssue('Auto-copy paused because a source or destination changed. Check the drives before enabling it again.');
@@ -176,7 +223,7 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
   const phase = queue?.status.phase ?? '';
   const copying = phase === 'planning' || phase === 'running' || phase === 'copying' || phase === 'stopping';
   const destinationId = queue?.destination.id ?? '';
-  const ready = enabled && Boolean(queue?.destination.available && destinationId) && !copying && !busy;
+  const ready = enabled && Boolean(queue?.copyAuthority.ready && queue.destination.available && destinationId) && !copying && !busy;
 
   async function previewSeparate(sourcePath: string, alternateName: string): Promise<ReviewedConflict> {
     const plan = record(await invoke('preview_copy_conflict', { request: { sourcePath, alternateName } }));
@@ -201,6 +248,7 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
     try {
       await onNativeWrite(async () => {
         const next = snapshot(await invoke('copy_queue_snapshot'));
+        if (!next.copyAuthority.ready && !retry) throw new SeparateCopyRefusal('Review recorded copy effects before starting a separate copy.');
         if (!retry && !sameCopyReview(reviewed.queue, next)) throw new SeparateCopyRefusal('The reviewed copy queue changed. Review the conflict again.');
         const result = record(await invoke('control_copy_queue', { request: {
           ...fences(reviewed.queue), action: 'startSeparate', operationId: reviewed.operationId,
@@ -237,6 +285,7 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
     try {
       await onNativeWrite(async () => {
         const next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
+        if (action !== 'pause' && !next.copyAuthority.ready) throw new Error('Review recorded copy effects before starting another pass.');
         if (auto && (next.destination.id !== armedDestination.current || next.sourceVolumeSignature !== armedSources.current)) {
           throw new Error('Auto-copy stopped because the reviewed drives changed.');
         }
@@ -280,6 +329,7 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
     if (checked) {
       await onNativeWrite(async () => {
         next = snapshot(await invoke<unknown>('copy_queue_snapshot'));
+        if (!next.copyAuthority.ready) throw new Error('Review recorded copy effects before enabling Auto-copy.');
         await invoke('validate_auto_copy', { request: reviewed ?? fences(next) });
         if (!next.destination.available) throw new Error(next.destination.problem || 'The copy destination is unavailable.');
         armedDestination.current = next.destination.id;
@@ -289,14 +339,34 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
     attempted.current = '';
     setAuto(checked);
   }
+  async function reconcileHistory(reviewed: QueueSnapshot, operationId: string): Promise<void> {
+    if (request.current || !enabled) throw new Error('Copy control is busy or unavailable.');
+    request.current = true;
+    setBusy(true);
+    try {
+      await onNativeWrite(() => invoke('reconcile_copy_history', { request: {
+        ...fences(reviewed), operationId, expectedLedgerDigest: reviewed.copyAuthority.ledgerDigest,
+      } }));
+      const next = snapshot(await invoke('copy_queue_snapshot'));
+      setQueue(next);
+      if (!next.copyAuthority.ready) throw new Error(next.copyAuthority.problem || 'Copy admission still requires review.');
+      setIssue('');
+      setAuthorityReview(null);
+    } finally {
+      request.current = false;
+      setBusy(false);
+      read.current();
+    }
+  }
   controlRef.current = {
     read: () => ({ autoCopy: auto, detailsOpen: details, busy, issue, queue,
+      authorityReviewOpen: authorityReview !== null,
       separateReview: separateSource ? { sourcePath: separateSource.slice(0, 2048), pathTruncated: separateSource.length > 2048 } : null }),
     execute: async (command, reviewed) => {
       if (command.action === 'setAutoCopy') await toggleAuto(command.enabled === true, reviewed);
       else if (command.action === 'setCopyDetails') {
         setDetails(command.open === true);
-        if (!command.open && !request.current) setSeparateSource(null);
+        if (!command.open && !request.current) { setSeparateSource(null); setAuthorityReview(null); }
       }
       else throw new Error('Unsupported copy presentation action');
     },
@@ -306,10 +376,11 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
   if (!queue && !issue) return null;
   const status = queue?.status;
   const marked = queue?.migrateNowCount ?? 0;
+  const authority = queue?.copyAuthority;
   const firstIssue = status?.issues.find(item => item.problem);
   const copyProblem = issue || status?.problem || firstIssue?.problem;
   return <section className="copy-queue" aria-label="Migration copy queue" onKeyDown={event => {
-    if (details && !separateSource && event.key === 'Escape') {
+    if (details && !separateSource && !authorityReview && event.key === 'Escape') {
       event.preventDefault();
       event.stopPropagation();
       setDetails(false);
@@ -324,11 +395,20 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
         <button type="button" disabled={!ready || !marked} onClick={() => void control('start', 'ordered').catch(() => {})}><ListOrdered size={15}/>Start Copying In Order</button>
         <button type="button" disabled={!ready || !marked} onClick={() => void control('start', 'all').catch(() => {})}><Copy size={15}/>Copy everything</button>
         <label className="copy-queue-auto" title="Copy new Migrate now marks after a short pause. Applies for this window session.">
-          <input type="checkbox" checked={auto} disabled={!enabled || !queue?.destination.available} onChange={event => { void toggleAuto(event.target.checked).catch(error => setIssue(String(error))); }}/>Auto-copy
+          <input type="checkbox" checked={auto} disabled={!enabled || !queue?.destination.available || !authority?.ready} onChange={event => { void toggleAuto(event.target.checked).catch(error => setIssue(String(error))); }}/>Auto-copy
         </label>
         {copying && <button type="button" onClick={() => { void toggleAuto(false); void control('pause').catch(() => {}); }}><Pause size={15}/>Pause</button>}
       </div>
     </div>
+    {authority && !authority.ready && <div className="copy-authority-notice">
+      <TriangleAlert size={15} aria-hidden="true"/>
+      <div role="status"><strong>{authority.phase === 'review-required' ? 'Copy history needs review' : 'New copy passes unavailable'}</strong>
+        {authority.problem && <p>{authority.problem}</p>}
+      </div>
+      {authority.phase === 'review-required' && <button type="button" aria-haspopup="dialog"
+        disabled={!enabled || copying || busy || !queue?.destination.available}
+        onClick={() => setAuthorityReview(queue)}>Review copy effects</button>}
+    </div>}
     {copyProblem && <div className="copy-queue-problem" role="status"><TriangleAlert size={15}/><span>{copyProblem}</span>
       {firstIssue && isDifferentFile(firstIssue.problem) && <button type="button" aria-haspopup="dialog" disabled={!ready}
         onClick={() => setSeparateSource(firstIssue.path)}>Review separate copy</button>}
@@ -361,8 +441,132 @@ export function CopyQueue({ revision, enabled, controlRef, onNativeWrite }: {
       </div>
     </div>}
     {separateSource && <SeparateCopyReview key={separateSource} sourcePath={separateSource} currentQueue={queue}
-      enabled={enabled && !copying} onPreview={previewSeparate} onApply={startSeparate} onClose={() => setSeparateSource(null)}/>}
+      enabled={enabled && !copying && authority?.ready === true} onPreview={previewSeparate} onApply={startSeparate} onClose={() => setSeparateSource(null)}/>}
+    {authorityReview && <CopyAuthorityReview key={`${authorityReview.copyAuthority.ledgerDigest}:${authorityReview.revision}:${authorityReview.destination.id}:${authorityReview.sourceVolumeSignature}:${authorityReview.queueSignature}`}
+      reviewed={authorityReview} current={queue} enabled={enabled && !copying} onReconcile={reconcileHistory}
+      onRefresh={() => setAuthorityReview(queue?.copyAuthority.phase === 'review-required' ? queue : null)}
+      onClose={() => setAuthorityReview(null)} fallbackFocus={() => countRef.current?.focus()}/>}
   </section>;
+}
+
+function CopyAuthorityReview({ reviewed, current, enabled, onReconcile, onRefresh, onClose, fallbackFocus }: {
+  reviewed: QueueSnapshot; current: QueueSnapshot | null; enabled: boolean;
+  onReconcile: (reviewed: QueueSnapshot, operationId: string) => Promise<void>; onRefresh: () => void;
+  onClose: () => void; fallbackFocus: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const scroll = useRef<HTMLDivElement>(null);
+  const operationId = useRef(crypto.randomUUID());
+  const request = useRef(false);
+  const [offsets, setOffsets] = useState([0]);
+  const [page, setPage] = useState<{ entries: CopyEffect[]; total: number; nextOffset: number | null } | null>(null);
+  const [seen, setSeen] = useState<ReadonlyMap<number, number>>(() => new Map());
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const offset = offsets.at(-1) ?? 0;
+  const authority = reviewed.copyAuthority;
+  const unchanged = current && current.copyAuthority.ledgerDigest === authority.ledgerDigest && sameCopyReview(reviewed, current);
+  const seenCount = [...seen.values()].reduce((total, size) => total + size, 0);
+  const allSeen = page && page.total === seenCount;
+
+  useEffect(() => {
+    const surface = dialog.current;
+    const invoker = document.activeElement;
+    surface?.showModal();
+    return () => {
+      surface?.close();
+      if (invoker instanceof HTMLElement && invoker.isConnected && !invoker.matches(':disabled')) invoker.focus();
+      else fallbackFocus();
+    };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    setPage(null);
+    setProblem(null);
+    void invoke('read_copy_effect_history', { request: {
+      offset, limit: 16, expectedLedgerDigest: authority.ledgerDigest,
+    } }).then(value => {
+      const result = record(value);
+      if (result.ledgerDigest !== authority.ledgerDigest || result.total !== authority.unreconciledCount ||
+          !Array.isArray(result.entries) || (result.nextOffset !== null && typeof result.nextOffset !== 'number')) {
+        throw new Error('Recorded copy effects changed. Review the current history.');
+      }
+      const entries = result.entries.map(copyEffect);
+      const consumed = offset + entries.length;
+      const nextOffset = consumed < authority.unreconciledCount ? consumed : null;
+      if (consumed > authority.unreconciledCount || result.nextOffset !== nextOffset || (nextOffset !== null && !entries.length)) {
+        throw new Error('The recorded effects page is incomplete. Review the current history.');
+      }
+      if (active) {
+        setPage({ entries, total: authority.unreconciledCount, nextOffset });
+        setSeen(previous => new Map(previous).set(offset, entries.length));
+      }
+    }).catch(cause => { if (active) setProblem(String(cause)); });
+    return () => { active = false; };
+  }, [offset, authority.ledgerDigest, authority.unreconciledCount]);
+
+  function apply(): void {
+    if (request.current || !enabled || !unchanged || !allSeen || !acknowledged) return;
+    request.current = true;
+    setApplying(true);
+    setProblem(null);
+    void onReconcile(reviewed, operationId.current).catch(cause => setProblem(String(cause))).finally(() => {
+      request.current = false;
+      setApplying(false);
+    });
+  }
+
+  return <dialog ref={dialog} className="modal copy-authority-review" aria-label="Review recorded copy effects"
+    onCancel={event => { event.preventDefault(); if (!applying) onClose(); }}>
+    <div className="modal-header"><h2>Review recorded copy effects</h2>
+      <button type="button" className="icon-button" aria-label="Close copy effects review" disabled={applying}
+        onClick={onClose}><X size={18} aria-hidden="true"/></button>
+    </div>
+    <div className="copy-authority-frame"><div ref={scroll} className="modal-body">
+      <p>Review the recorded copy requests and the current destination. The recorded phases describe requests; inspect destination files separately for completed bytes.</p>
+      <dl className="copy-authority-current">
+        <div><dt>Current destination</dt><dd>{reviewed.destination.root}</dd></div>
+        <div><dt>Destination identity</dt><dd>{reviewed.destination.id}</dd></div>
+        <div><dt>Queue</dt><dd>{reviewed.migrateNowCount.toLocaleString()} Migrate now · {reviewed.lastMomentCount.toLocaleString()} Last Moment</dd></div>
+        <div><dt>Ledger</dt><dd>{authority.historyCount.toLocaleString()} recorded effects · {authority.unreconciledCount.toLocaleString()} need review</dd></div>
+      </dl>
+      {page && <ol className="copy-authority-effects" aria-label="Recorded copy effects">
+        {page.entries.map(effect => <li key={effect.operationId}>
+          <strong>{effect.action || 'Copy request'} · {effect.phase || 'Unknown phase'}</strong>
+          <p>Operation {effect.operationId}{effect.jobId && ` · Job ${effect.jobId}`}</p>
+          <p>Destination {effect.destinationId || 'Unknown identity'}
+            {effect.requestedAt && ` · Requested ${effect.requestedAt}`}
+            {effect.committedRevision !== null && ` · Revision ${effect.committedRevision}`}</p>
+          {effect.destinationId && effect.destinationId !== reviewed.destination.id &&
+            <p className="copy-authority-error">This effect used a different destination identity.</p>}
+        </li>)}
+        {!page.entries.length && <li>No recorded effects on this page.</li>}
+      </ol>}
+      {problem && <p className="copy-authority-error" role="alert">{problem}</p>}
+      {!unchanged && <p role="status">The reviewed queue, drives or ledger changed. Read the current history again.</p>}
+    </div><OverflowIndicators targetRef={scroll} axis="vertical" refreshKey={page}/></div>
+    <div className="copy-authority-actions">
+      <div className="copy-authority-pages">
+        <span role="status">{seenCount.toLocaleString()} of {authority.unreconciledCount.toLocaleString()} effects needing review displayed</span>
+        <button type="button" disabled={offsets.length === 1 || applying} onClick={() => setOffsets(previous => previous.slice(0, -1))}>Previous effects</button>
+        <button type="button" disabled={page?.nextOffset == null || applying} onClick={() => {
+          const next = page?.nextOffset;
+          if (next != null) setOffsets(previous => [...previous, next]);
+        }}>Next effects</button>
+      </div>
+      <label><input type="checkbox" disabled={!allSeen || !unchanged || applying} checked={acknowledged}
+        onChange={event => setAcknowledged(event.target.checked)}/>
+        I reviewed the recorded effects, current destination and queue.
+      </label>
+      <div className="copy-authority-submit">
+        {!unchanged && <button type="button" disabled={applying} onClick={onRefresh}>Review current history</button>}
+        <button type="button" className="primary" disabled={!enabled || !allSeen || !unchanged || !acknowledged || applying}
+          onClick={apply}>{applying ? 'Saving reconciliation…' : 'Confirm copy history reconciliation'}</button>
+      </div>
+      <p>Reconciliation records your review. A new copy pass requires its own Copy command.</p>
+    </div>
+  </dialog>;
 }
 
 function SeparateCopyReview({ sourcePath, currentQueue, enabled, onPreview, onApply, onClose }: {

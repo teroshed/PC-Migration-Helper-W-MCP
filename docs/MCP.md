@@ -95,6 +95,14 @@ Different existing bytes stay intact, including if another process claims
 the new name before publication. This does not complete the ordinary
 original-path queue. Close the review to leave the conflict unresolved.
 
+After rollback, `get_copy_queue.copyAuthority` reports whether new copy
+admission is available. Page the unresolved history with
+`read_copy_effect_history` and its exact ledger digest. Review current marks
+and the original destination, then use `reconcile_copy_history` only on
+explicit user instruction. Reconciliation binds the queue and volume fences
+and preserves the old operation IDs without running a copy. See the
+[recovery guide](RECOVERY.md).
+
 ## Grouped marking and Undo
 
 Use `read_folder` for each reviewed entry and `get_review_state` for the

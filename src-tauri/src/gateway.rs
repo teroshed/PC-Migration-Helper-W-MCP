@@ -634,18 +634,19 @@ fn state_summary(state: &AppState) -> Result<Value, String> {
 }
 
 pub(crate) fn api_capabilities()->Value {
-    json!({"version":"0.7.0","transport":"authenticated-loopback-rpc","methods":[
+    json!({"version":"0.8.0","transport":"authenticated-loopback-rpc","methods":[
         "get_state","get_review_view","list_folder","get_details","list_decisions","list_suggestions",
         "read_review_text","get_review_group","get_status","get_assisted_review","next_attention","search_dirs","scan","mutate",
         "audit_status","audit_control","audit_notifications","audit_read_notifications",
         "copy_queue_snapshot","control_copy_queue","get_ui_state","control_ui","get_recovery_state","recover_review",
         "preview_mirror_binding","mirror_comparison_status","start_mirror_comparison","cancel_mirror_comparison",
         "read_mirror_evidence","read_mirror_confirmation","prepare_mirror_confirmation","preview_copy_conflict",
-        "get_adaptive_question_packet"],
+        "get_adaptive_question_packet","reconcile_copy_history","read_copy_effect_history"],
         "recoveryModeMethods":["get_recovery_state","recover_review","get_ui_state","control_ui"],
         "copyControls":["start","pause","resume","startSeparate"],"groupOperations":["bulkClassify","undoGroup"],
         "mirrorOperations":["mirrorBind","mirrorConfirm"],
         "adaptiveOperations":["adaptiveControl","adaptiveProposal"],
+        "independentCopyHistory":true,
         "supportedJournalVersions":[1,2],"sourceDeletion":false,
         "uiControl":"registered native UI session; accepted commands require an applied/error acknowledgement",
         "textContinuation":"read_review_text for saved text; control_ui listPending/readPendingText for retained drafts",
@@ -831,7 +832,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
     if matches!(
         method,
         "mutate" | "scan" | "audit_control" | "audit_read_notifications" | "control_copy_queue" | "control_ui" | "recover_review"
-        | "start_mirror_comparison" | "cancel_mirror_comparison" | "prepare_mirror_confirmation"
+        | "start_mirror_comparison" | "cancel_mirror_comparison" | "prepare_mirror_confirmation" | "reconcile_copy_history"
     ) {
         let expected=params["expectedInstanceId"].as_str().ok_or("Writes require expectedInstanceId from the current review state; reconnect before continuing")?;
         let current = state.gateway.lock().map_err(error)?;
@@ -844,6 +845,9 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         "recover_review"=>{let(request,origin)=agent_control_params(params)?;crate::recovery_control::control(state,&request,origin)},
         "copy_queue_snapshot"=>copy_snapshot_for_rpc(state),
         "preview_copy_conflict"=>crate::copy_control::preview_conflict(state,params),
+        "reconcile_copy_history"=>{let(request,origin)=agent_control_params(params)?;
+            crate::copy_control::reconcile_history(state,&request,origin)},
+        "read_copy_effect_history"=>crate::copy_control::effect_history(state,params),
         "preview_mirror_binding"=>crate::mirror_service::preview(state,params),
         "mirror_comparison_status"=>crate::mirror_service::status(state,params),
         "read_mirror_evidence"=>crate::mirror_service::evidence_page(state,params),

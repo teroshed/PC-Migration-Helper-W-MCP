@@ -1316,6 +1316,13 @@ fn hold_directories(path: &Path, create: bool) -> Result<Vec<File>, String> {
     Ok(guards)
 }
 
+pub(crate) fn guard_copy_state_directory(path: &Path) -> Result<Vec<File>, String> {
+    if !path.is_absolute() {
+        return Err("Copy effect history requires an absolute app data directory.".into());
+    }
+    hold_directories(path, false)
+}
+
 fn hold_directory(path: &Path, create: bool) -> Result<File, String> {
     hold_entry(path, create, true, false)
 }

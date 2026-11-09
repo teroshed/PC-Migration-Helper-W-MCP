@@ -9,7 +9,9 @@ A Windows desktop app for deciding what to take to a new PC, recording the reaso
 <p align="center">
   <a href="#get-started">Get started</a> ·
   <a href="#review-and-copy">Review and copy</a> ·
+  <a href="#manual-backup-decisions">Mirror verification</a> ·
   <a href="docs/MCP.md">MCP setup</a> ·
+  <a href="docs/RECOVERY.md">Recovery</a> ·
   <a href="LICENSE">Project license</a>
 </p>
 
@@ -37,7 +39,7 @@ npm ci
 npm run tauri -- dev
 ```
 
-The default source roots are `C:\` and `E:\`. The copy destination is `F:\` on a different volume. A missing drive appears as unavailable. Keep the checkout writable so the app can create its ignored `runtime` directory.
+The default source roots are `C:\` and `E:\`. The copy destination is `F:\` on a different volume. A missing drive appears as unavailable. By default the app creates a writable `runtime` directory beside the executable; choose an absolute `--data-dir` to place its working files elsewhere.
 
 <details>
 <summary>Build an executable and try it on disposable folders</summary>
@@ -45,8 +47,7 @@ The default source roots are `C:\` and `E:\`. The copy destination is `F:\` on a
 Build a source executable with these commands. With the default Cargo target directory, the executable is `src-tauri\target\release\migration-master.exe`. A custom `CARGO_TARGET_DIR` changes its location.
 
 ```powershell
-npm run build
-cargo build --release --locked --features tauri/custom-protocol --manifest-path src-tauri/Cargo.toml
+npm run tauri -- build --no-bundle --ci -- --locked
 ```
 
 ```powershell
@@ -63,13 +64,13 @@ The fixture window uses these sibling directories for source and destination. It
 ## Review and copy
 
 1. Open a drive and click a folder name to enter it. Use the folder arrow to preview contents in the next column, or use the decision filter to narrow the main listing.
-2. Right-click a row or open its **⋯** menu to mark it. Add notes from the decision panel. Folder decisions flow to eligible children, and specific child decisions override them. An unmarked folder can show a derived summary of its children within a 2,000-entry, 64-level inspection budget. The copy queue uses saved decisions.
+2. Right-click a row or open its **⋯** menu to mark it. Add notes from the decision panel. Folder decisions flow to eligible children, and specific child decisions override them. Derived folder summaries distinguish unanimous, mixed, undecided, and unknown observed coverage. The copy queue uses saved decisions.
 3. Use **Count & hash** to inspect the current folder or all available source drives. Coverage and the notification bell show inaccessible paths and observed changes.
 4. Open the copy queue, check the destination, and start the intended batch. **Copy everything** runs over eligible **Migrate now** marks and can recheck files already on the destination. **Migrate last moment** has a separate per-entry action. **Auto-copy** starts off for each window session. While enabled, it can act on new **Migrate now** marks, including ones you direct an agent to save.
 
-The queue preserves paths below each source root. It blocks destination collisions and refuses to overwrite different content. It copies regular files and empty folders, verifies the unnamed file data stream with SHA-256, and records outcomes. Extra streams, links, offline data, and inaccessible paths can leave explicit gaps. Source files stay in place. **To be ERASED** records review intent.
+The queue preserves paths below each source root. It copies regular files and empty folders, verifies the unnamed data stream with SHA-256, and records outcomes. Existing different content stays intact. For an individual conflict you can explicitly review and choose a separate unused filename. Extra streams, links, offline data, and inaccessible paths can leave coverage gaps. **To be ERASED** records review intent; it does not delete source files.
 
-Closing the window during an active copy requests a pause. Wait for the queue to stop, then close the window.
+Normal Close saves pending edits, stops work safely, and checkpoints local data before exiting. A blocked checkpoint keeps the app open with **Retry Exit** and **Cancel Exit**. Background operation is opt-in. Use the [recovery guide](docs/RECOVERY.md) if restoring an older journal.
 
 <details>
 <summary>Keyboard controls</summary>
@@ -77,6 +78,8 @@ Closing the window during an active copy requests a pause. Wait for the queue to
 Use <kbd>Tab</kbd> and <kbd>Shift</kbd>+<kbd>Tab</kbd> to move between controls. On a folder row, <kbd>Enter</kbd> opens the folder and <kbd>→</kbd> previews it. In a preview, <kbd>←</kbd> closes that preview and returns to its parent. Use <kbd>↑</kbd> and <kbd>↓</kbd> to move through entries, or press <kbd>↓</kbd> from a column heading to find an entry that needs attention.
 
 <kbd>Space</kbd> and <kbd>Shift</kbd>+<kbd>F10</kbd> open a row’s decision menu. <kbd>Ctrl</kbd>+<kbd>Space</kbd> toggles the row’s selection. Use <kbd>Esc</kbd> to close a menu or dialog. From a row, <kbd>Esc</kbd> goes to search, and from the search toolbar it returns to the drive buttons. <kbd>Ctrl</kbd>+<kbd>Z</kbd> outside an editing field undoes the previous decision or note.
+
+Selection is separate from keyboard focus and the details panel. It stays with the review drive across pages, filters and previews. **Review selection** shows the exact entries and hidden count before applying a grouped mark. Grouped Undo reviews and restores the entire eligible group together.
 
 At the end of the search field, <kbd>→</kbd> moves to **Known folders**. Press <kbd>→</kbd> again to open the decision filter. The filter also opens when reached with <kbd>Tab</kbd>. Use the arrow keys and <kbd>Enter</kbd> to choose a filter.
 
@@ -88,9 +91,13 @@ At the end of the search field, <kbd>→</kbd> moves to **Known folders**. Press
 
 The app records confirmation time, provenance and source metadata. Destination checksum comparison and restore evidence have their own scope. Both manual choices stay outside automated copy batches. Existing **Already on F:** decisions retain their original selected-path behavior.
 
+Open **Manual mirror** to bind two exact folder roots and compare matching relative paths. The read-only comparison reports equal, missing, different and extra entries, plus inaccessible or unsupported gaps. You can record an explicit confirmation for reviewed frozen membership after resolving or excluding gaps. Later additions require their own review. An earlier comparison stays visible as dated evidence after reopen or a monitoring break.
+
 ## AI Assistance and adjustable layout
 
 Open **AI Assistance**, choose the current folder and complete its metadata inventory. The interview presents one question at a time with **Approve**, **Override**, **Review children** and **Defer**. Likely local exceptions are considered before their parents, and uncertain branches default to keeping data. Deferred branches and coverage gaps stay visible. Pending manual backups receive an explicit confirmation question after the ordinary review decisions.
+
+Choose **External model** to let a connected MCP client propose questions from a bounded packet of opaque IDs and statistics. The packet omits paths, names, notes and file contents. You still choose the answer. **Local questions** stays available without an external client. The app does not start a paid model call on its own.
 
 Drag sidebar or folder-column dividers to resize them, or focus a divider and use the arrow keys. An edge warning appears before a sidebar collapses or a column fills the workspace. Reopen controls restore the saved widths and preview branch. **Ctrl+End** on a folder divider fills its pane. Compact toolbar mode keeps labeled **Path** and **Search** controls available. Layout, filter and review context are saved automatically.
 
@@ -98,11 +105,11 @@ Drag sidebar or folder-column dividers to resize them, or focus a divider and us
 
 Register the bundled stdio server with your MCP client and leave the native app open. An agent can read folder metadata, saved decisions, audit progress, and the currently rendered review columns. It can navigate or reveal a path without clearing your filter. **Follow AI’s movement** is a window preference that reveals paths as the agent touches them when the review is idle.
 
-Agent suggestions are stored separately. User-directed changes retain their provenance and use the current app session and journal revision. The 29-tool bridge also exposes guarded copying, damaged-journal recovery, window controls and retained draft inspection. Copying requires explicit confirmation and current queue/volume fences; an exact retry returns the original receipt without starting another job. See [MCP setup and tool usage](docs/MCP.md) and the [desktop/HTTP/MCP action map](docs/ACTION-PARITY.md).
+Agent suggestions are stored separately. User-directed changes retain their provenance and use the current app session and journal revision. The bridge also exposes grouped marking, mirror evidence, guarded copying, recovery, window controls and retained draft inspection. Discover tools from the matching build. Copying requires explicit confirmation and current queue/volume fences; an exact retry returns its receipt without starting another job. See [MCP setup and tool usage](docs/MCP.md) and the [desktop/HTTP/MCP action map](docs/ACTION-PARITY.md).
 
 ## Data and coverage
 
-The checkout’s `runtime` directory holds the review journal, recovery copy, inventory, audit and copy receipts, and the private gateway descriptor. Keep the journal in your backup plan. To use another writable location, launch the executable with `--data-dir` and an absolute directory path, then point the MCP server at that directory’s descriptor.
+The app data directory holds the review journal, recovery copy, inventory, audit, copy receipts and private gateway descriptor. Include the journal and independent copy effect history in your backup plan. To use another writable location, launch the executable with `--data-dir` and an absolute directory path, then point the MCP server at that directory’s descriptor.
 
 Use `--journal-file` with an existing absolute journal filename to retain a journal stored separately from the runtime directory. Fixture runs use their own journal and reject regular-run journal overrides.
 

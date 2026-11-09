@@ -3,7 +3,7 @@
 use crate::{assistance, filesystem, mirror, store, AppState, Shared};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{path::{Path,PathBuf}, sync::{atomic::AtomicBool,Mutex}};
+use std::{path::{Path,PathBuf}, sync::{atomic::{AtomicBool,Ordering},Mutex}};
 
 const SLATE_LIMIT: usize = 12;
 const MAX_QUESTIONS: u64 = 128;
@@ -14,6 +14,12 @@ const REPLY_BYTES: usize = 8 * 1024;
 pub(crate) struct Runtime {
     exchange: Mutex<Option<Exchange>>,
     preparation: Mutex<()>,
+    canceled: AtomicBool,
+}
+
+impl Runtime {
+    pub(crate) fn interrupt(&self) { self.canceled.store(true,Ordering::SeqCst); }
+    pub(crate) fn reopen(&self) { self.canceled.store(false,Ordering::SeqCst); }
 }
 
 #[derive(Clone)]
@@ -285,7 +291,7 @@ fn candidate_fence(s: &AppState, evidence: &Evidence, candidate: &Value) -> Resu
     let relative = Path::new(candidate_path).strip_prefix(prefix).map_err(|_|
         "The candidate is outside the exact interview scope")?.to_str().ok_or("Unsupported candidate path")?;
     let proof = mirror::revalidate_source_scope(&evidence_directory(s), &receipt,
-        source_environment(s)?, relative, &AtomicBool::new(false))?;
+        source_environment(s)?, relative, &s.adaptive.canceled)?;
     if proof.kind != candidate["kind"] || proof.files != candidate["files"] {
         return Err("The selected candidate membership changed. Review it again.".into());
     }
@@ -317,7 +323,7 @@ pub(crate) fn context(s: &AppState) -> Result<Value, String> {
             let directory = mirror::create_source_evidence_directory(
                 &s.runtime, "interview-evidence", scope, env,
             ).map_err(|_| "An external question needs a guarded evidence directory outside its source scope.")?;
-            let receipt = mirror::freeze_source(scope, env, &directory, &AtomicBool::new(false), |_| {})
+            let receipt = mirror::freeze_source(scope, env, &directory, &s.adaptive.canceled, |_| {})
                 .map_err(|_| "Current source membership could not be frozen. Review the folder locally or choose a narrower scope.")?;
             Evidence { scope:receipt.endpoint.root.clone(),scan_stamp:scan_stamp.into(),
                 membership_digest:receipt.manifest_digest.clone(),

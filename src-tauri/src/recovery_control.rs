@@ -1,5 +1,5 @@
 //! Explicit, fingerprint-fenced recovery using the same Store operation for UI and RPC.
-use crate::{canonical_json, document, store::{self, error, hash, now, Store}, AppState, MutationOrigin, Shared};
+use crate::{canonical_json, document, store::{error, hash, now, Store}, AppState, MutationOrigin, Shared};
 use serde_json::{json, Value};
 use std::fs;
 
@@ -18,7 +18,7 @@ fn snapshot_locked(s: &AppState, store: &Store, instance: &Value) -> Result<Valu
     let backup_hash = backup.as_deref().map(hash);
     let parsed = backup.as_deref().map(|value| {
         serde_json::from_slice::<Value>(value).map_err(error).and_then(|doc| {
-            store::validate(&doc)?;
+            store.validate_recovery_document(&doc)?;
             Ok(doc)
         })
     });
@@ -26,6 +26,7 @@ fn snapshot_locked(s: &AppState, store: &Store, instance: &Value) -> Result<Valu
     let backup_problem = parsed.as_ref().and_then(|result| result.as_ref().err()).cloned();
     let summary = parsed.as_ref().and_then(|result| result.as_ref().ok()).map(|doc| json!({
         "revision":doc["revision"],
+        "schemaVersion":doc["schemaVersion"],
         "decisionCount":doc["decisions"].as_object().map_or(0,|items|items.len()),
         "historyCount":doc["history"].as_array().map_or(0,|items|items.len()),
         "updatedAt":doc["updatedAt"],

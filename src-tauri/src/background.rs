@@ -87,6 +87,9 @@ pub fn status(s: &AppState) -> Result<Value, String> {
     )
 }
 pub fn begin_exit(s: &AppState) -> Result<Value, String> {
+    // Optional source-proof reads can cooperatively stop before their next
+    // filesystem batch even if the caller currently holds an edit guard.
+    s.adaptive.interrupt();
     let mut guard = s.background.session.lock().map_err(error)?;
     if let Some(pending) = &guard.pending {
         return Ok(pending.clone());
@@ -120,6 +123,7 @@ pub fn cancel_exit(s: &AppState, ticket: u64) -> Result<(), String> {
     guard.watcher_gap_pending = false;
     guard.pending = None;
     guard.exit_problem = None;
+    s.adaptive.reopen();
     Ok(())
 }
 fn join_stopped_watcher(s: &AppState) -> Result<bool, String> {

@@ -250,6 +250,20 @@ impl Store {
         self.fingerprint.as_deref()
     }
 
+    pub fn validate_recovery_document(&self, doc: &Value) -> Result<(), String> {
+        validate(doc)?;
+        if doc["schemaVersion"].as_u64().unwrap() < self.minimum_schema {
+            return Err("Recovery would downgrade this journal format. Use a reviewed compatible backup.".into());
+        }
+        Ok(())
+    }
+
+    pub fn can_recover(&self) -> bool {
+        self.problem.is_some() && read_optional(&self.path.with_extension("json.bak"))
+            .ok().flatten().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|doc| self.validate_recovery_document(&doc).is_ok())
+    }
+
     pub fn commit(&mut self, candidate: Value) -> Result<Value, String> {
         self.commit_guarded(candidate, || Ok(()))
     }
@@ -350,10 +364,7 @@ impl Store {
             return Err("The recovery copy changed. Inspect recovery state again before proceeding.".into());
         }
         let mut doc: Value = serde_json::from_slice(&backup).map_err(error)?;
-        validate(&doc)?;
-        if doc["schemaVersion"].as_u64().unwrap() < self.minimum_schema {
-            return Err("Recovery would downgrade this journal format. Restore a reviewed compatible backup; the original was preserved.".into());
-        }
+        self.validate_recovery_document(&doc)?;
         let restored = if let Some((operation_id, mut receipt)) = receipt {
             if doc.get("recoveryOperations").is_some_and(|value| !value.is_object()) {
                 return Err("Recovery receipt metadata has an unsupported format. Original preserved.".into());

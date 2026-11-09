@@ -63,13 +63,14 @@ confirmation, fencing, retries and asynchronous status.
 | Compare source and mirror, cancel, inspect evidence, prepare and confirm exact membership | `get_mirror_comparison`, `start_mirror_comparison`, `cancel_mirror_comparison`, `read_mirror_evidence`, `prepare_mirror_confirmation`, `confirm_mirror_membership` | Mirror status, comparison and evidence methods; `mutate`: `mirrorConfirm` |
 | Review and explicitly copy one file beside an occupied original destination | `preview_copy_conflict`, `control_copy_queue`: `startSeparate` | `preview_copy_conflict`, `control_copy_queue` |
 | Choose external or local assistance, revalidate, and submit one proposal | `control_adaptive_interview`, `get_adaptive_question_packet`, `propose_adaptive_question` | `get_adaptive_question_packet`; `mutate`: `adaptiveControl` / `adaptiveProposal` |
+| Inspect and reconcile independent copy history | `get_copy_queue`, `read_copy_effect_history`, `reconcile_copy_history` | `copy_queue_snapshot`, `read_copy_effect_history`, `reconcile_copy_history` |
 | Inspect a damaged journal and a valid recovery backup | `get_recovery_state` | `get_recovery_state` |
 | Explicitly restore that reviewed backup, preserving the displaced original | `recover_review` | `recover_review` |
 
 These mappings expose supported outcomes. For example, querying the next
 attention target does not silently navigate the desktop; the caller composes the
 returned target with navigation. Opening a decision menu does not apply a mark.
-The current model has one selected path; Ctrl+Space toggles that selection.
+Keyboard focus, the current details target, and the per-root selection are separate. Ctrl+Space toggles an exact member of the selection.
 
 ## Confirmation and job semantics
 
@@ -88,9 +89,15 @@ and needs a newly confirmed start. Auto-copy starts off each session and enablin
 it requires current copy fences and confirmation.
 
 Both manual backup states stay outside automated copy batches. `all` includes
-Migrate now only. Last Moment requires a separate explicit path scope. All copy
+Migrate now only. Last Moment requires a separate explicit path scope. Ordinary copy
 modes preserve the configured source-relative path to the destination, use the
 same no-replace/hash checks and expose no deletion or wipe action.
+
+A separately named conflict copy requires its own reviewed filename and
+fingerprint. The ordinary original-path queue remains unresolved for that file.
+The independent copy ledger records durable admission before release. A
+recovered journal missing newer admissions blocks further copying until the
+user reviews and reconciles the exact history. See [recovery](RECOVERY.md).
 
 Recovery is available only to the exclusive journal owner with a valid backup
 and a still-matching malformed/missing original. Its request binds both file
