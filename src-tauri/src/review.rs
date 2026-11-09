@@ -321,6 +321,40 @@ fn open_main_patch(view: &Value, path: &str) -> Value {
         "previewColumns":[],"previewScrollLeft":0})
 }
 
+fn clear_navigation_overlays(view: &Value, patch: &mut Value) {
+    patch["search"] = json!("");
+    patch["revealPath"] = Value::Null;
+    if view["layout"]["fillDepth"].is_u64() {
+        patch["layout"] = view["layout"].clone();
+        patch["layout"]["fillDepth"] = Value::Null;
+    }
+}
+
+fn close_preview_patch(view: &Value, closing: usize) -> Result<Value, String> {
+    let mut columns = previews(view);
+    let index = closing
+        .checked_sub(1)
+        .ok_or("The main review column cannot be closed")?;
+    let removed = columns
+        .get(index)
+        .and_then(|column| column["path"].as_str())
+        .ok_or("The preview column is not open")?;
+    let selection = if view["selectedPath"]
+        .as_str()
+        .is_some_and(|path| filesystem::under(path, removed))
+    {
+        json!(removed)
+    } else {
+        view["selectedPath"].clone()
+    };
+    columns.truncate(index);
+    let mut patch = json!({"previewColumns":columns,"selectedPath":selection,"revealPath":null});
+    if index == 0 {
+        patch["previewScrollLeft"] = json!(0);
+    }
+    Ok(patch)
+}
+
 fn reveal_container(s: &AppState, path: &str) -> Result<Option<String>, String> {
     let (volume, _, _) = filesystem::identify(path, &s.volumes)?;
     if same_path(path, &volume.root) {
@@ -514,6 +548,58 @@ fn action_patch(s: &AppState, doc: &Value, view: &Value, op: &Value) -> Result<V
             patch["revealPath"] = Value::Null;
             Ok(patch)
         }
+        "centerFolder" => {
+            let path = text_path(&op["path"])?;
+            open_folder(s, &path)?;
+            let mut patch = open_main_patch(view, &path);
+            if view["path"].as_str().is_some_and(|current| same_path(current, &path)) {
+                return Ok(patch);
+            }
+            let columns = previews(view);
+            if let Some(index) = columns.iter().position(|column|
+                column["path"].as_str().is_some_and(|item| same_path(item, &path)))
+            {
+                let promoted = &columns[index];
+                if view["filter"] == "all" {
+                    patch["page"] = promoted["page"].clone();
+                    patch["scrollTop"] = promoted["scrollTop"].clone();
+                }
+                patch["browserColumnWidth"] = promoted.get("width").cloned().unwrap_or_else(|| json!(360));
+                patch["previewColumns"] = json!(columns[index + 1..]);
+            }
+            clear_navigation_overlays(view, &mut patch);
+            Ok(patch)
+        }
+        "backFolder" => {
+            let closing = depth(op.get("depth"))?;
+            let current = text_path(&view["path"])?;
+            let (volume, _, _) = filesystem::identify(&current, &s.volumes)?;
+            if same_path(&current, &volume.root) {
+                return close_preview_patch(view, closing);
+            }
+            let columns = previews(view);
+            if closing > columns.len() {
+                return Err("The preview column is not open".into());
+            }
+            let parent = parent_path(&current).ok_or("There is no parent review folder")?;
+            open_folder(s, &parent)?;
+            let mut patch = open_main_patch(view, &parent);
+            let same_query = view["filter"] == "all" && view["search"] == "";
+            let mut previous = json!({
+                "path":current,
+                "page":if same_query { view["page"].clone() } else { json!(0) },
+                "scrollTop":if same_query { view["scrollTop"].clone() } else { json!(0) },
+            });
+            if let Some(width) = view.get("browserColumnWidth") {
+                previous["width"] = width.clone();
+            }
+            let mut branch = vec![previous];
+            branch.extend(columns.into_iter().take(4095));
+            patch["selectedPath"] = json!(current);
+            patch["previewColumns"] = json!(branch);
+            clear_navigation_overlays(view, &mut patch);
+            Ok(patch)
+        }
         "openPreview" => {
             let from = depth(op.get("depth"))?;
             let path = text_path(&op["path"])?;
@@ -541,30 +627,7 @@ fn action_patch(s: &AppState, doc: &Value, view: &Value, op: &Value) -> Result<V
             Ok(json!({"previewColumns":columns,"selectedPath":path,"revealPath":null}))
         }
         "closePreview" => {
-            let closing = depth(op.get("depth"))?;
-            let mut columns = previews(view);
-            let index = closing
-                .checked_sub(1)
-                .ok_or("The main review column cannot be closed")?;
-            let removed = columns
-                .get(index)
-                .and_then(|column| column["path"].as_str())
-                .ok_or("The preview column is not open")?;
-            let selection = if view["selectedPath"]
-                .as_str()
-                .is_some_and(|p| filesystem::under(p, removed))
-            {
-                json!(removed)
-            } else {
-                view["selectedPath"].clone()
-            };
-            columns.truncate(index);
-            let mut patch =
-                json!({"previewColumns":columns,"selectedPath":selection,"revealPath":null});
-            if index == 0 {
-                patch["previewScrollLeft"] = json!(0);
-            }
-            Ok(patch)
+            close_preview_patch(view, depth(op.get("depth"))?)
         }
         "reveal" => reveal_patch(s, doc, view, &op["path"]),
         "select" => {
@@ -759,6 +822,38 @@ mod tests {
         );
         assert_eq!(doc["view"]["previewColumns"], json!([]));
         assert_eq!(doc["view"]["selectedPath"], work);
+    }
+
+    #[test]
+    fn back_and_center_keep_surviving_preview_positions() {
+        let s = crate::tests::fixture();
+        let root = &s.volumes[0].root;
+        let work = format!("{root}\\Work");
+        let child = format!("{work}\\Child");
+        let leaf = format!("{child}\\Leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        mutate(&s, "start-in-work", json!({"type":"review","action":"openMain","path":work}));
+        mutate(&s, "set-main-position", json!({"type":"review","action":"setView","page":2,"scrollTop":30.5}));
+        mutate(&s, "show-child", json!({"type":"review","action":"openPreview","path":child,"depth":0}));
+        mutate(&s, "set-child-position", json!({"type":"review","action":"setView","depth":1,"page":3,"scrollTop":14.5}));
+        mutate(&s, "set-child-width", json!({"type":"review","action":"setLayout","depth":1,"width":420}));
+        mutate(&s, "show-leaf", json!({"type":"review","action":"openPreview","path":leaf,"depth":1}));
+        let backed = mutate(&s, "back-with-previews", json!({"type":"review","action":"backFolder","depth":2}));
+        assert_eq!(backed["view"]["path"], *root);
+        assert_eq!(backed["view"]["selectedPath"], work);
+        let columns = previews(&backed["view"]);
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns[0]["path"], work);
+        assert_eq!(columns[0]["page"], 2);
+        assert_eq!(columns[0]["scrollTop"], 30.5);
+        assert_eq!(columns[1]["path"], child);
+        assert_eq!(columns[2]["path"], leaf);
+        let centered = mutate(&s, "center-child", json!({"type":"review","action":"centerFolder","path":child}));
+        assert_eq!(centered["view"]["path"], child);
+        assert_eq!(centered["view"]["browserColumnWidth"], 420);
+        assert_eq!(centered["view"]["page"], 3);
+        assert_eq!(centered["view"]["scrollTop"], 14.5);
+        assert_eq!(previews(&centered["view"]), columns[2..]);
     }
 
     #[test]

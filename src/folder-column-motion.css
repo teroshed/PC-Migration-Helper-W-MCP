@@ -1,0 +1,15 @@
+.folder-column-exits {
+  position: absolute;
+  inset: 0 auto auto 0;
+  z-index: 2;
+  overflow: clip;
+  contain: layout paint;
+  pointer-events: none;
+  user-select: none;
+}
+
+.review-layout .folder-column-exits > .folder-column {
+  position: absolute;
+  min-width: 0;
+  margin: 0;
+}

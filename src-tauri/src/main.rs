@@ -208,6 +208,12 @@ fn recorded_effective_cached(
     let original = decision["status"].as_str().unwrap_or("attention");
     let mut status = original;
     let mut stale = false;
+    let verified_manual_backup = original == "manual-pending" && is_own
+        && matches!(e.kind.as_str(), "folder" | "file") && e.problem.is_none()
+        && s.mirrors.verifies_manual_scope(doc, &e.path, volume, s.fixture);
+    if verified_manual_backup {
+        status = "manual-confirmed";
+    }
     if original == "on-external" {
         if inherited.is_some() {
             status = "attention";
@@ -256,7 +262,9 @@ fn recorded_effective_cached(
                 .count()
         })
         .unwrap_or(0);
-    json!({"status":status,"own":is_own,"inheritedFrom":inherited,"stale":stale,"mixed":mixed,"originalStatus":if decision.is_object(){Some(original)}else{None}})
+    json!({"status":status,"own":is_own,"inheritedFrom":inherited,"stale":stale,"mixed":mixed,
+        "originalStatus":if decision.is_object(){Some(original)}else{None},
+        "manualEvidence":verified_manual_backup.then_some("mirror-verified")})
 }
 
 fn effective(s: &AppState, doc: &Value, entry: &Entry) -> Value {
@@ -857,6 +865,10 @@ fn run_mutation_as(
             }
             "assist" => assistance::update(s, &mut doc, &op)?,
             "adaptiveControl" => adaptive_review::configure(s, &mut doc, &op)?,
+            "inventoryPriority" => {
+                let defer = op["deferMarked"].as_bool().ok_or("Choose an inventory priority.")?;
+                doc["inventoryDeferMarked"] = json!(defer);
+            }
             "adaptiveProposal" => adaptive_review::submit(s, &mut doc, &op, &provenance)?,
             "mirrorBind" => mirror_service::apply_binding(s, &mut doc, &op)?,
             "mirrorConfirm" => {
@@ -913,16 +925,22 @@ fn run_mutation_as(
                     if question.is_some() && status == "attention" {
                         return Err("Use Defer to leave this interview question unanswered.".into());
                     }
-                    let (checked, _guards) =
-                        filesystem::guard_path(&path, &s.volumes, question.is_none())?;
+                    // A failed source check happens before this operation can save anything.
+                    let reject_path = |problem: String| {
+                        if operation_type == "classify" {
+                            format!("Mark rejected before save: {problem}")
+                        } else {
+                            problem
+                        }
+                    };
+                    let (checked, _guards) = filesystem::guard_path(&path, &s.volumes, question.is_none())
+                        .map_err(reject_path)?;
                     let entry = filesystem::inspect(&checked);
                     if entry.problem.is_some()
                         || question.as_ref().is_some_and(|q| q["kind"] != entry.kind)
                     {
-                        return Err(
-                            "This path is unavailable; the existing decision remains retained."
-                                .into(),
-                        );
+                        return Err(reject_path(entry.problem.unwrap_or_else(||
+                            format!("{path} changed before it could be marked."))));
                     }
                     if is_agent {
                         activity = Some(("mark", path.clone()));
@@ -1049,6 +1067,9 @@ fn run_mutation_as(
         // queued work after an intent change, so the next pass uses the new marks.
         s.copy_queue.pause();
     }
+    if classification_changed || operation_type == "inventoryPriority" {
+        s.index.update_priority(&saved, &s.volumes);
+    }
     if let Some((kind, path)) = activity {
         s.review.activity(kind, &path, saved["revision"].as_u64());
     }
@@ -1078,7 +1099,8 @@ async fn recover(state: State<'_, Shared>) -> Result<Value, String> {
 
 fn status_service(s: &AppState) -> Result<Value, String> {
     Ok(
-        json!({"scan":s.index.scan_status()?,"gaps":s.index.gaps()?,"decisionCount":document(s)?["decisions"].as_object().map(|m|m.len()).unwrap_or(0)}),
+        json!({"scan":s.index.scan_status()?,"gaps":s.index.gaps()?,"decisionCount":document(s)?["decisions"].as_object().map(|m|m.len()).unwrap_or(0),
+            "mirrorEvidenceStamp":s.mirrors.matching_stamp()}),
     )
 }
 
@@ -1285,7 +1307,10 @@ async fn get_status(state: State<'_, Shared>) -> Result<Value, String> {
         .map_err(error)?
 }
 
-fn scan_service(s: &AppState, mode: String, path: String) -> Result<Value, String> {
+fn scan_service(s: &AppState, mode: String, path: String, include_generated: bool) -> Result<Value, String> {
+    if include_generated && !matches!(mode.as_str(), "all" | "current") {
+        return Err("Choose whether to include generated folders when starting an inventory.".into());
+    }
     let _start = if mode != "pause" { Some(s.background.start_guard()?) } else { None };
     {
         let guard = s.store.lock().map_err(error)?;
@@ -1295,12 +1320,15 @@ fn scan_service(s: &AppState, mode: String, path: String) -> Result<Value, Strin
         if let Some(e) = &store.problem {
             return Err(e.clone());
         }
+        if mode != "pause" {
+            s.index.update_priority(&store.doc, &s.volumes);
+        }
     }
     match mode.as_str() {
         "pause" => {
             s.index.cancel.store(true, Ordering::Relaxed);
         }
-        "resume" => s.index.start(Vec::new(), s.volumes.clone(), true)?,
+        "resume" => s.index.start(Vec::new(), s.volumes.clone(), true, false)?,
         "all" => s.index.start(
             s.volumes
                 .iter()
@@ -1309,20 +1337,22 @@ fn scan_service(s: &AppState, mode: String, path: String) -> Result<Value, Strin
                 .collect(),
             s.volumes.clone(),
             false,
+            include_generated,
         )?,
         "current" => s.index.start(
             vec![filesystem::normalize(&path)?],
             s.volumes.clone(),
             false,
+            include_generated,
         )?,
         _ => return Err("Unknown inventory action".into()),
     }
     s.index.scan_status()
 }
 #[tauri::command]
-async fn scan(state: State<'_, Shared>, mode: String, path: String) -> Result<Value, String> {
+async fn scan(state: State<'_, Shared>, mode: String, path: String, include_generated: Option<bool>) -> Result<Value, String> {
     let s = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || scan_service(&s, mode, path))
+    tauri::async_runtime::spawn_blocking(move || scan_service(&s, mode, path, include_generated.unwrap_or(false)))
         .await
         .map_err(error)?
 }

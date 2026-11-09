@@ -904,7 +904,13 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
             if let Some(path)=&after{filesystem::identify(path,&state.volumes)?;}
             Ok(next_attention_service(state,text(params,"path",None)?,after)?.unwrap_or(Value::Null))
         },
-        "scan"=>scan_service(state,text(params,"mode",None)?,text(params,"path",Some(&state.volumes[0].root))?),
+        "scan" => {
+            let include_generated = params.get("includeGenerated")
+                .map(|value| value.as_bool().ok_or("includeGenerated must be a boolean"))
+                .transpose()?.unwrap_or(false);
+            scan_service(state, text(params,"mode",None)?,
+                text(params,"path",Some(&state.volumes[0].root))?, include_generated)
+        }
         "mutate"=>{
             let operation=params.get("operation").filter(|v|v.is_object()).ok_or("Missing operation")?.clone();
             let operation_id=text(params,"operationId",None)?;

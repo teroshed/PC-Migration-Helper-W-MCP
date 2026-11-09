@@ -123,7 +123,8 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
         "setSavedRecords" => &["action", "search", "filter", "page"],
         "setNotifications" => &["action", "mode", "offset"],
         "setAssistanceOverride" => &["action", "open", "questionId"],
-        "setCopyDetails" | "setGatewayDetails" => &["action", "open"],
+        "navigateAssistance" => &["action", "mode", "path", "depth", "value"],
+        "setCopyDetails" | "setGatewayDetails" | "setAssistanceScanDetails" | "setAssistanceDetails" => &["action", "open"],
         "setRowMenu" => &["action", "path"],
         "setEntrySelection" => &["action", "path", "selected", "expectedSelectionFingerprint"],
         "clearEntrySelection" | "openSelectionReview" => &["action", "expectedSelectionFingerprint"],
@@ -158,7 +159,7 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
         "setFollowAI" | "setAutoCopy" if !command["enabled"].is_boolean() => {
             return Err("enabled must be true or false".into())
         }
-        "setCopyDetails" | "setGatewayDetails" | "setAssistanceOverride"
+        "setCopyDetails" | "setGatewayDetails" | "setAssistanceOverride" | "setAssistanceScanDetails" | "setAssistanceDetails"
             if !command["open"].is_boolean() =>
         {
             return Err("open must be true or false".into())
@@ -277,11 +278,32 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
     if action == "setAssistanceOverride" {
         text(command, "questionId")?;
     }
+    if action == "navigateAssistance" {
+        let mode = text(command, "mode")?;
+        let no_path = command.get("path").is_none();
+        let no_depth = command.get("depth").is_none();
+        let no_value = command.get("value").is_none();
+        let depth = command["depth"].as_u64().filter(|depth| *depth < 48);
+        let valid = match mode {
+            "center" | "preview" => command["path"].as_str().is_some() && no_depth && no_value,
+            "menu" => command.get("path").is_some_and(|path| path.is_null() || path.is_string())
+                && no_depth && no_value,
+            "return" | "compare" => no_path && no_depth && no_value,
+            "close" => no_path && no_value && depth.is_some_and(|depth| depth > 0),
+            "refresh" => no_path && no_value && depth.is_some(),
+            "page" => no_path && depth.is_some() && command["value"].as_u64().is_some_and(|page| page <= 1_000_000),
+            "resize" => no_path && depth.is_some() && command["value"].as_u64().is_some_and(|width| width <= 2000),
+            _ => false,
+        };
+        if !valid {
+            return Err("Invalid assistance navigation command.".into());
+        }
+    }
     Ok(())
 }
 fn validate_command(s: &AppState, command: &Value) -> Result<(), String> {
     validate_command_structure(command)?;
-    if matches!(command["action"].as_str(), Some("setRowMenu" | "setEntrySelection")) {
+    if matches!(command["action"].as_str(), Some("setRowMenu" | "setEntrySelection" | "navigateAssistance")) {
         if let Some(path) = command["path"].as_str() {
             crate::filesystem::safe(path, &s.volumes, false)?;
         }

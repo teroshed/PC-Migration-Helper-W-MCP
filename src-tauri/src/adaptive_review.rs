@@ -121,8 +121,10 @@ pub(crate) fn scope_changed(doc: &mut Value, scope: &str) {
 
 pub(crate) fn prompt(runtime: &Runtime, doc: &Value, instance: &str,
     evidence: Evidence, candidates: Vec<Value>) -> Result<Value, String> {
-    if !active(doc) || session(doc)?.is_empty()
-        || doc["adaptiveInterview"]["scope"] != evidence.scope
+    let review_scope = doc["adaptiveInterview"]["scope"].as_str().unwrap_or("");
+    if !active(doc) || session(doc)?.is_empty() || review_scope.is_empty()
+        || (review_scope != evidence.scope && !(assistance::is_early_stamp(&evidence.scan_stamp)
+            && filesystem::under(&evidence.scope, review_scope)))
     {
         return Err("Start an external interview from the desktop for this scope.".into());
     }
@@ -267,10 +269,14 @@ fn evidence_directory(s: &AppState) -> PathBuf { s.runtime.join("interview-evide
 
 fn ready_scan(view: &Value) -> Option<&str> {
     matches!(view["phase"].as_str(), Some("question" | "complete"))
-        .then(|| view["scan"]["finishedAt"].as_str()).flatten()
+        .then(|| view["earlyStamp"].as_str().or_else(|| view["scan"]["finishedAt"].as_str())).flatten()
 }
 
 fn scope_check(s: &AppState, scope: &str, stamp: &str) -> Result<(), String> {
+    if assistance::is_early_stamp(stamp) {
+        return if assistance::early_branch_current(s, scope, stamp)? { Ok(()) }
+        else { Err("The inventoried branch changed. Request a fresh question.".into()) };
+    }
     let scan = s.index.scan_status()?;
     if scan["status"] != "complete" || scan["finishedAt"] != stamp
         || s.index.changed_below(scope, stamp)? || s.audit.changed_below(scope, stamp)?
@@ -307,8 +313,11 @@ pub(crate) fn context(s: &AppState) -> Result<Value, String> {
     if !active(&doc) { return Err("Choose External model in AI Assistance first.".into()); }
     if proposal(&doc).is_some() { return Err("The current question is waiting for the user's answer.".into()); }
     let (view, mut slate) = assistance::local_slate(s, &doc, SLATE_LIMIT)?;
-    let scan_stamp = ready_scan(&view).ok_or("Wait for the selected folder inventory to finish.")?;
-    let scope = view["scope"].as_str().ok_or("No interview scope is ready")?;
+    let scan_stamp = ready_scan(&view).ok_or("No finished branch is ready from the inventory yet.")?;
+    if view["skippedGenerated"].as_u64().unwrap_or(0) != 0 {
+        return Err("This scope has skipped generated folders. Use local questions, choose a narrower scope, or explicitly include generated folders.".into());
+    }
+    let scope = view["earlyBranch"].as_str().or_else(|| view["scope"].as_str()).ok_or("No interview scope is ready")?;
     scope_check(s, scope, scan_stamp)?;
     if slate.is_empty() || slate[0]["manualConfirmation"] == true {
         return Err("There is no ordinary model question ready. Review manual or unresolved work locally.".into());
@@ -364,12 +373,24 @@ pub(crate) fn decorate(s: &AppState, doc: &Value, view: &mut Value) -> Result<()
         adaptive["phase"] = json!("local");
     } else if let Some(saved) = proposal(doc) {
         let current_instance = instance(s).ok();
+        let early = saved["scanStamp"].as_str().filter(|stamp| assistance::is_early_stamp(stamp));
+        let evidence_current = if let Some(stamp) = early {
+            if let (Some(branch), Some(scope)) = (saved["scope"].as_str(), view["scope"].as_str()) {
+                filesystem::under(branch, scope) && assistance::early_branch_current(s, branch, stamp)?
+            } else { false }
+        } else {
+            saved["scanStamp"].as_str() == ready_scan(view) && saved["scope"] == view["scope"]
+        };
         let is_current = saved["instanceId"].as_str() == current_instance.as_deref()
-            && saved["scanStamp"].as_str() == ready_scan(view) && saved["scope"] == view["scope"];
+            && evidence_current;
         if is_current {
             adaptive["phase"] = json!("question");
             view["question"] = saved["question"].clone();
             view["phase"] = json!("question");
+            if early.is_some() {
+                view["earlyBranch"] = saved["scope"].clone();
+                view["earlyStamp"] = saved["scanStamp"].clone();
+            }
         } else {
             adaptive["phase"] = json!("revalidate");
             adaptive["retainedQuestion"] = saved["question"].clone();
@@ -378,6 +399,7 @@ pub(crate) fn decorate(s: &AppState, doc: &Value, view: &mut Value) -> Result<()
     } else {
         adaptive["phase"] = json!(if remaining(doc)==0 { "limit" }
             else if ready_scan(view).is_none() { "waiting-inventory" }
+            else if view["skippedGenerated"].as_u64().unwrap_or(0) != 0 { "unavailable" }
             else if view["question"].is_null() || view["question"]["manualConfirmation"]==true { "unavailable" }
             else { "waiting-model" });
         view["question"] = Value::Null;
@@ -388,18 +410,24 @@ pub(crate) fn decorate(s: &AppState, doc: &Value, view: &mut Value) -> Result<()
 
 fn resume(s: &AppState, doc: &mut Value) -> Result<(), String> {
     let prior = proposal(doc).ok_or("There is no saved external question to revalidate.")?.clone();
-    let (view, _) = assistance::local_slate(s, doc, 1)?;
-    let stamp = ready_scan(&view).ok_or("Run a fresh inventory before revalidating this question.")?;
     let mut evidence = proposal_evidence(&prior)?;
-    if view["scope"] != evidence.scope { return Err("The saved question belongs to a different review scope.".into()); }
-    scope_check(s, &evidence.scope, stamp)?;
-    evidence.scan_stamp = stamp.into();
+    if assistance::is_early_stamp(&evidence.scan_stamp) {
+        let scope = doc["assistance"]["scope"].as_str().ok_or("Choose an interview scope first.")?;
+        if !filesystem::under(&evidence.scope, scope) {
+            return Err("The saved question belongs to a different review scope.".into());
+        }
+    } else {
+        let (view, _) = assistance::local_slate(s, doc, 1)?;
+        if view["scope"] != evidence.scope { return Err("The saved question belongs to a different review scope.".into()); }
+        evidence.scan_stamp = ready_scan(&view).ok_or("Run a fresh inventory before revalidating this question.")?.into();
+    }
+    scope_check(s, &evidence.scope, &evidence.scan_stamp)?;
     let current = candidate_fence(s, &evidence, &prior["question"])?;
     if prior["candidateFence"] != current {
         return Err("The saved question's exact members changed. Keep it in history and choose local questions or start a new external session.".into());
     }
     doc["adaptiveInterview"]["proposal"]["instanceId"] = json!(instance(s)?);
-    doc["adaptiveInterview"]["proposal"]["scanStamp"] = json!(stamp);
+    doc["adaptiveInterview"]["proposal"]["scanStamp"] = json!(evidence.scan_stamp);
     Ok(())
 }
 
@@ -440,6 +468,47 @@ mod tests {
     }
 
     #[test]
+    fn model_packet_and_proposal_use_a_finished_branch_during_inventory() {
+        let s = crate::tests::fixture();
+        fs::create_dir_all(&s.runtime).unwrap();
+        let root = &s.volumes[0].root;
+        let ready = Path::new(root).join("Ready");
+        fs::create_dir_all(&ready).unwrap();
+        fs::write(ready.join("invented-private-name.txt"), b"synthetic file").unwrap();
+        crate::run_mutation(&s, revision(&s), "early-adaptive-scope".into(),
+            json!({"type":"assist","action":"scope","path":root})).unwrap();
+        crate::run_mutation(&s, revision(&s), "early-adaptive-enable".into(),
+            json!({"type":"adaptiveControl","action":"external","questionLimit":2})).unwrap();
+        crate::scan_service(&s, "current".into(), root.clone(), false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while s.index.running.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let db = s.index.connect().unwrap();
+        db.execute("UPDATE queue SET state='working' WHERE path=?1", [format!("{root}\\Work")]).unwrap();
+        db.execute("UPDATE meta SET value=json_set(value,'$.status','running','$.finishedAt',null) WHERE key='scan'", []).unwrap();
+        let request = context(&s).unwrap();
+        let packet = &request["packet"];
+        let encoded = serde_json::to_string(packet).unwrap();
+        assert!(!encoded.contains("invented-private-name") && !encoded.contains(root));
+        let reply = json!({"type":"adaptiveProposal","proposal":{"version":1,"requestId":packet["requestId"],
+            "candidateId":packet["candidates"][0]["id"],"question":"Keep these files together?",
+            "reason":"A keep decision covers the reviewed members.","recommendation":"keep"}});
+        let saved = crate::run_mutation_as(&s, revision(&s), "early-adaptive-proposal".into(), reply,
+            MutationOrigin::Agent {basis:"assistant_suggestion".into(),reason:"Synthetic branch fixture".into()}).unwrap();
+        let view = assistance::snapshot(&s, &saved).unwrap();
+        assert_eq!(view["scan"]["status"], "running");
+        assert_eq!(view["earlyBranch"], json!(ready));
+        assert_eq!(view["question"]["source"], "codex");
+        assert!(saved["decisions"].as_object().unwrap().is_empty());
+        let answer = json!({"type":"assistAnswer","path":view["question"]["path"],
+            "questionId":view["question"]["id"],"status":"last-moment"});
+        let applied = crate::run_mutation(&s, revision(&s), "early-adaptive-answer".into(), answer).unwrap();
+        assert_eq!(applied["decisions"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
     fn external_interview_proposes_only_reopens_and_applies_one_reviewed_answer() {
         let mut s = crate::tests::fixture();
         fs::create_dir_all(&s.runtime).unwrap();
@@ -450,7 +519,7 @@ mod tests {
         crate::run_mutation(&s, revision(&s), "enable-model-fixture".into(),
             json!({"type":"adaptiveControl","action":"external","questionLimit":3})).unwrap();
         assert!(context(&s).unwrap_err().contains("inventory"));
-        crate::scan_service(&s, "current".into(), folder.to_string_lossy().into_owned()).unwrap();
+        crate::scan_service(&s, "current".into(), folder.to_string_lossy().into_owned(), false).unwrap();
         let deadline = Instant::now()+Duration::from_secs(8);
         while s.index.running.load(std::sync::atomic::Ordering::SeqCst) {
             assert!(Instant::now()<deadline,"fixture inventory did not finish");

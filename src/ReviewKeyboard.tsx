@@ -11,6 +11,7 @@ interface FocusRequest {
   folder: string;
   target: 'heading' | 'first' | 'row';
   path?: string;
+  preventScroll?: boolean;
 }
 
 function focusElement(element: HTMLElement): void {
@@ -87,7 +88,8 @@ export function useReviewKeyboardFocus(strip: RefObject<HTMLDivElement | null>) 
       target ??= fallback ? heading : null;
       if (!target) return;
       cancel();
-      focusElement(target);
+      if (request.preventScroll) target.focus({ preventScroll: true });
+      else focusElement(target);
     }
     const observer = new MutationObserver(() => findTarget(false));
     observer.observe(region, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-busy', 'data-column-path', 'data-column-page'] });

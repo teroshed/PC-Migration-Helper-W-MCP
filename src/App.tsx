@@ -4,9 +4,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import {
-  ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, Check, CheckCircle2,
+  ArrowDownToLine, ArrowLeft, ArrowRight, Check, CheckCircle2,
   ChevronLeft, ChevronRight, Clock3, Database, Download, ExternalLink,
-  File, Folder, FolderOpen, HardDrive, History, Info, Link2, ListFilter,
+  File, Folder, FolderOpen, HardDrive, History, Home, Info, Link2, ListFilter,
   LoaderCircle, Map as MapIcon, Pause, Play, RefreshCw, Search, ShieldCheck, Sparkles,
   TriangleAlert, Undo2, X, CircleHelp, Trash2, ChevronsDown, ChevronsUp,
 } from 'lucide-react';
@@ -18,9 +18,9 @@ import type {
   AppStatus, Boot, Decision, Details, Document, Effective, Entry, Listing,
   GroupTarget, Operation, QueueState, ScanStatus, Status, ViewState, Volume, GatewayStatus, PreviewColumn, ReviewLayout,
 } from './model';
-import { DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
-import { DirectoryColumn, PreviewFolderColumn, RowClassificationMenu } from './FolderColumns';
-import type { RowMenuTarget } from './FolderColumns';
+import { DECISION_CHOICES, DESCRIPTIONS, EMPTY_EFFECTIVE, ICONS, LABELS, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, RollupCoverageDetails, StatusBadge } from './classifications';
+import { DirectoryColumn, PreviewFolderColumn, RowClassificationMenu, localRowSuggestion } from './FolderColumns';
+import type { RowMenuTarget, RowSuggestion } from './FolderColumns';
 import { OverflowIndicators } from './OverflowIndicators';
 import { AuditControls, AuditCoverageDetails, AuditDetails, useAuditStatus } from './Audit';
 import { NotificationBell } from './NotificationBell';
@@ -28,6 +28,8 @@ import { CopyQueue } from './CopyQueue';
 import { AssistanceInterview } from './Assistance';
 import { ResizeGrip, ReviewSidebar } from './ReviewLayout';
 import { FolderReadCache } from './folder-read-cache';
+import { centerOpenFolder, keepFolderOnBack } from './folder-column-navigation';
+import { useFolderColumnMotion } from './folder-column-motion';
 import { isStaleRead, reviewContentKey } from './read-cache';
 import { auditRefreshKey } from './audit-model';
 import './copy-queue.css';
@@ -92,12 +94,13 @@ function parseAppStatus(value: unknown): AppStatus {
   const v = record(value);
   const s = record(v.scan);
   const number = (v: unknown): number => typeof v === 'number' ? v : 0;
-  const scan: ScanStatus = { status: typeof s.status === 'string' ? s.status : undefined, pending: number(s.pending), processed: number(s.processed), files: number(s.files), bytes: number(s.bytes), currentPath: typeof s.currentPath === 'string' ? s.currentPath : undefined, error: typeof s.error === 'string' ? s.error : undefined };
+  const scan: ScanStatus = { status: typeof s.status === 'string' ? s.status : undefined, pending: number(s.pending), processed: number(s.processed), files: number(s.files), bytes: number(s.bytes), skippedGenerated: number(s.skippedGenerated), currentPath: typeof s.currentPath === 'string' ? s.currentPath : undefined, error: typeof s.error === 'string' ? s.error : undefined };
   const gaps = Array.isArray(v.gaps) ? v.gaps.map(value => {
     const g = record(value);
     return { path: String(g.path ?? ''), problem: String(g.problem ?? ''), observedAt: String(g.observedAt ?? '') };
   }) : [];
-  return { scan, gaps, decisionCount: number(v.decisionCount) };
+  return { scan, gaps, decisionCount: number(v.decisionCount),
+    mirrorEvidenceStamp: typeof v.mirrorEvidenceStamp === 'string' ? v.mirrorEvidenceStamp : undefined };
 }
 export default function App() {
   const [boot, setBoot] = useState<Boot | null>(null);
@@ -118,6 +121,7 @@ export default function App() {
   const [pathDraft, setPathDraft] = useState('');
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [showGaps, setShowGaps] = useState(false);
+  const [includeGeneratedForIndex, setIncludeGeneratedForIndex] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showDecisionPicker, setShowDecisionPicker] = useState(false);
   const [showContext, setShowContext] = useState(false);
@@ -126,8 +130,11 @@ export default function App() {
   const [lifecycleSnapshot, setLifecycleSnapshot] = useState<Record<string, unknown> | null>(null);
   const [gatewayDetailsOpen, setGatewayDetailsOpen] = useState(false);
   const [showAssistance, setShowAssistance] = useState(false);
+  const [assistanceFooter, setAssistanceFooter] = useState<HTMLDivElement | null>(null);
   const [showMirror, setShowMirror] = useState(false);
+  const [mirrorReviewPath, setMirrorReviewPath] = useState<string | null>(null);
   const [observedRevision, setObservedRevision] = useState(0);
+  const observedSuggestions = useRef<Pick<Document, 'revision' | 'suggestions'> | null>(null);
   const [showConflict, setShowConflict] = useState(false);
   const [conflictLoading, setConflictLoading] = useState(false);
   const [conflictProblem, setConflictProblem] = useState<string | null>(null);
@@ -235,7 +242,7 @@ export default function App() {
   // Observe watcher/audit changes even while visible-row refresh is deferred during
   // editing. A later navigation must never reuse the superseded snapshot.
   const folderReadScope = JSON.stringify([boot?.dataPath, boot?.volumes, reviewContent,
-    dataTick, auditDataTick, refreshTick, appStatus.scan.status, appStatus.scan.error, audit.problem]);
+    dataTick, refreshTick, appStatus.scan.error, audit.problem, appStatus.mirrorEvidenceStamp]);
   // A source event or missed-watcher interval requires fresh immediate metadata,
   // while hashes and decision edits only need the derived listing recomputed.
   const folderSourceScope = JSON.stringify([boot?.dataPath, boot?.volumes,
@@ -243,10 +250,10 @@ export default function App() {
   useLayoutEffect(() => {
     folderReads.configure({ derived: folderReadScope, source: folderSourceScope });
   }, [folderReads, folderReadScope, folderSourceScope]);
-  const folderProgressScope = JSON.stringify([appStatus.scan.processed, appStatus.scan.files,
+  const folderProgressScope = JSON.stringify([appStatus.scan.status, appStatus.scan.processed, appStatus.scan.files,
     appStatus.scan.bytes, appStatus.scan.pending, audit.status ? auditRefreshKey(audit.status) : null]);
   useLayoutEffect(() => { folderReads.expireValues(); }, [folderReads, folderProgressScope]);
-  const folderRefreshToken = JSON.stringify([reviewContent, dataTick, auditDataTick, refreshTick, appStatus.scan.status]);
+  const folderRefreshToken = JSON.stringify([folderReadScope, folderSourceScope, auditDataTick, appStatus.scan.status]);
   const reviewActivity = useReviewActivity(Boolean(boot), receiveReviewActivity);
   useReviewSurface(columnStripRef, view && document ? { view, appliedRevision: document.revision, followAi, following: localFollowView.current, knownSearch, loading } : null);
 
@@ -259,6 +266,7 @@ export default function App() {
 
   function applyDisplayedView(next: ViewState, transient: boolean, revealAgain = false): void {
     const previous = viewRef.current;
+    if (previous) prepareFolderMotion(previous, next);
     localFollowView.current = transient;
     revealPreviewDepth.current = null;
     viewRef.current = next;
@@ -475,6 +483,7 @@ export default function App() {
       if (current.revealPath && patch.revealPath === undefined) patch = { ...patch, revealPath: null };
     }
     const next = { ...current, ...patch };
+    if (previewChanged || patch.path !== undefined) prepareFolderMotion(current, next);
     viewRef.current = next;
     setView(next);
     if (localFollowView.current) {
@@ -496,6 +505,10 @@ export default function App() {
     if (focus) toolbarFocus.current = mode;
     setLayout({ toolbar: mode });
   }
+  function changeAssistance(open: boolean): void {
+    if (open && window.innerHeight <= 740 && toolbar === 'expanded') setToolbar('compact');
+    setShowAssistance(open);
+  }
   function focusSearch(): void {
     if (toolbar === 'expanded' || toolbar === 'search') searchRef.current?.focus();
     else setToolbar('search', true);
@@ -507,17 +520,32 @@ export default function App() {
     } else if (depth === 0) updateView({ browserColumnWidth: width }, true);
     else changePreview(depth, { width });
   }
-  function navigate(path: string, selection: string | null = null, keepFilter = false): string | null {
-    if (!viewRef.current) return null;
+  function navigate(path: string, selection: string | null = null, keepFilter = false, movement?: 'center' | 'back'): string | null {
+    const current = viewRef.current;
+    if (!current) return null;
     flushBuffers();
     let normalized: string;
     try { normalized = normalizeReviewPath(path, boot?.volumes.map(v => v.root) ?? []); }
     catch (cause) { report(cause); return null; }
-    const recent = [normalized, ...viewRef.current.recentPaths.filter(item => item.toLowerCase() !== normalized.toLowerCase())].slice(0, 8);
+    const recent = [normalized, ...current.recentPaths.filter(item => reviewPathKey(item) !== reviewPathKey(normalized))].slice(0, 8);
+    const branch = movement === 'center' ? centerOpenFolder(current, normalized)
+      : movement === 'back' ? keepFolderOnBack(current, knownSearch) : {};
+    const filter = keepFilter ? current.filter : 'all';
+    const page = branch.page ?? 0;
+    if (reviewPathKey(current.path) !== reviewPathKey(normalized)) {
+      const cached = folderReads.peekRecentListing({ path: normalized, search: '', filter, page });
+      setListing(cached ?? null);
+      setLoading(cached === undefined);
+    }
     revealPreviewDepth.current = null;
     setSelectedEntryInfo(null);
     dismissRowMenu(false);
-    updateView({ path: normalized, selectedPath: selection, search: '', filter: keepFilter ? viewRef.current.filter : 'all', page: 0, scrollTop: 0, recentPaths: recent, previewColumns: [], previewScrollLeft: 0, layout: { ...viewRef.current.layout, fillDepth: viewRef.current.layout?.fillDepth === 0 ? 0 : null } }, true);
+    updateView({
+      path: normalized, selectedPath: selection, search: '', filter, page, scrollTop: 0,
+      recentPaths: recent, previewColumns: [], previewScrollLeft: 0,
+      layout: { ...current.layout, fillDepth: movement ? null : current.layout?.fillDepth === 0 ? 0 : null },
+      ...branch,
+    }, true);
     setPathDraft(normalized);
     setKnownResults(null);
     setKnownSearch(false);
@@ -527,6 +555,26 @@ export default function App() {
   function navigateByKey(path: string): void {
     const folder = navigate(path, null, true);
     if (folder) keyboard.requestFocus({ depth: 0, folder, target: 'heading' });
+  }
+  function centerFolder(path: string): void {
+    const current = viewRef.current;
+    const folder = current && reviewPathKey(current.path) === reviewPathKey(path)
+      ? current.path
+      : navigate(path, null, true, 'center');
+    if (folder) keyboard.requestFocus({ depth: 0, folder, target: 'heading', preventScroll: true });
+  }
+  function backFolder(depth = 0): void {
+    const current = viewRef.current;
+    if (!current) return;
+    const parent = parentPath(current.path);
+    const volumes = boot?.volumes ?? [];
+    const drive = rootForSelection(current.path, volumes);
+    if (parent && drive && rootForSelection(parent, volumes)?.id === drive.id) {
+      const folder = navigate(parent, null, true, 'back');
+      if (folder) keyboard.requestFocus({ depth: 0, folder, target: 'heading', preventScroll: true });
+    } else if (depth > 0) {
+      closePreviewByKey(depth);
+    }
   }
   function selectEntry(entry: Entry): void {
     setSelectedEntryInfo(entry);
@@ -722,7 +770,7 @@ export default function App() {
     return current;
   }
   function previewFolder(entry: Entry, fromDepth: number): void {
-    if (entry.kind !== 'folder' || !viewRef.current) return;
+    if (entry.kind !== 'folder' || entry.problem || !viewRef.current) return;
     flushBuffers();
     const columns = previewBranch(viewRef.current.previewColumns, fromDepth, entry.path);
     setSelectedEntryInfo(entry);
@@ -898,7 +946,10 @@ export default function App() {
         const result = parseBoot(await invoke<unknown>('get_boot'));
         if (!active) return;
         failedReads = 0;
-        if (!result.problem) setObservedRevision(result.document.revision);
+        if (!result.problem) {
+          observedSuggestions.current = { revision: result.document.revision, suggestions: result.document.suggestions };
+          setObservedRevision(result.document.revision);
+        }
         setGateway(previous => JSON.stringify(previous) === JSON.stringify(result.gateway) ? previous : result.gateway);
         const writer = queue.current;
         if (!writer || result.problem || result.document.revision <= writer.revision) return;
@@ -945,6 +996,7 @@ export default function App() {
       }
     } else restoreReviewScroll(strip, 'scrollLeft', view.previewScrollLeft);
   }, [view?.path, previewBranchKey, view?.previewScrollLeft, fillDepth]);
+  const prepareFolderMotion = useFolderColumnMotion(columnStripRef, view);
 
   useLayoutEffect(() => {
     const target = toolbarFocus.current;
@@ -983,7 +1035,9 @@ export default function App() {
     const query = { path, search: view.search, filter: view.filter, page: view.page };
     const cached = !force ? folderReads.peekListing(query) : undefined;
     if (cached) { loadedListingContext.current = contextKey; setListing(cached); setLoading(false); return; }
-    if (foreground) setLoading(true);
+    const recent = !force ? folderReads.peekRecentListing(query) : undefined;
+    if (recent) { setListing(recent); setLoading(false); }
+    else if (foreground) setLoading(true);
     const timeout = setTimeout(() => {
       activeAuditReads.current += 1;
       void folderReads.listing(query, force).then(result => {
@@ -1013,7 +1067,7 @@ export default function App() {
       if (active) { loadedDetailsPath.current = selectedPath; setDetails(value); setDetailsLoading(false); }
     }).catch(cause => { if (active) { setDetails(null); setDetailsLoading(false); report(cause); } }).finally(() => { activeAuditReads.current = Math.max(0, activeAuditReads.current - 1); });
     return () => { active = false; };
-  }, [selectedPath, boot, dataTick, auditDataTick, refreshTick, appStatus.scan.status]);
+  }, [selectedPath, boot, dataTick, auditDataTick, refreshTick, appStatus.scan.status, appStatus.mirrorEvidenceStamp]);
 
   useEffect(() => {
     if (!boot) return;
@@ -1103,7 +1157,14 @@ export default function App() {
   }
   async function scan(mode: 'all' | 'current' | 'resume' | 'pause'): Promise<void> {
     if (!view) return;
-    try { await invoke('scan', { mode, path: view.path }); await refreshStatus(); } catch (cause) { report(cause); }
+    const freshScan = mode === 'all' || mode === 'current';
+    try {
+      await invoke('scan', { mode, path: view.path, includeGenerated: freshScan && includeGeneratedForIndex });
+      if (freshScan) setIncludeGeneratedForIndex(false);
+      await refreshStatus();
+    } catch (cause) {
+      report(cause);
+    }
   }
   async function searchKnown(throwFailure = false): Promise<void> {
     if (!view?.search.trim()) { const problem = 'Type a folder name in Search, then search known folders.'; setMessage(problem); if (throwFailure) throw new Error(problem); return; }
@@ -1132,7 +1193,7 @@ export default function App() {
     if (submittingGroup.current || attemptedGroup.current) throw new Error('Reconcile the submitted group before closing its review.');
     closeGroupReview();
     setShowGaps(false); setShowHistory(false); setShowDecisionPicker(false); setShowContext(false);
-    setShowMcp(false); setShowAssistance(false); setShowMirror(false); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
+    setShowMcp(false); setShowAssistance(false); setShowMirror(false); setMirrorReviewPath(null); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
     void notificationControl.current?.execute({ action: 'setNotifications', mode: 'closed' }, { command: { action: 'setNotifications' } });
     void copyControl.current?.execute({ action: 'setCopyDetails', open: false }, { command: { action: 'setCopyDetails' } });
   }
@@ -1150,7 +1211,7 @@ export default function App() {
         review: groupReview ? { mode: groupReview.mode, revision: groupReview.revision, operationId: groupReview.operationId,
           groupId: groupReview.mode === 'undo' ? groupReview.group.id : null, pending: groupBusy, outcomeUncertain: !groupBusy && groupAttempt !== null,
           problem: groupProblem } : null },
-      rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || saveState.saving || Boolean(rowMenu.entry.problem) } : null,
+      rowMenu: rowMenu ? { path: rowMenu.entry.path, disabled: readOnly || Boolean(rowMenu.entry.problem) } : null,
       gatewayDetailsOpen, knownFolders: { active: knownSearch, search: view?.search, results: knownResults },
       savedRecords: { search: savedSearch, filter: savedFilter, page: savedPage },
       writer: { ...queue.current?.state, revision: queue.current?.revision, retainedRequestCount: retainedMetadata.total,
@@ -1259,8 +1320,8 @@ export default function App() {
       if (!notificationControl.current) throw new Error('Notifications are not available.');
       await notificationControl.current.execute(command, request); return;
     }
-    if (action === 'setAssistanceOverride') {
-      if (!showAssistance || !assistanceControl.current) throw new Error('Open AI Assistance and read its current question first.');
+    if (action === 'setAssistanceOverride' || action === 'setAssistanceScanDetails' || action === 'setAssistanceDetails' || action === 'navigateAssistance') {
+      if (!showAssistance || !assistanceControl.current) throw new Error('Open AI Assistance first.');
       await assistanceControl.current.execute(command, request); return;
     }
     if (action === 'closePanels') { closePanels(); return; }
@@ -1269,8 +1330,8 @@ export default function App() {
         if (!queue.current?.state.error) throw new Error('No failed writer is available to compare.');
         await beginConflictReview(true); return;
       }
-      if (command.panel === 'decision' && (readOnly || !selectedPath || detailsLoading || !details || !details.exists || saveState.saving)) throw new Error('The selected decision is not available for editing.');
-      const setters: Record<string, (open: boolean) => void> = { assistance: setShowAssistance, decision: setShowDecisionPicker,
+      if (command.panel === 'decision' && (readOnly || !selectedPath || detailsLoading || !details || !details.exists)) throw new Error('The selected decision is not available for editing.');
+      const setters: Record<string, (open: boolean) => void> = { assistance: changeAssistance, decision: setShowDecisionPicker,
         context: setShowContext, history: setShowHistory, saved: setShowSaved, gaps: setShowGaps, gateway: setShowMcp, mirror: setShowMirror };
       const setter = setters[String(command.panel)];
       if (!setter) throw new Error('Unsupported panel');
@@ -1318,7 +1379,10 @@ export default function App() {
       const target = event.target;
       if (target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
       if (event.ctrlKey && event.key.toLowerCase() === 'z') { event.preventDefault(); if (!readOnly) void undo(); }
-      else if (event.altKey && event.key === 'ArrowUp' && view) { const parent = parentPath(view.path); if (parent && boot?.volumes.some(v => parent.toLowerCase().startsWith(v.root.toLowerCase()))) { event.preventDefault(); navigate(parent); } }
+      else if (event.altKey && event.key === 'ArrowUp' && view) {
+        event.preventDefault();
+        backFolder();
+      }
     }
     window.addEventListener('keydown', key);
     return () => window.removeEventListener('keydown', key);
@@ -1333,7 +1397,8 @@ export default function App() {
   const agentDecision = activeProvenance?.kind === 'agent-mcp' || activeProvenance?.kind === 'mcp-agent';
   const noteText = selectedPath ? notes[selectedPath] ?? activeDecision?.notes ?? '' : '';
   const up = parentPath(view.path);
-  const canUp = up !== null && boot.volumes.some(v => up.toLowerCase() === v.root.replace(/\\$/, '').toLowerCase() || up.toLowerCase().startsWith(v.root.toLowerCase()));
+  const driveHome = rootForSelection(view.path, boot.volumes)?.root;
+  const canUp = up !== null && driveHome !== undefined && reviewPathKey(view.path) !== reviewPathKey(driveHome);
   const scanRunning = appStatus.scan.status === 'running';
   const saveError = saveState.error;
   const revisionConflict = Boolean(saveError && /newer saved state|revision conflict|outside this app|stale save response/i.test(saveError));
@@ -1345,7 +1410,7 @@ export default function App() {
   const reviewed = Math.max(0, knownInView - (listing?.attention ?? 0));
   const percent = knownInView ? Math.round(reviewed / knownInView * 100) : 0;
   const ActiveIcon = ICONS[effective.status];
-  const classificationUnavailable = readOnly || !selectedPath || detailsLoading || !details || details.exists === false || saveState.saving;
+  const classificationUnavailable = readOnly || !selectedPath || detailsLoading || !details || details.exists === false;
   const manualContext = effective.status === 'manual-pending' ? 'Manual backup pending · confirm after copying'
     : effective.status === 'manual-confirmed' ? 'Your manual-backup confirmation · checksum verification separate' : null;
   const incompleteRollup = effective.rollup?.kind === 'unknown' && !effective.rollup.coverage?.complete;
@@ -1358,15 +1423,83 @@ export default function App() {
       : effective.mixed > 0 ? `${effective.mixed} child exceptions · mixed decisions`
       : effective.status === 'on-external' ? 'Manual F: assertion · completeness unverified'
       : 'Decisions only · source files stay untouched');
-  const pathSuggestions = Array.isArray(document.suggestions) ? document.suggestions.flatMap(value => {
+  const observed = observedSuggestions.current;
+  const proposalSource = showAssistance && observed && observed.revision > document.revision ? observed : document;
+  const suggestions = Array.isArray(proposalSource.suggestions) ? proposalSource.suggestions.flatMap(value => {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
     const suggestion = record(value);
     if (typeof suggestion.path !== 'string' || !isStatus(suggestion.status) || typeof suggestion.reason !== 'string') return [];
     const location = resolveDecisionPath({ ...suggestion, path: suggestion.path, status: suggestion.status }, boot.volumes);
-    if (!location.path || location.path.toLowerCase() !== selectedPath?.toLowerCase()) return [];
+    if (!location.path || (!showAssistance && location.path.toLowerCase() !== selectedPath?.toLowerCase())) return [];
     const provenance = typeof suggestion.provenance === 'object' && suggestion.provenance !== null && !Array.isArray(suggestion.provenance) ? record(suggestion.provenance) : null;
-    return [{ id: typeof suggestion.id === 'string' ? suggestion.id : suggestion.path, status: suggestion.status, reason: suggestion.reason, createdAt: typeof suggestion.createdAt === 'string' ? suggestion.createdAt : null, actor: typeof provenance?.actor === 'string' ? provenance.actor : 'Unspecified agent' }];
+    return [{ path: location.path, id: typeof suggestion.id === 'string' ? suggestion.id : suggestion.path, status: suggestion.status, reason: suggestion.reason, createdAt: typeof suggestion.createdAt === 'string' ? suggestion.createdAt : null, actor: typeof provenance?.actor === 'string' ? provenance.actor : 'Unspecified agent' }];
   }) : [];
+  const pathSuggestions = suggestions.filter(suggestion => reviewPathKey(suggestion.path) === reviewPathKey(selectedPath ?? ''));
+  const assistanceSuggestions = new Map<string, RowSuggestion>();
+  if (showAssistance) for (const suggestion of suggestions) {
+    assistanceSuggestions.set(reviewPathKey(suggestion.path),
+      { source: 'ai', label: decisionChoiceLabel(suggestion.status), reason: suggestion.reason });
+  }
+  function inspectAssistanceQuestion(path: string, kind: 'file' | 'folder'): void {
+    const folder = kind === 'file' ? parentPath(path) : path;
+    if (!folder || reviewPathKey(viewRef.current?.path ?? '') === reviewPathKey(folder)) return;
+    navigate(folder, kind === 'file' ? path : null);
+  }
+  const assistanceBrowser: UiParticipant = {
+    read: () => ({ root: view.path, selectedPath, columns: [
+      { path: view.path, page: view.page, width: view.browserColumnWidth ?? 360, scrollTop: view.scrollTop },
+      ...view.previewColumns,
+    ], menuPath: rowMenu?.entry.path ?? null }),
+    execute: async command => {
+      const current = viewRef.current;
+      if (!current) throw new Error('The folder browser is unavailable.');
+      const mode = command.mode;
+      if (mode === 'menu' && command.path === null) { dismissRowMenu(true); return; }
+      if (mode === 'center' || mode === 'preview' || mode === 'menu') {
+        const path = command.path;
+        if (typeof path !== 'string') throw new Error('Choose a displayed entry.');
+        const row = Array.from(columnStripRef.current?.querySelectorAll<HTMLElement>('.entry-row') ?? [])
+          .find(item => reviewPathKey(item.dataset.entryPath ?? '') === reviewPathKey(path));
+        const actual = row?.dataset.entryPath;
+        if (!row || !actual) throw new Error('Choose a displayed entry.');
+        const entry = parseEntry(await invoke('get_review_entry', { path: actual }));
+        if (!row.isConnected || entry.path !== actual) throw new Error('The entry changed. Refresh its folder.');
+        if (mode === 'menu') {
+          const invoker = row.querySelector<HTMLButtonElement>('.entry-more');
+          const bounds = invoker?.getBoundingClientRect();
+          if (!invoker || !bounds) throw new Error('The row menu is unavailable.');
+          openRowMenu({ id: crypto.randomUUID(), entry, x: bounds.right, y: bounds.bottom, invoker });
+          return;
+        }
+        if (entry.kind !== 'folder' || entry.problem) throw new Error('Choose a readable folder.');
+        if (mode === 'center') { centerFolder(entry.path); return; }
+        const depth = Number(row.closest<HTMLElement>('[data-column-depth]')?.dataset.columnDepth);
+        if (!Number.isInteger(depth)) throw new Error('The folder column is no longer open.');
+        previewFolder(entry, depth);
+        return;
+      }
+      const depth = command.depth;
+      if (typeof depth !== 'number' || !Number.isInteger(depth) || depth < 0 || depth > current.previewColumns.length) {
+        throw new Error('Choose an open column.');
+      }
+      if (mode === 'close' && depth > 0) { closePreview(depth); return; }
+      if (mode === 'resize' && typeof command.value === 'number') { resizeColumn(depth, command.value, false); return; }
+      if (mode === 'page' && typeof command.value === 'number' && Number.isInteger(command.value) && command.value >= 0) {
+        if (depth) changePreview(depth, { page: command.value, scrollTop: 0 });
+        else updateView({ page: command.value, scrollTop: 0 }, true);
+        return;
+      }
+      if (mode === 'refresh') {
+        if (!depth) { await refreshVisible(); return; }
+        const column = current.previewColumns[depth - 1];
+        if (!column) throw new Error('The column is no longer open.');
+        await folderReads.listing({ path: column.path, search: '', filter: 'all', page: column.page }, true);
+        setRefreshTick(value => value + 1);
+        return;
+      }
+      throw new Error('Invalid folder browser action.');
+    },
+  };
   const savedDecisions = Object.values(document.decisions).filter(decision => (savedFilter === 'all' || decision.status === savedFilter) && `${decision.path}\n${decision.notes ?? ''}`.toLowerCase().includes(savedSearch.toLowerCase())).sort((a, b) => a.path.localeCompare(b.path));
   const columnActions = {
     selectedPath,
@@ -1374,6 +1507,7 @@ export default function App() {
     reviewActivity,
     revealPath: view.revealPath,
     revealVersion,
+    suggestionFor: showAssistance ? (entry: Entry) => assistanceSuggestions.get(reviewPathKey(entry.path)) ?? localRowSuggestion(entry) : undefined,
     onSelect: selectEntry,
     onToggleSelect: toggleEntry,
     canGroupSelect: (entry: Entry) => !readOnly && Boolean(selectionTarget(entry, selectionRoot)),
@@ -1382,8 +1516,8 @@ export default function App() {
       return target !== undefined && groupKeys.has(selectionKey(target));
     },
     onRowsDisplayed,
-    onOpen: navigate,
-    onOpenByKey: navigateByKey,
+    onOpen: centerFolder,
+    onOpenByKey: centerFolder,
     onPreview: previewFolder,
     onPreviewByKey: previewByKey,
     onCloseByKey: closePreviewByKey,
@@ -1395,7 +1529,7 @@ export default function App() {
     onReviewFolder: (path: string): void => { setSelectedEntryInfo(null); updateView({ selectedPath: path }, true); },
     onReadPendingChange: (delta: number): void => { activeAuditReads.current = Math.max(0, activeAuditReads.current + delta); },
   };
-  const rowMenuDisabled = readOnly ? 'Recover the saved data before changing decisions.' : saveState.saving ? 'Finishing the current save. Decisions will be available when it finishes.' : rowMenu?.entry.problem ? 'This path is unavailable. Its saved record is retained; review its notes from Saved records.' : null;
+  const rowMenuDisabled = readOnly ? 'Recover the saved data before changing decisions.' : rowMenu?.entry.problem ? 'This path is unavailable. Its saved record is retained; review its notes from Saved records.' : null;
 
   const layout = view.layout ?? {};
   const layoutStyle = {
@@ -1453,7 +1587,7 @@ export default function App() {
             <button className="assistance-trigger" aria-haspopup="dialog" onClick={() => setShowMirror(true)}>
               <ShieldCheck size={16} aria-hidden="true"/> Manual mirror
             </button>
-            <button className="assistance-trigger" aria-haspopup="dialog" onClick={() => setShowAssistance(true)}>
+            <button className="assistance-trigger" aria-expanded={showAssistance} aria-controls="inline-assistance" onClick={() => changeAssistance(!showAssistance)}>
               <Sparkles size={16} aria-hidden="true"/> AI Assistance
             </button>
             <button className="primary next-button" aria-disabled={loading} onClick={() => { if (!loading) void nextAttention(); }}>
@@ -1472,7 +1606,9 @@ export default function App() {
               onClick={() => setToolbar('expanded', true)}><ChevronsDown size={16}/></button>
           </div>}
         <div id="review-path-tools" hidden={toolbar !== 'expanded' && toolbar !== 'path'}>
-        <div className="path-row"><button className="icon-button" disabled={!canUp || loading} aria-label="Go to parent folder" onClick={() => { if (up && canUp) navigate(up); }}><ArrowUp size={17}/></button><form className="path-form" onSubmit={event => { event.preventDefault(); navigate(pathDraft); }}><FolderOpen size={17}/><input ref={pathInputRef} aria-label="Current folder path" value={pathDraft} spellCheck={false} onChange={event => setPathDraft(event.target.value)}/><button type="submit" aria-label="Open folder path" title="Open path"><ArrowRight size={16}/></button></form><button className="icon-button" aria-label="Rescan current folder" title="Refresh immediate contents; keep decisions" disabled={loading} onClick={() => { void refreshVisible().catch(report); }}><RefreshCw size={17} className={loading ? 'spin' : ''}/></button>
+        <div className="path-row"><button className="icon-button" disabled={!canUp} aria-label="Back to parent folder" title="Back to parent folder" onClick={() => backFolder()}><ArrowLeft size={17}/></button>
+          <button className="icon-button" disabled={!driveHome || !canUp} aria-label="Go to drive home" title={driveHome ? `Drive home · ${driveHome}` : 'Drive home'} onClick={() => { if (driveHome) navigateByKey(driveHome); }}><Home size={16}/></button>
+          <form className="path-form" onSubmit={event => { event.preventDefault(); navigate(pathDraft); }}><FolderOpen size={17}/><input ref={pathInputRef} aria-label="Current folder path" value={pathDraft} spellCheck={false} onChange={event => setPathDraft(event.target.value)}/><button type="submit" aria-label="Open folder path" title="Open path"><ArrowRight size={16}/></button></form><button className="icon-button" aria-label="Rescan current folder" title="Refresh immediate contents; keep decisions" disabled={loading} onClick={() => { void refreshVisible().catch(report); }}><RefreshCw size={17} className={loading ? 'spin' : ''}/></button>
           {toolbar === 'expanded' && <button ref={expandedTrigger} className="icon-button" aria-label="Compact path and search tools"
             title="Compact path and search tools" onClick={() => setToolbar('compact', true)}><ChevronsUp size={16}/></button>}
         </div>
@@ -1491,7 +1627,13 @@ export default function App() {
             edge={(_, raw) => raw <= 56} edgeLabel="Release for compact path and search tools"
             onCommit={height => setToolbar(height <= 56 ? 'compact' : 'expanded', true)}/>
         </div>
-        <div className="browse-interaction-hint"><span>Folder click opens · arrow previews</span><span>Ctrl+Space selects · Space marks</span></div>
+        {showAssistance && <AssistanceInterview currentPath={view.path} revision={Math.max(document.revision, observedRevision)}
+          scanSignal={`${appStatus.scan.status}:${appStatus.mirrorEvidenceStamp}`}
+          readOnly={readOnly} onEdit={editAssistance} controlRef={assistanceControl}
+          footerHost={assistanceFooter} inspectQuestion={inspectAssistanceQuestion} browser={assistanceBrowser}
+          deferMarked={document.inventoryDeferMarked !== false}
+          onOpenMirror={path => { setMirrorReviewPath(path); setShowMirror(true); }}/>}
+        <div className="browse-interaction-hint"><span>Click to preview · focus button or row menu to center</span><span>Ctrl+Space selects · Space marks</span></div>
         {groupTargets.length > 0 && <div className="review-selection-bar" role="group" aria-label="Grouped review selection">
           <span aria-live="polite"><strong>{groupTargets.length} selected</strong> · {visibleGroupCount} shown · {groupTargets.length - visibleGroupCount} hidden</span>
           <div className="selection-actions">
@@ -1506,9 +1648,9 @@ export default function App() {
           </div>
         </div>}
         <div className="folder-strip-frame" data-column-filled={fillDepth !== null || undefined}><div className="folder-columns-strip" ref={columnStripRef} aria-label="Folder preview columns" onScroll={event => { if (fillDepth === null && !appRef.current?.hasAttribute('data-resize-active') && !isRestoredScroll(event.currentTarget, 'scrollLeft')) updateView({ previewScrollLeft: event.currentTarget.scrollLeft }); }}>
-          <DirectoryColumn {...columnActions} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
-          {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>The folder arrow previews its contents here. Keep opening arrows for more columns.</p><p>Folder names open the main location. Right-click or use ⋯ to mark a decision.</p></div>}
-          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={`${index + 1}:${column.path}`} {...columnActions} column={column} depth={index + 1} cache={folderReads} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onClose={() => closePreview(index + 1)}/>)}
+          <DirectoryColumn {...columnActions} previewPath={view.previewColumns[0]?.path} path={view.path} depth={0} page={view.page} scrollTop={view.scrollTop} width={view.browserColumnWidth ?? 360} listing={listing} loading={loading} error={!loading && !listing ? 'This location could not be read. Its coverage gap is recorded; you can continue elsewhere.' : null} knownResults={knownResults} knownSearch={knownSearch} listRef={listRef} onBack={canUp ? () => backFolder() : undefined} onScroll={scrollTop => updateView({ scrollTop })} onPage={page => updateView({ page, scrollTop: 0 }, true)} onRefresh={() => { void refreshVisible().catch(report); }}/>
+          {fillDepth === null && !view.previewColumns.length && <div className="preview-placeholder" aria-hidden="true"><ChevronRight size={27}/><h3>Look one layer deeper</h3><p>Click a folder to preview its contents in the next column.</p><p>Right-click for the folder actions and decision menu.</p></div>}
+          {view.previewColumns.slice(0, fillDepth ?? undefined).map((column, index) => <PreviewFolderColumn key={reviewPathKey(column.path)} {...columnActions} previewPath={view.previewColumns[index + 1]?.path} column={column} depth={index + 1} cache={folderReads} cacheContext={{ derived: folderReadScope, source: folderSourceScope }} refreshToken={folderRefreshToken} onChange={patch => changePreview(index + 1, patch)} onBack={() => backFolder(index + 1)} backPreservesBranch={canUp} onClose={() => closePreview(index + 1)}/>)}
         </div>
         <OverflowIndicators targetRef={columnStripRef} axis="horizontal" refreshKey={view.previewColumns}/>
         {fillDepth !== null && <button ref={restoreColumnsRef} className="review-restore-columns"
@@ -1517,6 +1659,7 @@ export default function App() {
             setLayout({ fillDepth: null });
           }}><ChevronLeft size={20} aria-hidden="true"/></button>}
         </div>
+        {showAssistance && <div ref={setAssistanceFooter} className="inline-assistance-footer"/>}
       </section>
       <footer className="workspace-footer"><span><ShieldCheck size={13}/>Copy runs use saved marks and the selected destination.</span><span>Enter: open · →: preview · ←: close preview</span></footer>
     </main>
@@ -1528,7 +1671,7 @@ export default function App() {
       <div className="details-controls">
         <div className="selected-title"><div className="selected-icon">{selectedEntry?.kind === 'file' ? <File size={26}/> : selectedEntry?.kind === 'link' ? <Link2 size={26}/> : <Folder size={26}/>}</div><div><h2 title={selectedPath ?? ''}>{selectedPath ? baseName(selectedPath) : 'Select a folder'}</h2><p title={selectedPath ?? ''}>{selectedPath}</p></div></div>
         <div className="review-location-row">{selectedPath === view.path ? <span>Reviewing this folder itself</span> : <button className="text-button" onClick={() => updateView({ selectedPath: null }, true)}><ArrowLeft size={13}/>Review this folder instead</button>}{detailsLoading && <LoaderCircle size={13} className="spin" aria-label="Reading decision"/>}</div>
-        <button className={`decision-picker-trigger status-${effective.status}`} aria-haspopup="dialog" aria-expanded={showDecisionPicker} disabled={classificationUnavailable} onClick={() => setShowDecisionPicker(true)}><ActiveIcon size={20}/><span><strong>{LABELS[effective.status]}{effective.status === 'migrate-now' ? ' · pending' : ''}</strong><small>Change decision · eight color-coded options</small></span><ChevronRight size={17}/></button>
+        <button className={`decision-picker-trigger status-${effective.status}`} aria-haspopup="dialog" aria-expanded={showDecisionPicker} disabled={classificationUnavailable} onClick={() => setShowDecisionPicker(true)}><ActiveIcon size={20}/><span><strong>{effective.manualEvidence === 'mirror-verified' ? reviewStatusLabel(effective) : LABELS[effective.status]}{effective.status === 'migrate-now' ? ' · pending' : ''}</strong><small>Change decision</small></span><ChevronRight size={17}/></button>
         <button className={`context-summary ${details?.exists === false || effective.stale || incompleteRollup ? 'warning' : ''}`} onClick={() => setShowContext(true)} title={contextSummary}><Info size={14}/><span>{contextSummary}</span><ChevronRight size={13}/></button>
         <div className="notes-section"><label className="notes-label" htmlFor="decision-notes">Notes <span>autosaved</span></label><textarea id="decision-notes" disabled={readOnly || !selectedPath || detailsLoading} placeholder="Exclusions, destination, exports needed…" value={noteText} onChange={event => { if (!selectedPath) return; const text = event.target.value; setNotes(current => ({ ...current, [selectedPath]: text })); noteBuffer.current.set(selectedPath, text); scheduleFlush(); }} rows={2}/></div>
         <div className="detail-actions"><button onClick={() => setShowContext(true)} title={pathSuggestions.length ? `${pathSuggestions.length} assistant proposals; separate from your decisions` : 'Review context and child exceptions'}><ListFilter size={14}/><span>Context{effective.mixed ? ` · ${effective.mixed}` : pathSuggestions.length ? ` · ${pathSuggestions.length} proposals` : ''}</span></button><button onClick={() => setShowHistory(true)}><History size={14}/><span>History</span></button></div>
@@ -1541,21 +1684,26 @@ export default function App() {
       <div className="data-location"><Database size={14}/><span title={boot.dataPath}>migration_master_data.json<small>Native JSON · version {document.schemaVersion} · revision {document.revision}</small></span></div>
     </aside>
     </ReviewSidebar>
-    {showAssistance && <Modal title="AI Assistance" onClose={() => setShowAssistance(false)}>
-      <AssistanceInterview currentPath={view.path} revision={Math.max(document.revision, observedRevision)}
-        readOnly={Boolean(readOnly)} onEdit={editAssistance} controlRef={assistanceControl}/>
-    </Modal>}
-    {rowMenu && <RowClassificationMenu key={rowMenu.id} target={rowMenu} disabledReason={rowMenuDisabled} onDismiss={dismissRowMenu} onChoose={status => { const target = rowMenu; setSelectedEntryInfo(target.entry); dismissRowMenu(true); void classifyPath(target.entry.path, status).then(() => { if (target.invoker && !target.invoker.isConnected) window.document.querySelector<HTMLButtonElement>('.decision-picker-trigger')?.focus(); }); }}/ >}
+    {rowMenu && <RowClassificationMenu key={rowMenu.id} target={rowMenu} disabledReason={rowMenuDisabled} onDismiss={dismissRowMenu}
+      onCenterFolder={rowMenu.entry.kind === 'folder' && !rowMenu.entry.problem ? () => centerFolder(rowMenu.entry.path) : undefined}
+      onChoose={status => { const target = rowMenu; setSelectedEntryInfo(target.entry); dismissRowMenu(true); void classifyPath(target.entry.path, status).then(() => { if (target.invoker && !target.invoker.isConnected) window.document.querySelector<HTMLButtonElement>('.decision-picker-trigger')?.focus(); }); }}/>}
     {message && <div className="toast" role="status"><CheckCircle2 size={16}/><span>{message}</span><button onClick={() => setMessage(null)} aria-label="Dismiss status"><X size={14}/></button></div>}
     {showMcp && <Modal title="Local MCP gateway" compact onClose={() => setShowMcp(false)}><div className={`mcp-state-line mcp-${gateway.state}`}><Link2 size={19}/><strong>{gateway.state === 'running' ? 'MCP ready' : gateway.state === 'error' ? 'Gateway needs attention' : 'Gateway unavailable'}</strong></div><p className="modal-intro">Keep the native app open while using an MCP client. This indicator shows the local gateway’s readiness.</p>{gateway.problem && <div className="context-box warning"><TriangleAlert size={16}/><p>{gateway.problem}</p></div>}{gateway.endpoint && <label className="gateway-endpoint">Local endpoint<input aria-label="Local MCP gateway endpoint" readOnly value={gateway.endpoint}/></label>}<p className="modal-intro gateway-instructions">Register the included local stdio server with your MCP client. The bridge shares the app’s saved decisions and revision checks. Agent proposals remain separate from decisions; accepted edits retain their provenance.</p><details className="gateway-diagnostics" open={gatewayDetailsOpen} onToggle={event => setGatewayDetailsOpen(event.currentTarget.open)}><summary>Session details</summary>{gateway.startedAt && <p>Gateway started: {new Date(gateway.startedAt).toLocaleString()}</p>}{gateway.instanceId && <p>Instance: {gateway.instanceId}</p>}<p>Authentication credentials are never displayed here.</p></details></Modal>}
     {showConflict && <Modal title="Saved-state conflict" onClose={closeConflictReview}><p className="modal-intro">Another reviewer saved a newer version while your edit was pending. The newer file was not overwritten. Your pending requests below remain in this window and will not be replayed automatically. Compare both versions, then explicitly choose whether to apply your pending edits to the displayed revision.</p><div className="context-box warning"><TriangleAlert size={17}/><p>Keep this window open while resolving the conflict. Pending edits are still held in memory. You can select and copy this text to preserve a separate record before any manual recovery.</p></div><p className="conflict-revisions">This window last acknowledged revision {queue.current?.revision ?? document.revision}.{externalDocument ? ` The newer saved version is revision ${externalDocument.revision}.` : ' The latest saved revision will be read on the next status check.'}</p><label className="conflict-draft-label">Retained pending requests<textarea aria-label="Retained pending requests" readOnly value={JSON.stringify(queue.current?.retainedOperations ?? [], null, 2)}/></label>{externalDocument && <div className="conflict-saved-summary"><h3>Newer saved decisions for pending paths</h3>{Array.from(new Set((queue.current?.retainedOperations ?? []).flatMap(operation => 'path' in operation ? [operation.path] : []))).map(path => { const decision = Object.values(externalDocument.decisions).find(decision => resolveDecisionPath(decision, boot.volumes).path?.toLowerCase() === path.toLowerCase()); return <article key={path}><strong>{path}</strong><p>{decision ? LABELS[decision.status] : 'No explicit saved decision'}</p>{decision?.notes && <p>{decision.notes}</p>}</article>; })}</div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'view') && <div className="conflict-saved-summary"><h3>Saved review position in this revision</h3><p>{externalDocument.view.path}</p><p>Selection: {externalDocument.view.selectedPath ?? 'folder itself'} · filter: {externalDocument.view.filter} · search: {externalDocument.view.search || '(empty)'}</p></div>}{externalDocument && (queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') && <ReviewedUndoTarget document={externalDocument}/>}<div className="conflict-recovery-actions"><button disabled={conflictLoading || !queue.current?.state.error} onClick={() => void loadConflictComparison()}><RefreshCw size={14}/>{conflictLoading ? 'Reading saved version…' : 'Refresh comparison'}</button><button className="primary" disabled={conflictLoading || !externalDocument || !queue.current?.state.error || (externalDocument?.revision ?? 0) < (queue.current?.revision ?? 0)} onClick={() => { void applyReviewedPending().catch(() => {}); }}>Apply my pending edits{(queue.current?.retainedOperations ?? []).some(operation => operation.type === 'undo') ? ' + reviewed Undo' : ''} to revision {externalDocument?.revision ?? '…'}</button></div>{conflictProblem && <div className="context-box warning" role="alert"><TriangleAlert size={17}/><p>{conflictProblem}</p></div>}<p className="modal-intro conflict-footnote">Applying uses the displayed revision and the original request identifiers. Unrelated saved fields stay intact. For fields changed in both versions, this action deliberately chooses your pending edit. If the saved file changes again, the revision check stops the edit for another review.</p><p className="modal-intro">No pending request is discarded and no revision fence is bypassed by closing this panel.</p></Modal>}
-    {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{STATUSES.map(status => { const Icon = ICONS[status]; const isSelected = effective.own && effective.status === status; return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); void classify(status); }}><Icon size={18}/><span><strong>{LABELS[status]}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
+    {showDecisionPicker && <Modal title="Choose a migration decision" compact onClose={() => setShowDecisionPicker(false)}><p className="picker-intro">Your choice is autosaved. It never copies or deletes source files.</p><div className="decision-choices" role="group" aria-label="Migration decision">{DECISION_CHOICES.map(status => { const Icon = ICONS[status]; const isSelected = isDecisionChoiceSelected(effective, status); return <button key={status} className={`classification-button status-${status} ${isSelected ? 'selected' : ''}`} aria-pressed={isSelected} disabled={classificationUnavailable} onClick={() => { setShowDecisionPicker(false); if (!isSelected) void classify(status); }}><Icon size={18}/><span><strong>{decisionChoiceLabel(status)}</strong><small>{DESCRIPTIONS[status]}</small></span>{isSelected && <Check size={16}/>}</button>; })}</div></Modal>}
     {showContext && <Modal title="Review context & exceptions" onClose={() => setShowContext(false)}><p className="context-path">{selectedPath}</p><StatusBadge effective={effective}/><RollupCoverageDetails effective={effective}/><AuditDetails stats={details?.audit ?? selectedEntry?.audit} logicalFallback={selectedEntry?.kind === 'file' ? selectedEntry.size : undefined}/>{agentDecision && <div className="context-box"><Link2 size={16}/><div><p>Saved through MCP by {typeof activeProvenance?.actor === 'string' ? activeProvenance.actor : 'an agent'}{typeof activeProvenance?.at === 'string' ? ` · ${new Date(activeProvenance.at).toLocaleString()}` : ''}.</p>{typeof activeProvenance?.reason === 'string' && <p>{activeProvenance.reason}</p>}</div></div>}{pathSuggestions.length > 0 && <section className="assistant-proposals"><h3>Assistant proposals · not applied</h3><p>Suggestions are separate from saved decisions. No proposal below changes a classification.</p>{pathSuggestions.map(suggestion => <article key={suggestion.id}><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: suggestion.status }}/><p>{suggestion.reason}</p><small>{suggestion.actor} · MCP suggestion{suggestion.createdAt ? ` · ${new Date(suggestion.createdAt).toLocaleString()}` : ''}</small></article>)}</section>}{effective.inheritedFrom && <div className="context-box"><Info size={16}/>{effective.originalStatus === 'on-external' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has a manual F: assertion. This child needs its own review. Backup assertions are not inherited.</p> : effective.originalStatus === 'manual-confirmed' ? <p>The parent <strong>{effective.inheritedFrom}</strong> has your manual-backup confirmation for that path. Review this child separately.</p> : <p>Inherited from <strong>{effective.inheritedFrom}</strong>. Choosing a decision creates a specific child exception.</p>}</div>}{effective.stale && <div className="context-box warning"><TriangleAlert size={16}/><p>Source metadata changed or new content was discovered after the decision. Review it again. The earlier claim remains in history.</p></div>}{details && !details.exists && <div className="context-box warning"><TriangleAlert size={16}/><p>This path is missing or unavailable. Its saved decision is retained. You can edit notes; classification is unavailable until the path can be read again.</p></div>}{selectedPath !== view.path && !selectedEntry && !loading && <p className="modal-intro">The selected path is outside the current page or filter. Its decision remains open.</p>}{activeDecision?.decidedAt && <p className="decision-date">Decision recorded {new Date(activeDecision.decidedAt).toLocaleString()}</p>}<div className="evidence-note"><ShieldCheck size={18}/><p>Manual marks record your pending copy or your confirmation. Source checksums, destination-copy receipts and restore checks provide separate evidence. The green Already on F: mark retains your manual F: assertion.</p></div>{details && details.overrides.length > 0 ? <div className="overrides"><h3>Specific child decisions · {details.overrides.length} recorded</h3>{details.overrides.map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <div key={`${decision.path}-${index}`}><button disabled={!location.path} title={decision.path} onClick={() => { if (!location.path) return; setShowContext(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}><span className={`decision-dot status-${decision.status}`}/><span>{decision.path}</span><ChevronRight size={13}/></button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}</div>; })}</div> : <p className="modal-intro context-empty">No specific child exceptions are recorded for this path.</p>}</Modal>}
-    {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>This optional index discovers folder names for navigation. The Count & hash controls run the full allocation and source checksum audit.</p><div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued</p><p className="modal-intro">Protected paths, failed reads and links are recorded here. No ownership or permissions are changed. This shows the latest 200 gaps; the inventory may discover more.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
+    {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>The directory index skips known generated folders by default. Count &amp; hash runs a separate source audit.</p>
+      {!scanRunning && <label className="follow-ai-control">
+        <input type="checkbox" checked={includeGeneratedForIndex} onChange={event => setIncludeGeneratedForIndex(event.target.checked)}/>
+        <span>Include generated folders in the next new index</span>
+      </label>}
+      <div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued
+      {Boolean(appStatus.scan.skippedGenerated) && <> · {appStatus.scan.skippedGenerated?.toLocaleString()} generated folders skipped</>}
+      </p><p className="modal-intro">This list shows up to 200 entries, including a sample of skipped generated folders and the latest filesystem gaps.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
     {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item} onGroupUndo={readOnly ? undefined : groupId => { void prepareGroupUndo(groupId, true).catch(report); }}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}
     {showSaved && <Modal title="Saved decisions & notes" onClose={() => setShowSaved(false)}><p className="modal-intro">Every saved record remains here, including paths that were moved, removed or belong to a previous volume. Availability is checked when you open a path. A previous disk’s decision is never applied to a different disk using the same drive letter.</p><div className="saved-tools"><input aria-label="Search saved decisions and notes" placeholder="Search saved paths and notes…" value={savedSearch} onChange={event => { setSavedSearch(event.target.value); setSavedPage(0); }}/><select aria-label="Filter saved records" value={savedFilter} onChange={event => { setSavedFilter(event.target.value); setSavedPage(0); }}><option value="all">All saved records</option>{STATUSES.map(status => <option value={status} key={status}>{LABELS[status]}</option>)}</select></div><p className="saved-result-count">{savedDecisions.length.toLocaleString()} matching saved records · current availability not yet checked</p>{savedDecisions.slice(savedPage * 100, (savedPage + 1) * 100).map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <article className="saved-record" key={`${decision.path}-${index}`}><div><strong>{decision.path}</strong><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: decision.status, own: true }}/>{decision.noteOnly === true && <small>Note only · classification not set</small>}{decision.notes && <p>{decision.notes}</p>}{decision.decidedAt && <small>Recorded {new Date(decision.decidedAt).toLocaleString()}</small>}</div><div className="saved-review-action"><button disabled={!location.path} onClick={() => { if (!location.path) return; setShowSaved(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}>Review path</button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}{location.path && location.path.toLowerCase() !== decision.path.toLowerCase() && <small>Current location: {location.path}</small>}</div></article>; })}{!savedDecisions.length && <div className="empty-state"><Database size={28}/><h3>No matching saved records</h3><p>New decisions and notes are captured as you review folders.</p></div>}<div className="saved-pagination"><button disabled={savedPage === 0} onClick={() => setSavedPage(page => page - 1)}>Previous 100</button><span>Page {savedPage + 1} / {Math.max(1, Math.ceil(savedDecisions.length / 100))}</span><button disabled={(savedPage + 1) * 100 >= savedDecisions.length} onClick={() => setSavedPage(page => page + 1)}>Next 100</button></div></Modal>}
-    {showMirror && <Modal title="Manual mirror comparison" onClose={() => setShowMirror(false)}>
-      <MirrorReview currentPath={view.path} instanceId={gateway.instanceId} enabled={!readOnly}
+    {showMirror && <Modal title="Manual mirror comparison" onClose={() => { setShowMirror(false); setMirrorReviewPath(null); }}>
+      <MirrorReview currentPath={mirrorReviewPath ?? view.path} instanceId={gateway.instanceId} enabled={!readOnly}
         controlRef={mirrorControl} onNativeWrite={runNativeWrite} onSave={saveMirror}/>
     </Modal>}
     {groupReview && <Modal title={groupReview.mode === 'mark' ? 'Review selected entries' : 'Review group Undo'}

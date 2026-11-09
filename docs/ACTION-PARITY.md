@@ -42,6 +42,7 @@ confirmation, fencing, retries and asynchronous status.
 | Count/hash all roots or a subtree; pause/resume/restart; inspect progress | `audit_control` / `audit_status` | `checksum_control` / `checksum_status` |
 | Read change notifications and mark specified/all notifications read | `audit_notifications` / `audit_read_notifications` | `read_notifications` / `mark_notifications_read` |
 | Activate a notification's source location | mark read, then review `openMain` | `mark_notifications_read`, then `navigate_review` |
+| Center a folder or go back while keeping the open branch | `mutate`: review `centerFolder` / `backFolder` | `control_review_view` |
 | Resize/collapse/reopen sidebars, size/fill folder columns, restore the strip, expand/collapse Path/Search | `mutate`: review `setLayout` / `setView` | `control_review_view` |
 | Enable/disable Follow AI's movement | `control_ui`: `setFollowAI` | `control_ui` |
 | Inspect eligible copy entries, queue signatures, destination and job progress | `copy_queue_snapshot` | `get_copy_queue` |
@@ -53,6 +54,8 @@ confirmation, fencing, retries and asynchronous status.
 | Change the visible saved-record search/filter/page | `control_ui`: `setSavedRecords` | `control_ui` |
 | Show/dismiss notification preview/full list and change its page | `control_ui`: `setNotifications` | `control_ui` |
 | Open/close the assistance override chooser, row menu, copy details or gateway details | `control_ui`: `setAssistanceOverride` / `setRowMenu` / `setCopyDetails` / `setGatewayDetails` | `control_ui` |
+| Expand question or scan details, or navigate the folder previews in AI Assistance | `control_ui`: `setAssistanceDetails` / `setAssistanceScanDetails` / `navigateAssistance` | `control_ui` |
+| Change whether marked folders scan last | `mutate`: `inventoryPriority` | `set_inventory_priority` |
 | Inspect pending saves, buffered notes/view/path drafts and save/conflict state | `get_ui_state`; `control_ui`: `listPending` / `readPendingText` | `get_ui_state` / `control_ui` |
 | Flush pending saves, safely retry a failed save, compare a conflict, apply exact retained edits to a reviewed revision | `control_ui`: `flushPending` / `retryPending` / `compareConflict` / `retryReviewed` | `control_ui` |
 | Dismiss status or error feedback while retaining user work | `control_ui`: `dismissFeedback` | `control_ui` |

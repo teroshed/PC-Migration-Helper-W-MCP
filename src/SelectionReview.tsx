@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { AlertTriangle, Folder, File, X } from 'lucide-react';
-import { DESCRIPTIONS, ICONS, LABELS } from './classifications';
-import { STATUSES } from './model';
+import { DECISION_CHOICES, DESCRIPTIONS, ICONS, LABELS, decisionChoiceLabel } from './classifications';
 import type { GroupTarget, Operation, Status } from './model';
 import { selectedFoldersWithDescendants, selectionKey } from './review-selection';
 import type { SavedGroup } from './review-selection';
@@ -52,12 +51,12 @@ export function SelectionReview({ review, attempted, busy, error, onSubmit, onRe
       ? `Review all ${targets.length} selected entries. They will receive one saved decision together.`
       : `Review the previous decisions for all ${targets.length} group members. Undo applies to the entire group only while every member still matches the saved group result.`}</p>
     {review.mode === 'mark' && <div className="group-status-options" role="group" aria-label="Decision for selected entries">
-      {STATUSES.map(mark => {
+      {DECISION_CHOICES.map(mark => {
         const Icon = ICONS[mark];
         return <button key={mark} type="button" aria-pressed={mark === status} disabled={disabled}
           title={DESCRIPTIONS[mark]} className={`classification-button status-${mark}${mark === status ? ' selected' : ''}`}
           onClick={() => { setStatus(mark); setFolderAcknowledged(false); setQueueAcknowledged(false); }}>
-          <Icon size={15} aria-hidden="true"/><span><strong>{LABELS[mark]}</strong></span>
+          <Icon size={15} aria-hidden="true"/><span><strong>{decisionChoiceLabel(mark)}</strong></span>
         </button>;
       })}
     </div>}

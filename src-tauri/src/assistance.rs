@@ -1,5 +1,5 @@
 use crate::{filesystem, store::error, AppState, Shared};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -8,13 +8,15 @@ use std::{
 };
 
 #[derive(Default)]
-pub struct Cache(Mutex<Option<Arc<Inventory>>>);
+pub struct Cache(Mutex<Option<Arc<Inventory>>>, Mutex<Option<(String, String)>>);
 
 struct Inventory {
     scope: String,
     stamp: String,
+    observed_after: String,
     directories: Vec<Directory>,
     gaps: usize,
+    skipped_generated: usize,
 }
 
 struct Directory {
@@ -79,27 +81,30 @@ impl Inventory {
             .query_row("SELECT value FROM meta WHERE key='scan'", [], |r| r.get(0))
             .map_err(error)?;
         let current: Value = serde_json::from_str(&current).map_err(error)?;
-        if current["status"] != "complete" || current["finishedAt"] != stamp {
-            return Err(
-                "The inventory changed while preparing the interview. Refresh to continue.".into(),
-            );
-        }
-        let root = scope.trim_end_matches('\\').to_ascii_lowercase();
-        let prefix = format!("{root}\\");
+        let observed_after = if is_early_stamp(stamp) {
+            early_basis(&db, scope, &current)?.filter(|basis| basis.stamp == stamp)
+                .map(|basis| basis.observed_after)
+        } else if current["status"] == "complete" && current["finishedAt"] == stamp {
+            Some(stamp.to_owned())
+        } else {
+            None
+        }.ok_or("The inventory changed while preparing the interview. Refresh to continue.")?;
+        let (low, high) = subtree_range(scope);
         let mut query = db
             .prepare(
                 "SELECT q.path, coalesce(d.files,0), coalesce(d.bytes,0),
-                    q.state='done' AND d.signature IS NOT NULL AND d.problem IS NULL
+                    q.state='done' AND d.signature IS NOT NULL AND d.problem IS NULL,
+                    q.state='skipped'
              FROM queue q LEFT JOIN directories d ON d.path=q.path
-             WHERE rtrim(lower(q.path),char(92))=?1 OR substr(lower(q.path),1,length(?2))=?2
+             WHERE q.path=?1 OR (q.path>=?2 AND q.path<?3)
              ORDER BY length(q.path), q.path COLLATE NOCASE",
             )
             .map_err(error)?;
         let rows = query
-            .query_map(params![root, prefix], |r| {
+            .query_map(params![scope, low, high], |r| {
                 let path: String = r.get(0)?;
                 let readable: bool = r.get(3)?;
-                Ok(Directory {
+                Ok((Directory {
                     reusable: reusable_name(&path),
                     path,
                     files: crate::index::nonnegative(r.get(1)?, 1)?,
@@ -110,10 +115,25 @@ impl Inventory {
                     protected: false,
                     parent_id: None,
                     children: Vec::new(),
-                })
+                }, r.get::<_, bool>(4)?))
             })
             .map_err(error)?;
-        let mut directories: Vec<_> = rows.collect::<Result<_, _>>().map_err(error)?;
+        // A resumed inventory can have older observations beneath a newly skipped root.
+        // Keep those observations in storage but exclude them from this interview.
+        let mut hidden = HashSet::new();
+        let mut directories = Vec::new();
+        let mut skipped_generated = 0;
+        for row in rows {
+            let (directory, skipped) = row.map_err(error)?;
+            let beneath_skip = parent(&directory.path).is_some_and(|path| hidden.contains(&path));
+            if beneath_skip || skipped {
+                hidden.insert(directory.path.to_lowercase());
+            }
+            if !beneath_skip {
+                directories.push(directory);
+                skipped_generated += usize::from(skipped);
+            }
+        }
         let ids: HashMap<_, _> = directories
             .iter()
             .enumerate()
@@ -135,12 +155,12 @@ impl Inventory {
         let mut gaps = db
             .prepare(
                 "SELECT path FROM directories WHERE problem IS NOT NULL
-             AND observed_at>=?1 AND substr(lower(path),1,length(?2))=?2",
+             AND observed_at>=?1 AND path>=?2 AND path<?3",
             )
             .map_err(error)?;
         for row in gaps
             .query_map(
-                params![scan["startedAt"].as_str().unwrap_or(""), prefix],
+                params![scan["startedAt"].as_str().unwrap_or(""), low, high],
                 |row| row.get::<_, String>(0),
             )
             .map_err(error)?
@@ -184,10 +204,172 @@ impl Inventory {
         Ok(Self {
             scope: scope.to_string(),
             stamp: stamp.to_string(),
+            observed_after,
             directories,
             gaps: gap_paths.len(),
+            skipped_generated,
         })
     }
+}
+
+const EARLY_DIRECTORY_LIMIT: usize = 256;
+const EARLY_FILE_LIMIT: u64 = 25_000;
+
+fn subtree_range(scope: &str) -> (String, String) {
+    let scope = scope.trim_end_matches('\\');
+    (format!("{scope}\\"), format!("{scope}]"))
+}
+
+fn scan_contains(scan: &Value, scope: &str) -> bool {
+    scan["roots"].as_array().into_iter().flatten().filter_map(Value::as_str)
+        .any(|root| filesystem::under(scope, root))
+}
+
+struct EarlyBasis {
+    stamp: String,
+    observed_after: String,
+}
+
+pub(crate) fn is_early_stamp(stamp: &str) -> bool { stamp.starts_with("branch:") }
+
+fn early_basis(db: &Connection, path: &str, scan: &Value) -> Result<Option<EarlyBasis>, String> {
+    let Some(started) = scan["startedAt"].as_str() else { return Ok(None) };
+    if !matches!(scan["status"].as_str(), Some("running" | "paused" | "complete"))
+        || !scan_contains(scan, path)
+    {
+        return Ok(None);
+    }
+    let mut ancestor = parent(path);
+    while let Some(candidate) = ancestor {
+        let skipped = db.query_row("SELECT EXISTS(SELECT 1 FROM queue WHERE path=?1 AND state='skipped')",
+            [&candidate], |row| row.get::<_, bool>(0)).map_err(error)?;
+        if skipped { return Ok(None); }
+        ancestor = parent(&candidate);
+    }
+    let (low, high) = subtree_range(path);
+    let mut rows = db.prepare(
+        "SELECT q.path, q.state, d.signature, d.problem, d.observed_at, d.files, h.generation
+         FROM queue q LEFT JOIN directories d ON d.path=q.path
+         LEFT JOIN observation_heads h ON h.parent=lower(q.path)
+         WHERE q.path IN (
+             SELECT path FROM queue WHERE path=?1
+             UNION ALL SELECT path FROM (SELECT path FROM queue WHERE path>=?2 AND path<?3 ORDER BY path LIMIT ?4)
+         ) ORDER BY q.path"
+    ).map_err(error)?;
+    let mut rows = rows.query(params![path, low, high, (EARLY_DIRECTORY_LIMIT + 1) as i64]).map_err(error)?;
+    let mut missing = db.prepare(
+        "SELECT EXISTS(SELECT 1 FROM directory_children c LEFT JOIN queue q ON q.path=c.path
+         WHERE c.parent=?1 AND c.generation=?2 AND (q.state IS NULL OR q.state<>'done'))"
+    ).map_err(error)?;
+    let mut observations = Vec::new();
+    let mut observed_after = None::<String>;
+    let mut files = 0u64;
+    let mut saw_root = false;
+    while let Some(row) = rows.next().map_err(error)? {
+        let dir: String = row.get(0).map_err(error)?;
+        let state: String = row.get(1).map_err(error)?;
+        let signature: Option<String> = row.get(2).map_err(error)?;
+        let problem: Option<String> = row.get(3).map_err(error)?;
+        let observed: Option<String> = row.get(4).map_err(error)?;
+        let leaves: Option<i64> = row.get(5).map_err(error)?;
+        let generation: Option<String> = row.get(6).map_err(error)?;
+        let (Some(signature), Some(observed), Some(leaves), Some(generation)) =
+            (signature, observed, leaves, generation) else { return Ok(None) };
+        let Ok(leaves) = u64::try_from(leaves) else { return Ok(None) };
+        files = files.saturating_add(leaves);
+        if state != "done" || problem.is_some() || observed.as_str() < started
+            || observations.len() == EARLY_DIRECTORY_LIMIT || files > EARLY_FILE_LIMIT
+            || missing.query_row(params![dir, generation], |row| row.get::<_, bool>(0)).map_err(error)?
+        {
+            return Ok(None);
+        }
+        saw_root |= dir.eq_ignore_ascii_case(path);
+        if observed_after.as_ref().is_none_or(|first| &observed < first) {
+            observed_after = Some(observed);
+        }
+        observations.push((dir, signature));
+    }
+    if !saw_root { return Ok(None); }
+    let evidence = serde_json::to_vec(&(started, observations)).map_err(error)?;
+    Ok(observed_after.map(|observed_after| EarlyBasis {
+        stamp: format!("branch:{}", crate::store::hash(&evidence)),
+        observed_after,
+    }))
+}
+
+fn current_early_basis(s: &AppState, path: &str) -> Result<Option<EarlyBasis>, String> {
+    let db = s.index.connect()?;
+    let db = db.unchecked_transaction().map_err(error)?;
+    let scan: String = db.query_row("SELECT value FROM meta WHERE key='scan'", [], |row| row.get(0)).map_err(error)?;
+    let scan = serde_json::from_str(&scan).map_err(error)?;
+    let Some(basis) = early_basis(&db, path, &scan)? else { return Ok(None) };
+    if s.watcher_fault.lock().map_err(error)?.is_some()
+        || s.audit.watch_changed(path, &basis.observed_after)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(basis))
+}
+
+pub(crate) fn early_branch_current(s: &AppState, path: &str, stamp: &str) -> Result<bool, String> {
+    Ok(current_early_basis(s, path)?.is_some_and(|basis| basis.stamp == stamp))
+}
+
+fn early_children(s: &AppState, scope: &str) -> Result<Vec<String>, String> {
+    let db = s.index.connect()?;
+    let mut query = db.prepare(
+        "SELECT q.path FROM directory_children c JOIN observation_heads h ON h.parent=lower(c.parent)
+         JOIN queue q ON q.path=c.path WHERE c.parent=?1 AND c.generation=h.generation AND q.state='done'
+         ORDER BY q.path LIMIT 128"
+    ).map_err(error)?;
+    let rows = query.query_map([scope], |row| row.get::<_, String>(0)).map_err(error)?;
+    rows.collect::<Result<_, _>>().map_err(error)
+}
+
+fn early_questions(s: &AppState, doc: &Value, scope: &str, scan: &Value,
+    slate: &mut Vec<Value>, limit: usize, view: &mut Value) -> Result<(), String> {
+    let pinned = s.assistance.1.lock().map_err(error)?.clone();
+    let mut candidates = vec![scope.to_owned()];
+    candidates.extend(early_children(s, scope)?);
+    if let Some((owner, path)) = pinned {
+        if owner == scope && filesystem::under(&path, scope) {
+            candidates.retain(|candidate| !candidate.eq_ignore_ascii_case(&path));
+            candidates.insert(0, path);
+        }
+    }
+    let confirmations = crate::manual_backup::ConfirmationCache::default();
+    let overrides = saved_paths(doc, "split");
+    for path in candidates {
+        if crate::adaptive_review::active(doc)
+            && s.runtime.to_str().is_some_and(|runtime| filesystem::under(runtime, &path))
+        {
+            continue;
+        }
+        if resolved(s, doc, &path, &confirmations) && !overrides.contains(&path.to_lowercase()) {
+            continue;
+        }
+        let Some(basis) = current_early_basis(s, &path)? else { continue };
+        let inventory = Inventory::load(s, &path, scan, &basis.stamp)?;
+        if inventory.directories[0].gap_below || inventory.gaps != 0 { continue; }
+        let (questions, unavailable) = pick_question(s, doc, &inventory, limit)?;
+        if questions.is_empty() || unavailable != 0 || !early_branch_current(s, &path, &basis.stamp)? {
+            continue;
+        }
+        slate.extend(questions.into_iter().map(|question| {
+            let mut displayed = question.display(s, doc, scope, &basis.stamp, &inventory.observed_after);
+            displayed["earlyBranch"] = json!(path);
+            displayed
+        }));
+        *s.assistance.1.lock().map_err(error)? = Some((scope.to_owned(), path.clone()));
+        view["phase"] = json!("question");
+        view["question"] = slate[0].clone();
+        view["earlyBranch"] = json!(path);
+        view["earlyStamp"] = json!(basis.stamp);
+        view["files"] = json!(inventory.directories[0].leaves);
+        view["skippedGenerated"] = json!(0);
+        break;
+    }
+    Ok(())
 }
 
 fn scan_state(s: &AppState) -> Result<Value, String> {
@@ -269,7 +451,7 @@ impl Question {
         }
     }
 
-    fn display(self, s: &AppState, doc: &Value, scope: &str, stamp: &str) -> Value {
+    fn display(self, s: &AppState, doc: &Value, scope: &str, stamp: &str, observed_after: &str) -> Value {
         let name = basename(&self.path);
         let (prompt, reason) = if self.manual_confirmation {
             (format!("Have you completed the manual backup of {name}?"),
@@ -316,7 +498,7 @@ impl Question {
                         .is_some_and(|reason| !reason.trim().is_empty())
                     && value["createdAt"]
                         .as_str()
-                        .is_some_and(|date| date >= stamp)
+                        .is_some_and(|date| date >= observed_after)
             });
         let agent_status = suggestion.and_then(|v| v["status"].as_str());
         let proposed = if self.manual_confirmation {
@@ -468,7 +650,7 @@ fn pick_question(
             )
             .optional()
             .map_err(error)?;
-        if observed.is_none_or(|time| time.as_str() < inventory.stamp.as_str())
+        if observed.is_none_or(|time| time.as_str() < inventory.observed_after.as_str())
             && s.index.refresh(&dir.path, &s.volumes, None, true).is_err()
         {
             unavailable += 1;
@@ -517,7 +699,12 @@ fn pending_manual(
                 && decision["volumeId"] == volume.id
                 && decision["relativePath"].as_str().is_some_and(|relative| {
                     let path = std::path::Path::new(&volume.root).join(relative);
-                    filesystem::under(&path.to_string_lossy(), scope)
+                    let path = path.to_string_lossy();
+                    filesystem::under(&path, scope) && !(s.mirrors.verifies_manual_scope(doc, &path, volume, s.fixture)
+                        && filesystem::guard_path(&path, &s.volumes, false).is_ok_and(|(path, _guards)| {
+                            let entry = filesystem::inspect(&path);
+                            matches!(entry.kind.as_str(), "folder" | "file") && entry.problem.is_none()
+                        }))
                 })
         })
         .cloned()
@@ -613,7 +800,7 @@ fn pending_question(
 
 fn snapshot_inner(s: &AppState, doc: &Value, slate: &mut Vec<Value>, limit: usize) -> Result<Value, String> {
     let Some(scope) = doc["assistance"]["scope"].as_str() else {
-        return Ok(json!({"phase":"idle","revision":doc["revision"]}));
+        return Ok(json!({"phase":"idle","revision":doc["revision"],"scan":scan_state(s)?}));
     };
     let (volume, _, _) = filesystem::identify(scope, &s.volumes)?;
     if doc["assistance"]["volumeId"] != volume.id {
@@ -621,23 +808,28 @@ fn snapshot_inner(s: &AppState, doc: &Value, slate: &mut Vec<Value>, limit: usiz
     }
     let pending = pending_manual(s, doc, scope, volume);
     let scan = scan_state(s)?;
-    let scoped = scan["roots"].as_array().is_some_and(|roots| {
-        roots
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|root| filesystem::under(scope, root))
-    });
+    let scoped = scan_contains(&scan, scope);
     let mut view = json!({"phase":"needs-scan","scope":scope,"revision":doc["revision"],
         "deferred":saved_paths(doc,"deferred").len(),"manualPending":pending.len(),"scan":scan});
     if scan["status"] == "running" || s.index.running.load(Ordering::SeqCst) {
         view["phase"] = json!(if scoped { "scanning" } else { "other-scan" });
+        if scoped { early_questions(s, doc, scope, &scan, slate, limit, &mut view)?; }
         return Ok(view);
     }
     if scoped && scan["status"] == "paused" {
         view["phase"] = json!("paused");
+        early_questions(s, doc, scope, &scan, slate, limit, &mut view)?;
         return Ok(view);
     }
     if !scoped || scan["status"] != "complete" {
+        return Ok(view);
+    }
+    if crate::adaptive_review::active(doc) && scan["skippedGenerated"].as_u64().unwrap_or(0) > 0 {
+        early_questions(s, doc, scope, &scan, slate, limit, &mut view)?;
+        if !slate.is_empty() { return Ok(view); }
+    }
+    if scan["skippedGenerated"].as_u64().unwrap_or(0) > 0 && s.index.skipped_ancestor(scope)? {
+        view["scan"]["error"] = json!("This folder was skipped as generated. Scan including generated folders to review it.");
         return Ok(view);
     }
     let stamp = scan["finishedAt"]
@@ -672,7 +864,7 @@ fn snapshot_inner(s: &AppState, doc: &Value, slate: &mut Vec<Value>, limit: usiz
     if questions.is_empty() {
         questions.extend(pending_question(s, doc, &inventory, &pending));
     }
-    slate.extend(questions.into_iter().map(|question| question.display(s, doc, scope, stamp)));
+    slate.extend(questions.into_iter().map(|question| question.display(s, doc, scope, stamp, stamp)));
     view["phase"] = json!(if !slate.is_empty() {
         "question"
     } else {
@@ -681,6 +873,7 @@ fn snapshot_inner(s: &AppState, doc: &Value, slate: &mut Vec<Value>, limit: usiz
     view["question"] = slate.first().cloned().unwrap_or(Value::Null);
     view["files"] = json!(inventory.directories[0].leaves);
     view["gaps"] = json!(inventory.gaps + unavailable);
+    view["skippedGenerated"] = json!(inventory.skipped_generated);
     Ok(view)
 }
 
@@ -692,6 +885,7 @@ pub(crate) fn local_slate(s: &AppState, doc: &Value, limit: usize) -> Result<(Va
 
 pub fn snapshot(s: &AppState, doc: &Value) -> Result<Value, String> {
     let (mut view, _) = local_slate(s, doc, 1)?;
+    view["deferMarked"] = json!(doc["inventoryDeferMarked"] != false);
     crate::adaptive_review::decorate(s, doc, &mut view)?;
     Ok(view)
 }
@@ -708,6 +902,11 @@ pub fn validate_question(s: &AppState, doc: &Value, op: &Value) -> Result<Value,
     }
     if question["adaptive"] == true {
         crate::adaptive_review::validate_saved_question(s, doc, op)?;
+    }
+    if question["earlyBranch"].is_string() && op["type"] == "assistAnswer"
+        && matches!(op["status"].as_str(), Some("redownload" | "erase" | "on-external" | "manual-confirmed"))
+    {
+        return Err("Use a keep or manual backup decision for a question offered during inventory.".into());
     }
     Ok(question)
 }
@@ -934,15 +1133,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current(s)["phase"], "needs-scan");
-        s.index
-            .start(vec![scope], s.volumes.clone(), false)
-            .unwrap();
+        run_inventory(s, scope, true);
+    }
+
+    fn run_inventory(s: &AppState, scope: String, include_generated: bool) {
+        s.index.start(vec![scope], s.volumes.clone(), false, include_generated).unwrap();
         let started = Instant::now();
         while s.index.running.load(Ordering::SeqCst) {
             assert!(started.elapsed() < Duration::from_secs(15));
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(scan_state(s).unwrap()["status"], "complete");
+    }
+
+    #[test]
+    fn completed_branch_is_reviewable_while_another_branch_is_active() {
+        let s = fixture();
+        write(&s, r"Ready\keep.txt");
+        write(&s, r"Work\Child\pending.txt");
+        let root = &s.volumes[0].root;
+        let ready = format!("{root}\\Ready");
+        let work = format!("{root}\\Work");
+        edit(&s, "early-scope", json!({"type":"assist","action":"scope","path":root})).unwrap();
+        run_inventory(&s, root.clone(), false);
+        let db = s.index.connect().unwrap();
+        db.execute("UPDATE queue SET state='working' WHERE path=?1", [&work]).unwrap();
+        db.execute("UPDATE meta SET value=json_set(value,'$.status','running','$.finishedAt',null) WHERE key='scan'", []).unwrap();
+        let first = current(&s);
+        assert_eq!(first["scan"]["status"], "running");
+        assert_eq!(first["phase"], "question", "{first}");
+        assert_eq!(first["question"]["path"], ready);
+        assert!(edit(&s, "unsafe-early-answer", answer(&first["question"], "erase")).is_err());
+
+        db.execute("UPDATE queue SET state='done' WHERE path=?1", [&work]).unwrap();
+        assert_eq!(current(&s)["question"]["id"], first["question"]["id"]);
+        thread::sleep(Duration::from_millis(3));
+        s.audit.record_watch_change(&format!("{ready}\\keep.txt"), "modified").unwrap();
+        assert!(edit(&s, "stale-early-answer", answer(&first["question"], "last-moment")).is_err());
+        assert!(document(&s).unwrap()["decisions"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inaccessible_mark_is_rejected_before_save_without_changing_other_marks() {
+        let s = fixture();
+        let missing = format!("{}\\Missing", s.volumes[0].root);
+        let work = format!("{}\\Work", s.volumes[0].root);
+        let before = document(&s).unwrap();
+        let error = edit(&s, "missing-mark", json!({"type":"classify","path":missing,"status":"last-moment"})).unwrap_err();
+        assert!(error.starts_with("Mark rejected before save: "), "{error}");
+        assert_eq!(document(&s).unwrap(), before);
+        let saved = edit(&s, "reachable-mark", json!({"type":"classify","path":work,"status":"last-moment"})).unwrap();
+        assert_eq!(saved["decisions"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_inventory_keeps_generated_branches_out_of_questions_until_requested() {
+        let s = fixture();
+        for file in [
+            r"Work\node_modules\dependency\package.js",
+            r"Work\build\handwritten.txt",
+            r"Work\app\build\CMakeCache.txt",
+            r"Work\app\build\CMakeFiles\generated.txt",
+            r"Work\app\target\CACHEDIR.TAG",
+            r"Work\app\target\.rustc_info.json",
+            r"Work\app\.next\chunk.js",
+        ] {
+            write(&s, file);
+        }
+        let scope = Path::new(&s.volumes[0].root).join("Work").to_string_lossy().into_owned();
+        edit(&s, "filtered-scope", json!({"type":"assist","action":"scope","path":scope})).unwrap();
+        run_inventory(&s, scope.clone(), false);
+        let filtered = current(&s);
+        assert_eq!(filtered["scan"]["skippedGenerated"], 4);
+        assert_eq!(filtered["skippedGenerated"], 4);
+        assert_eq!(filtered["gaps"], 4);
+        assert_eq!(filtered["files"], 1);
+        let handwritten = Path::new(&scope).join("build").to_string_lossy().into_owned();
+        assert_eq!(filtered["question"]["path"], handwritten);
+
+        let generated = Path::new(&scope).join("node_modules").join("dependency")
+            .to_string_lossy().into_owned();
+        edit(&s, "generated-scope", json!({"type":"assist","action":"scope","path":generated})).unwrap();
+        assert_eq!(current(&s)["phase"], "needs-scan");
+        run_inventory(&s, generated, true);
+        let included = current(&s);
+        assert_eq!(included["scan"]["includeGenerated"], true);
+        assert_eq!(included["skippedGenerated"], 0);
+        assert_eq!(included["files"], 1);
+        assert_eq!(included["phase"], "question");
     }
 
     #[test]

@@ -66,6 +66,7 @@ export interface Effective {
   stale: boolean;
   mixed: number;
   originalStatus: string | null;
+  manualEvidence?: 'mirror-verified';
   rollup?: Rollup;
 }
 export interface Entry {
@@ -91,8 +92,8 @@ export interface GatewayStatus { state: 'running' | 'error' | 'unavailable'; end
 export interface Boot { document: Document; volumes: Volume[]; dataPath: string; fixture: boolean; problem: string | null; recoveryAvailable: boolean; gateway: GatewayStatus }
 export interface Listing { path: string; entries: Entry[]; total: number; attention: number; counts: Record<string, number>; observedAt: string | null }
 export interface Details { path: string; effective: Effective; decision: Decision | null; overrides: Decision[]; history: unknown[]; exists: boolean; audit?: AuditStats }
-export interface ScanStatus { status?: string; pending: number; processed?: number; files?: number; bytes?: number; currentPath?: string; error?: string }
-export interface AppStatus { scan: ScanStatus; gaps: Array<{ path: string; problem: string; observedAt: string }>; decisionCount: number }
+export interface ScanStatus { status?: string; pending: number; processed?: number; files?: number; bytes?: number; skippedGenerated?: number; currentPath?: string; error?: string }
+export interface AppStatus { scan: ScanStatus; gaps: Array<{ path: string; problem: string; observedAt: string }>; decisionCount: number; mirrorEvidenceStamp?: string }
 export type Operation =
   | { type: 'classify'; path: string; status: Status }
   | { type: 'note'; path: string; notes: string }
@@ -100,6 +101,7 @@ export type Operation =
   | { type: 'assist'; action: 'scope'; path: string }
   | { type: 'assist'; action: 'split' | 'defer'; path: string; questionId: string }
   | { type: 'assist'; action: 'restore' }
+  | { type: 'inventoryPriority'; deferMarked: boolean }
   | { type: 'assistAnswer'; path: string; questionId: string; status: Status; overrideConfirmed?: true }
   | { type: 'adaptiveControl'; action: 'external'; questionLimit: number }
   | { type: 'adaptiveControl'; action: 'local' | 'resume' }
@@ -215,7 +217,8 @@ export function parseEffective(value: unknown): Effective {
   const v = record(value);
   if (!isStatus(v.status) || typeof v.own !== 'boolean' || typeof v.stale !== 'boolean' || typeof v.mixed !== 'number') throw new Error('Invalid native classification response.');
   const rollup = parseRollup(v.rollup);
-  return { status: v.status, own: v.own, stale: v.stale, mixed: v.mixed, inheritedFrom: typeof v.inheritedFrom === 'string' ? v.inheritedFrom : null, originalStatus: typeof v.originalStatus === 'string' ? v.originalStatus : null, rollup };
+  return { status: v.status, own: v.own, stale: v.stale, mixed: v.mixed, inheritedFrom: typeof v.inheritedFrom === 'string' ? v.inheritedFrom : null, originalStatus: typeof v.originalStatus === 'string' ? v.originalStatus : null, rollup,
+    ...(v.manualEvidence === 'mirror-verified' ? { manualEvidence: v.manualEvidence } : {}) };
 }
 export function parseListing(value: unknown): Listing {
   const v = record(value);
@@ -349,7 +352,14 @@ export class MutationQueue {
         item.resolve(this.document);
         this.notify();
       } catch (cause) {
-        this.failure = cause instanceof Error ? cause.message : String(cause);
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (item.operation.type === 'classify' && message.startsWith('Mark rejected before save: ')) {
+          this.pending.shift();
+          item.reject(new Error(message));
+          this.notify();
+          continue;
+        }
+        this.failure = message;
         this.running = false;
         // Do not discard or replay the failed operation. Retry uses the same idempotency key.
         for (const waiter of this.waiters.splice(0)) waiter.reject(new Error(this.failure));

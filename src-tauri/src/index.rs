@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     hash::{Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -16,12 +16,20 @@ use std::{
 };
 
 const MISSING: &str = "Missing or changed type since the previous observation; retained for review";
+#[derive(Clone, Default)]
+struct PriorityPlan {
+    revision: u64,
+    rules: Vec<(String, i64)>,
+}
+
 pub struct Index {
     pub path: PathBuf,
     pub running: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
     refresh_locks: Arc<[Mutex<()>; 64]>,
     worker_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    priority_plan: Arc<Mutex<PriorityPlan>>,
+    priority_applied: Arc<Mutex<Option<u64>>>,
 }
 impl Index {
     pub fn open(path: PathBuf) -> Result<Self, String> {
@@ -32,6 +40,8 @@ impl Index {
             cancel: Arc::new(AtomicBool::new(false)),
             refresh_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             worker_handle: Arc::new(Mutex::new(None)),
+            priority_plan: Arc::new(Mutex::new(PriorityPlan::default())),
+            priority_applied: Arc::new(Mutex::new(None)),
         };
         let db = s.connect()?;
         db.execute_batch("PRAGMA journal_mode=WAL;
@@ -56,7 +66,60 @@ impl Index {
             INSERT OR IGNORE INTO meta VALUES('scan','{}');
             INSERT OR IGNORE INTO meta VALUES('observationSequence','0');
             UPDATE meta SET value=json_set(value,'$.status','paused') WHERE key='scan' AND json_extract(value,'$.status')='running';").map_err(error)?;
+        let has_priority: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('queue') WHERE name='priority')", [], |row| row.get(0)
+        ).map_err(error)?;
+        if !has_priority {
+            db.execute("ALTER TABLE queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0", []).map_err(error)?;
+        }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS queue_priority_rules(path TEXT PRIMARY KEY COLLATE NOCASE,defer INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS queue_priority_order ON queue(state,priority,length(path),path);").map_err(error)?;
         Ok(s)
+    }
+    pub(crate) fn update_priority(&self, doc: &Value, volumes: &[Volume]) {
+        let Some(revision) = doc["revision"].as_u64() else { return };
+        let mut rules = Vec::new();
+        if doc["inventoryDeferMarked"] != false {
+            for mark in doc["decisions"].as_object().into_iter().flat_map(|marks| marks.values()) {
+                if mark["noteOnly"] == true { continue; }
+                let (Some(id), Some(relative), Some(status)) =
+                    (mark["volumeId"].as_str(), mark["relativePath"].as_str(), mark["status"].as_str())
+                else { continue };
+                let Some(volume) = volumes.iter().find(|volume| volume.id == id && volume.available) else { continue };
+                let path = if relative.is_empty() { volume.root.clone() } else {
+                    format!("{}\\{relative}", volume.root.trim_end_matches('\\'))
+                };
+                if filesystem::locate(&path, volumes).is_ok() {
+                    rules.push((path, i64::from(status != "attention")));
+                }
+            }
+        }
+        // Apply parent rules first. A nearer explicit decision can override them.
+        rules.sort_unstable_by_key(|(path, _)| path.len());
+        if let Ok(mut plan) = self.priority_plan.lock() {
+            if revision >= plan.revision && plan.rules != rules {
+                *plan = PriorityPlan { revision, rules };
+            }
+        }
+    }
+    fn apply_priority(&self, db: &mut Connection) -> Result<(), String> {
+        let mut applied = self.priority_applied.lock().map_err(error)?;
+        let plan = {
+            let plan = self.priority_plan.lock().map_err(error)?;
+            if *applied == Some(plan.revision) { return Ok(()) }
+            plan.clone()
+        };
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+        tx.execute_batch("DELETE FROM queue_priority_rules; UPDATE queue SET priority=0 WHERE priority<>0;").map_err(error)?;
+        for (path, defer) in plan.rules {
+            tx.execute("INSERT OR REPLACE INTO queue_priority_rules VALUES(?1,?2)", params![path,defer]).map_err(error)?;
+            let prefix = path.trim_end_matches('\\');
+            tx.execute("UPDATE queue SET priority=?1 WHERE priority<>?1 AND (path=?2 OR (path>=?3 AND path<?4))",
+                params![defer,path,format!("{prefix}\\"),format!("{prefix}]")]).map_err(error)?;
+        }
+        tx.commit().map_err(error)?;
+        *applied = Some(plan.revision);
+        Ok(())
     }
     pub fn connect(&self) -> Result<Connection, String> {
         let c = Connection::open(&self.path).map_err(error)?;
@@ -158,15 +221,42 @@ impl Index {
                 |r| r.get::<_, i64>(0)
             )
             .map_err(error)?);
+        v["skippedGenerated"] = json!(db.query_row(
+            "SELECT count(*) FROM queue WHERE state='skipped'",
+            [], |row| row.get::<_, i64>(0),
+        ).map_err(error)?);
         Ok(v)
     }
     pub fn gaps(&self) -> Result<Value, String> {
         let db = self.connect()?;
-        let mut q=db.prepare("SELECT path,problem,observed_at FROM directories WHERE problem IS NOT NULL ORDER BY observed_at DESC LIMIT 200").map_err(error)?;
+        let mut q = db.prepare(
+            "SELECT path,problem,observed_at FROM (
+                 SELECT path,problem,observed_at FROM directories WHERE problem IS NOT NULL
+                 ORDER BY observed_at DESC
+                 LIMIT 200-min(20,(SELECT count(*) FROM queue WHERE state='skipped'))
+             )
+             UNION ALL
+             SELECT path,problem,observed_at FROM (
+                 SELECT path,'Generated folder skipped by the metadata scan. Index it explicitly to include its contents.' AS problem,
+                        json_extract((SELECT value FROM meta WHERE key='scan'),'$.finishedAt') AS observed_at
+                 FROM queue WHERE state='skipped' ORDER BY path LIMIT 20
+             )",
+        ).map_err(error)?;
         let rows=q.query_map([],|r|Ok(json!({"path":r.get::<_,String>(0)?,"problem":r.get::<_,String>(1)?,"observedAt":r.get::<_,Option<String>>(2)?}))).map_err(error)?;
         Ok(Value::Array(
             rows.collect::<Result<Vec<_>, _>>().map_err(error)?,
         ))
+    }
+    pub(crate) fn skipped_ancestor(&self, path: &str) -> Result<bool, String> {
+        let db = self.connect()?;
+        let mut lookup = db.prepare("SELECT 1 FROM queue WHERE path=?1 AND state='skipped'")
+            .map_err(error)?;
+        for ancestor in Path::new(path).ancestors().filter_map(Path::to_str) {
+            if lookup.exists([ancestor]).map_err(error)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub fn directory_info(&self, path: &str) -> Result<Option<Value>, String> {
         self.connect()?.query_row("SELECT observed_at,files,folders,bytes,problem,signature,(SELECT observed_at FROM listing_heads WHERE parent=?1) FROM directories WHERE path=?1",[path],|r|Ok(json!({"observedAt":r.get::<_,Option<String>>(0)?,"files":optional_count(r,1)?,"folders":optional_count(r,2)?,"bytes":optional_count(r,3)?,"problem":r.get::<_,Option<String>>(4)?,"signature":r.get::<_,Option<String>>(5)?,"listingObservedAt":r.get::<_,Option<String>>(6)?}))).optional().map_err(error)
@@ -476,8 +566,10 @@ impl Index {
             if e.kind == "folder" {
                 if scanning {
                     tx.execute(
-                        "INSERT OR IGNORE INTO queue(path,state) VALUES(?1,'pending')",
-                        [&e.path],
+                        "INSERT OR IGNORE INTO queue(path,state,priority) VALUES(?1,'pending',
+                         coalesce((SELECT defer FROM queue_priority_rules WHERE path=?1),
+                                  (SELECT priority FROM queue WHERE path=?2),0))",
+                        params![e.path, path],
                     )
                     .map_err(error)?;
                 }
@@ -576,6 +668,7 @@ impl Index {
         roots: Vec<String>,
         volumes: Vec<Volume>,
         resume: bool,
+        include_generated: bool,
     ) -> Result<(), String> {
         let mut coordinator = self.worker_handle.lock().map_err(error)?;
         if self.running.load(Ordering::SeqCst) {
@@ -604,10 +697,10 @@ impl Index {
             if !resume {
                 tx.execute("DELETE FROM queue", []).map_err(error)?;
                 for root in &roots {
-                    tx.execute("INSERT OR IGNORE INTO queue VALUES(?1,'pending')", [root])
+                    tx.execute("INSERT OR IGNORE INTO queue(path,state) VALUES(?1,'pending')", [root])
                         .map_err(error)?;
                 }
-                tx.execute("UPDATE meta SET value=?1 WHERE key='scan'",[json!({"status":"running","startedAt":now(),"roots":roots,"processed":0,"files":0,"bytes":0,"currentFiles":0,"currentBytes":0}).to_string()]).map_err(error)?;
+                tx.execute("UPDATE meta SET value=?1 WHERE key='scan'",[json!({"status":"running","startedAt":now(),"roots":roots,"includeGenerated":include_generated,"processed":0,"files":0,"bytes":0,"currentFiles":0,"currentBytes":0}).to_string()]).map_err(error)?;
             } else {
                 let pending: i64 = tx
                     .query_row(
@@ -636,7 +729,10 @@ impl Index {
             cancel: self.cancel.clone(),
             refresh_locks: self.refresh_locks.clone(),
             worker_handle: self.worker_handle.clone(),
+            priority_plan: self.priority_plan.clone(),
+            priority_applied: self.priority_applied.clone(),
         };
+        *self.priority_applied.lock().map_err(error)? = None;
         let spawn = std::thread::Builder::new().name("migration-inventory".into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&volumes)))
                 .unwrap_or_else(|_| Err("Inventory stopped unexpectedly; the durable queue can be resumed".into()));
@@ -675,13 +771,22 @@ impl Index {
             [workers as i64],
         )
         .map_err(error)?;
+        let raw: String = db.query_row("SELECT value FROM meta WHERE key='scan'", [],
+            |row| row.get(0)).map_err(error)?;
+        let scan: Value = serde_json::from_str(&raw).map_err(error)?;
+        let filtered_roots: Vec<&str> = if scan["includeGenerated"] == true {
+            Vec::new()
+        } else {
+            scan["roots"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+        };
+        let filtered_roots = filtered_roots.as_slice();
         // Like the audit pool, bound work and retain the durable queue. Workers claim one
         // directory at a time; no growing in-memory list or unbounded thread creation.
         let result = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
             for n in 0..workers {
                 let handle = std::thread::Builder::new().name(format!("migration-inventory-{n}")).spawn_scoped(scope, || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_worker(volumes)))
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_worker(volumes, filtered_roots)))
                         .unwrap_or_else(|_| Err("Inventory worker stopped unexpectedly; the durable queue can be resumed".into()));
                     if result.is_err() { self.cancel.store(true, Ordering::SeqCst); }
                     result
@@ -723,17 +828,18 @@ impl Index {
         tx.commit().map_err(error)?;
         result
     }
-    fn run_worker(&self, volumes: &[Volume]) -> Result<(), String> {
+    fn run_worker(&self, volumes: &[Volume], filtered_roots: &[&str]) -> Result<(), String> {
         let mut db = self.connect()?;
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
             // IMMEDIATE avoids concurrent read-to-write upgrades and duplicate claims.
+            self.apply_priority(&mut db)?;
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(error)?;
-            let path: Option<String> = tx.query_row("SELECT path FROM queue WHERE state='pending' ORDER BY length(path),path LIMIT 1", [], |r| r.get(0)).optional().map_err(error)?;
+            let path: Option<String> = tx.query_row("SELECT path FROM queue WHERE state='pending' ORDER BY priority,length(path),path LIMIT 1", [], |r| r.get(0)).optional().map_err(error)?;
             let Some(path) = path else {
                 let working: bool = tx
                     .query_row(
@@ -757,6 +863,20 @@ impl Index {
             )
             .map_err(error)?;
             tx.commit().map_err(error)?;
+            if let Some(root) = generated_ancestor(&path, filtered_roots, volumes) {
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+                let descendant_start = format!("{root}\\");
+                let descendant_end = format!("{root}]");
+                tx.execute("UPDATE queue SET state='skipped-child'
+                    WHERE path>=?1 AND path<?2 AND state IN ('pending','working')",
+                    params![descendant_start, descendant_end]).map_err(error)?;
+                tx.execute("UPDATE queue SET state='skipped' WHERE path=?1", [root])
+                    .map_err(error)?;
+                tx.execute("DELETE FROM scan_progress WHERE path=?1 OR (path>=?2 AND path<?3)",
+                    params![root, descendant_start, descendant_end]).map_err(error)?;
+                tx.commit().map_err(error)?;
+                continue;
+            }
             let result = self.refresh(&path, volumes, Some(&self.cancel), false);
             if result.as_ref().is_err_and(|e| e == "Paused") {
                 return Ok(());
@@ -764,17 +884,57 @@ impl Index {
             let tx = db
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(error)?;
-            tx.execute(
-                "UPDATE queue SET state=?2 WHERE path=?1",
+            let finished = tx.execute(
+                "UPDATE queue SET state=?2 WHERE path=?1 AND state='working'",
                 params![path, if result.is_ok() { "done" } else { "gap" }],
             )
             .map_err(error)?;
             tx.execute("DELETE FROM scan_progress WHERE path=?1", [&path])
                 .map_err(error)?;
-            tx.execute("UPDATE meta SET value=json_set(value,'$.processed',coalesce(json_extract(value,'$.processed'),0)+1,'$.files',coalesce(json_extract(value,'$.files'),0)+CASE WHEN ?2 THEN coalesce((SELECT files FROM directories WHERE path=?1),0) ELSE 0 END,'$.bytes',coalesce(json_extract(value,'$.bytes'),0)+CASE WHEN ?2 THEN coalesce((SELECT bytes FROM directories WHERE path=?1),0) ELSE 0 END) WHERE key='scan'",params![path,result.is_ok()]).map_err(error)?;
+            if finished != 0 {
+                tx.execute("UPDATE meta SET value=json_set(value,'$.processed',coalesce(json_extract(value,'$.processed'),0)+1,'$.files',coalesce(json_extract(value,'$.files'),0)+CASE WHEN ?2 THEN coalesce((SELECT files FROM directories WHERE path=?1),0) ELSE 0 END,'$.bytes',coalesce(json_extract(value,'$.bytes'),0)+CASE WHEN ?2 THEN coalesce((SELECT bytes FROM directories WHERE path=?1),0) ELSE 0 END) WHERE key='scan'",params![path,result.is_ok()]).map_err(error)?;
+            }
             tx.commit().map_err(error)?;
         }
     }
+}
+
+fn generated_ancestor<'a>(path: &'a str, roots: &[&str], volumes: &[Volume]) -> Option<&'a str> {
+    const GENERATED_NAMES: &[&str] = &[
+        "node_modules", ".npm-cache", ".pnpm-store", "__pycache__", ".pytest_cache",
+        ".ruff_cache", ".next", ".nuxt", ".svelte-kit",
+    ];
+    let scope = roots.iter().find(|scope| filesystem::under(path, scope))?;
+    let mut generated = None;
+    for ancestor in Path::new(path).ancestors() {
+        let Some(raw) = ancestor.to_str() else { break };
+        if !filesystem::under(raw, scope) {
+            break;
+        }
+        let name = ancestor.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let named = GENERATED_NAMES.iter().any(|generated| name.eq_ignore_ascii_case(generated));
+        let cmake = name.eq_ignore_ascii_case("build");
+        let cargo = name.eq_ignore_ascii_case("target");
+        let npm_cache = name.eq_ignore_ascii_case("_cacache");
+        if !(named || cmake || cargo || npm_cache) {
+            continue;
+        }
+        let Ok((directory, _guards)) = filesystem::guard_path(raw, volumes, false) else {
+            continue;
+        };
+        let file = |name: &str| fs::symlink_metadata(directory.join(name))
+            .is_ok_and(|meta| meta.is_file() && !filesystem::reparse(&meta));
+        let dir = |name: &str| fs::symlink_metadata(directory.join(name))
+            .is_ok_and(|meta| meta.is_dir() && !filesystem::reparse(&meta));
+        if (named && directory.is_dir())
+            || (cmake && file("CMakeCache.txt") && dir("CMakeFiles"))
+            || (cargo && file("CACHEDIR.TAG") && file(".rustc_info.json"))
+            || (npm_cache && dir("content-v2") && dir("index-v5"))
+        {
+            generated = Some(raw);
+        }
+    }
+    generated
 }
 fn touch_observations(db: &Connection, path: &str) -> Result<(), String> {
     db.execute(
@@ -937,8 +1097,40 @@ fn entry_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn marked_folders_are_deferred_and_explicit_attention_restores_normal_priority() {
+        let s = crate::tests::fixture();
+        let root = &s.volumes[0].root;
+        let marked = format!("{root}\\Work");
+        let exception = format!("{marked}\\Child");
+        let unmarked = format!("{root}\\Other");
+        let volume = &s.volumes[0].id;
+        let mut db = s.index.connect().unwrap();
+        for path in [&marked, &exception, &unmarked] {
+            db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path]).unwrap();
+        }
+        let mut policy = serde_json::json!({"revision":1,"decisions":{
+            "marked":{"volumeId":volume,"relativePath":"Work","status":"last-moment"},
+            "exception":{"volumeId":volume,"relativePath":"Work\\Child","status":"attention"}
+        }});
+        s.index.update_priority(&policy, &s.volumes);
+        s.index.apply_priority(&mut db).unwrap();
+        let priority = |db: &rusqlite::Connection, path: &str| -> i64 {
+            db.query_row("SELECT priority FROM queue WHERE path=?1", [path], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(priority(&db, &marked), 1);
+        assert_eq!(priority(&db, &exception), 0);
+        assert_eq!(priority(&db, &unmarked), 0);
+        policy["revision"] = serde_json::json!(2);
+        policy["inventoryDeferMarked"] = serde_json::json!(false);
+        s.index.update_priority(&policy, &s.volumes);
+        s.index.apply_priority(&mut db).unwrap();
+        assert_eq!(priority(&db, &marked), 0);
+        let pending: i64 = db.query_row("SELECT count(*) FROM queue WHERE state='pending'", [], |row| row.get(0)).unwrap();
+        assert_eq!(pending, 3);
+    }
+
     use super::*;
-    use std::path::Path;
     fn fixture(label: &str) -> (Index, Vec<Volume>, PathBuf) {
         let base = std::env::temp_dir().join(format!(
             "migration-index-{label}-{}-{}",
@@ -1023,7 +1215,7 @@ mod tests {
         fs::create_dir(p.join("child")).unwrap();
         fs::write(p.join("loose"), b"fixture").unwrap();
         let db = i.connect().unwrap();
-        db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+        db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path(&p)])
             .unwrap();
         db.execute(
             "UPDATE meta SET value=?1 WHERE key='scan'",
@@ -1049,10 +1241,10 @@ mod tests {
     fn invalid_start_preserves_the_resumable_queue() {
         let (i, v, p) = fixture("invalid-start");
         let db = i.connect().unwrap();
-        db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+        db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path(&p)])
             .unwrap();
         assert!(i
-            .start(vec![r"Z:\outside-review-root".into()], v, false)
+            .start(vec![r"Z:\outside-review-root".into()], v, false, false)
             .is_err());
         assert_eq!(
             db.query_row(
@@ -1064,6 +1256,77 @@ mod tests {
             1
         );
         assert!(!i.running.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn npm_cache_requires_its_layout_and_can_be_included_explicitly() {
+        let (index, volumes, source) = fixture("npm-cache-policy");
+        let npm = source.join(".caches").join("npm");
+        let real_cache = npm.join("_cacache");
+        let lookalike = source.join("ordinary").join("_cacache");
+        for directory in [real_cache.join("content-v2").join("sha512"), real_cache.join("index-v5"),
+            lookalike.join("content-v2")] {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("example"), b"fixture").unwrap();
+        }
+        fs::write(npm.join("notes.txt"), b"user fixture").unwrap();
+        for (include_generated, files, skipped) in [(false, 2, 1), (true, 4, 0)] {
+            index.start(vec![path(&source)], volumes.clone(), false, include_generated).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while index.running.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let status = index.scan_status().unwrap();
+            assert_eq!(status["status"], "complete");
+            assert_eq!(status["files"], files);
+            assert_eq!(status["skippedGenerated"], skipped);
+            assert!(!index.skipped_ancestor(&path(&npm)).unwrap());
+            assert!(!index.skipped_ancestor(&path(&lookalike)).unwrap());
+            assert_eq!(index.skipped_ancestor(&path(&real_cache)).unwrap(), !include_generated);
+        }
+    }
+
+    #[test]
+    fn legacy_inventory_resume_skips_queued_generated_descendants_and_keeps_other_work() {
+        let (index, volumes, source) = fixture("generated-resume");
+        let generated = source.join("NODE_MODULES");
+        let retained = generated.join("already-done");
+        let queued = generated.join("queued");
+        let ordinary = source.join("node_modules-backup");
+        for folder in [&retained, &queued, &ordinary] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("file"), b"fixture").unwrap();
+        }
+        let db = index.connect().unwrap();
+        db.execute("UPDATE meta SET value=?1 WHERE key='scan'", [json!({
+            "status":"paused","roots":[path(&source)],"startedAt":now(),"processed":3,"files":1
+        }).to_string()]).unwrap();
+        for (folder, state) in [(&source, "done"), (&generated, "done"), (&retained, "done"),
+            (&queued, "pending"), (&ordinary, "pending")] {
+            db.execute("INSERT INTO queue(path,state) VALUES(?1,?2)", params![path(folder),state]).unwrap();
+        }
+        index.start(Vec::new(), volumes, true, false).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while index.running.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let state = |folder: &Path| db.query_row("SELECT state FROM queue WHERE path=?1",
+            [path(folder)], |row| row.get::<_, String>(0)).unwrap();
+        assert_eq!(state(&generated), "skipped");
+        assert_eq!(state(&retained), "done");
+        assert_eq!(state(&queued), "skipped-child");
+        assert_eq!(state(&ordinary), "done");
+        assert!(index.skipped_ancestor(&path(&retained)).unwrap());
+        assert!(!index.skipped_ancestor(&path(&ordinary)).unwrap());
+        let status = index.scan_status().unwrap();
+        assert_eq!(status["status"], "complete");
+        assert_eq!(status["processed"], 4);
+        assert_eq!(status["files"], 2);
+        assert_eq!(status["pending"], 0);
+        assert_eq!(status["skippedGenerated"], 1);
+        assert!(index.gaps().unwrap().as_array().unwrap().iter().any(|gap|
+            gap["path"] == path(&generated) && gap["problem"].as_str().unwrap().contains("Generated folder skipped")));
     }
     #[cfg(windows)]
     #[test]
@@ -1118,7 +1381,7 @@ mod tests {
                 )
                 .unwrap();
                 let db = i.connect().unwrap();
-                db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+                db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path(&p)])
                     .unwrap();
                 i.running.store(true, Ordering::Relaxed);
                 let started = std::time::Instant::now();
@@ -1151,7 +1414,7 @@ mod tests {
         let (i, v, p) = fixture("crash-recovery");
         fs::write(p.join("file"), b"fixture").unwrap();
         let db = i.connect().unwrap();
-        db.execute("INSERT INTO queue VALUES(?1,'working')", [path(&p)])
+        db.execute("INSERT INTO queue(path,state) VALUES(?1,'working')", [path(&p)])
             .unwrap();
         db.execute("INSERT INTO scan_progress VALUES(?1,999,999)", [path(&p)])
             .unwrap();
@@ -1188,7 +1451,7 @@ mod tests {
             }
         }
         let db = i.connect().unwrap();
-        db.execute("INSERT INTO queue VALUES(?1,'pending')", [path(&p)])
+        db.execute("INSERT INTO queue(path,state) VALUES(?1,'pending')", [path(&p)])
             .unwrap();
         i.running.store(true, Ordering::Relaxed);
         std::thread::scope(|scope| {

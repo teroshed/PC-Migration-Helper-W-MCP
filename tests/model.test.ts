@@ -246,6 +246,24 @@ test('serial native saves use the last acknowledged revision during rapid edits'
   assert.equal(queue.state.pending, 0);
   assert.equal(native.revision, 4);
 });
+test('an inaccessible path rejects only its own mark and leaves the writer usable', async () => {
+  const revisions: number[] = [];
+  const queue = new MutationQueue(doc(4), async (revision, _id, operation) => {
+    revisions.push(revision);
+    if (operation.type === 'classify' && operation.path.endsWith('Denied')) {
+      throw 'Mark rejected before save: Access is denied. (os error 5)';
+    }
+    return doc(revision + 1);
+  }, () => {});
+  const denied = queue.request({ type: 'classify', path: 'E:\\Denied', status: 'last-moment' });
+  const accepted = queue.request({ type: 'classify', path: 'E:\\Available', status: 'last-moment' });
+  await assert.rejects(denied, /Access is denied/);
+  assert.equal((await accepted).revision, 5);
+  await queue.flush();
+  assert.deepEqual(revisions, [4, 4]);
+  assert.equal(queue.state.error, null);
+});
+
 test('failed acknowledgements retain pending edits and retry the same idempotency key', async () => {
   let fail = true;
   const ids: string[] = [];

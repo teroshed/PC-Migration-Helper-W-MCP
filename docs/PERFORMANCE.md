@@ -21,6 +21,18 @@ reparse-point, source-change, inaccessible-directory or backup-verification rule
 
 ## Truthful progress
 
+The metadata inventory skips known generated trees by default, including
+`node_modules`, recognized framework output and npm's `_cacache` when its
+`content-v2` and `index-v5` directories identify the cache layout. Generic
+`build` and `target` folders are indexed unless their contents have recognizable
+CMake or Cargo output markers. Skipped folders remain browsable and appear
+as coverage gaps in AI Assistance. Choose **Scan including generated folders**
+to include them. The Count & Hash audit has its own scope and policy.
+
+A pre-update metadata queue can be resumed with the new default. Completed
+observations stay saved, and already queued descendants of a generated tree
+are skipped. An explicit include choice is retained when its scan resumes.
+
 Assistance reads the same transactional inventory status as the scan controls.
 The panel shows processed/queued/active directories, worker count, files found,
 logical bytes, current path, recorded gaps, and time since the scan started

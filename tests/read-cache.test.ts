@@ -46,7 +46,10 @@ test('progress expires future cache reuse without starving a coherent in-flight 
   complete('observed snapshot');
   assert.equal(await pending, 'observed snapshot');
   assert.equal(cache.peek('A'), undefined);
+  assert.equal(cache.peekRecent('A'), 'observed snapshot');
   assert.equal(await cache.read('A', async () => 'current progress'), 'current progress');
+  cache.setScope('watcher saw a change');
+  assert.equal(cache.peekRecent('A'), undefined);
 });
 
 test('expired, evicted and oversized values are not reused; errors can be retried', async () => {

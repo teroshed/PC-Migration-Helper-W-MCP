@@ -19,6 +19,7 @@ struct Live {
     worker: Option<JoinHandle<()>>,
     watcher: Option<watcher::WatchHandle>,
     verified: Option<mirror::EvidenceWindow>,
+    complete_match: bool,
     prepared: Option<PreparedConfirmation>,
     outcome_problem: Option<String>,
 }
@@ -43,6 +44,36 @@ impl ConfirmationGuard {
 }
 
 impl Runtime {
+    fn matching_window(live: &Live) -> Option<&mirror::EvidenceWindow> {
+        let window = live.verified.as_ref()?;
+        (live.complete_match && live.watcher.as_ref().and_then(position)
+            == Some((window.source_sequence, window.mirror_sequence))).then_some(window)
+    }
+
+    pub(crate) fn matching_stamp(&self) -> Option<String> {
+        let live = self.0.lock().ok()?;
+        Some(Self::matching_window(&live)?.manifest_digest.clone())
+    }
+
+    pub(crate) fn verifies_manual_scope(
+        &self,
+        doc: &Value,
+        path: &str,
+        volume: &filesystem::Volume,
+        fixture: bool,
+    ) -> bool {
+        let Ok(live) = self.0.lock() else { return false };
+        let Some(window) = Self::matching_window(&live) else { return false };
+        let source = &doc["mirrorBindings"][&window.binding_id]["source"];
+        let same_volume = if fixture {
+            source["volumeId"].as_str().is_some_and(|id| id.starts_with("fixture-source:"))
+                && source["volumeRoot"].as_str().is_some_and(|root| root.eq_ignore_ascii_case(&volume.root))
+        } else {
+            source["volumeId"] == volume.id
+        };
+        same_volume && source["root"].as_str().is_some_and(|root| filesystem::under(path, root))
+    }
+
     pub(crate) fn active(&self) -> Result<bool, String> {
         let live = self.0.lock().map_err(store::error)?;
         Ok(live.worker.as_ref().is_some_and(|job| !job.is_finished()))
@@ -213,7 +244,7 @@ fn start_worker(s: &AppState, live: &mut Live, operation: &str, instance: String
             }
         });
         let mut verified = None;
-        let outcome = match result {
+        let (outcome, complete_match) = match result {
             Ok(receipt) => {
                 if let (Some(before), Some(after)) = (beginning, monitor.as_ref().ok().and_then(position)) {
                     if before == after && !work_cancel.load(Ordering::SeqCst) {
@@ -226,16 +257,20 @@ fn start_worker(s: &AppState, live: &mut Live, operation: &str, instance: String
                 if verified.is_none() && monitoring_issue.is_none() {
                     monitoring_issue = Some("The comparison is dated evidence. An uninterrupted unchanged monitoring window was not established.".into());
                 }
-                json!({"operationId":id,"phase":"complete","receipt":receipt,"monitoringIssue":monitoring_issue})
+                let counts = &receipt.counts;
+                let complete_match = receipt.source_matches && counts.changed_during_read == 0
+                    && counts.unsupported == 0 && counts.unreadable == 0;
+                (json!({"operationId":id,"phase":"complete","receipt":receipt,"monitoringIssue":monitoring_issue}), complete_match)
             }
-            Err(problem) => json!({"operationId":id,
-                "phase":if work_cancel.load(Ordering::SeqCst) {"canceled"} else {"error"},"problem":problem}),
+            Err(problem) => (json!({"operationId":id,
+                "phase":if work_cancel.load(Ordering::SeqCst) {"canceled"} else {"error"},"problem":problem}), false),
         };
         let save = serde_json::to_vec_pretty(&outcome).map_err(store::error)
             .and_then(|bytes| mirror::publish_evidence_file(&directory, &outcome_name(&id), &bytes));
         if let Ok(mut live) = shared.lock() {
             live.progress = None;
             live.watcher = monitor.ok();
+            live.complete_match = save.is_ok() && complete_match;
             live.verified = if save.is_ok() { verified } else { None };
             live.outcome_problem = save.err();
         }
@@ -570,6 +605,24 @@ mod tests {
         let comparison = &proof["comparison"];
         assert_eq!(comparison["outcome"]["receipt"]["sourceMatches"], true, "{comparison}");
         assert_eq!(comparison["freshness"], "monitored", "{comparison}");
+        let mut manual_intent = crate::document(&s).unwrap();
+        let (volume, relative, key) = filesystem::locate(source.to_str().unwrap(), &s.volumes).unwrap();
+        manual_intent["decisions"].as_object_mut().unwrap().insert(key, json!({
+            "path":source,"status":"manual-pending","volumeId":volume.id,"relativePath":relative
+        }));
+        let displayed = crate::recorded_effective(&s, &manual_intent, &filesystem::inspect(&source));
+        assert_eq!(displayed["status"], "manual-confirmed");
+        assert_eq!(displayed["manualEvidence"], "mirror-verified");
+        assert_eq!(displayed["originalStatus"], "manual-pending");
+        let child = crate::recorded_effective(&s, &manual_intent, &filesystem::inspect(&source_file));
+        assert_eq!(child["status"], "manual-pending");
+        assert!(child["manualEvidence"].is_null());
+        let (_, relative, key) = filesystem::locate(source_file.to_str().unwrap(), &s.volumes).unwrap();
+        manual_intent["decisions"].as_object_mut().unwrap().insert(key, json!({
+            "path":source_file,"status":"manual-pending","volumeId":volume.id,"relativePath":relative
+        }));
+        let marked_file = crate::recorded_effective(&s, &manual_intent, &filesystem::inspect(&source_file));
+        assert_eq!(marked_file["status"], "manual-confirmed");
         let records = evidence_page(&s, &json!({"operationId":"verify-fixture","offset":0,
             "limit":8,"problemsOnly":false})).unwrap();
         assert!(records["page"]["entries"].as_array().unwrap().len() >= 2);
@@ -588,6 +641,11 @@ mod tests {
 
         fs::write(source.join("new-original.txt"), b"new fixture member").unwrap();
         wait(|| status(&s, &json!({})).unwrap()["comparison"]["freshness"] != "monitored");
+        let changed = crate::recorded_effective(&s, &manual_intent, &filesystem::inspect(&source));
+        assert_eq!(changed["status"], "manual-pending");
+        assert!(changed["manualEvidence"].is_null());
+        let changed_file = crate::recorded_effective(&s, &manual_intent, &filesystem::inspect(&source_file));
+        assert_eq!(changed_file["status"], "manual-pending");
         let mut updated_prepare = prepare;
         updated_prepare["expectedRevision"] = confirmed["revision"].clone();
         assert!(prepare_confirmation(&s, &updated_prepare).is_err());

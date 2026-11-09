@@ -79,6 +79,12 @@ const uiCommand = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('setSavedRecords'), search: z.string().max(4000).optional(), filter: z.union([status, z.literal('all')]).optional(), page: page.optional() }),
   z.strictObject({ action: z.literal('setNotifications'), mode: z.enum(['closed', 'preview', 'full']), offset: z.number().int().min(0).max(10_000).multipleOf(50).optional() }),
   z.strictObject({ action: z.literal('setAssistanceOverride'), open: z.boolean(), questionId: sha256 }),
+  z.strictObject({ action: z.literal('setAssistanceScanDetails'), open: z.boolean() }),
+  z.strictObject({ action: z.literal('setAssistanceDetails'), open: z.boolean() }),
+  z.strictObject({ action: z.literal('navigateAssistance'),
+    mode: z.enum(['center', 'preview', 'menu', 'return', 'compare', 'close', 'refresh', 'page', 'resize']),
+    path: path.nullable().optional(), depth: z.number().int().min(0).max(47).optional(),
+    value: z.number().int().min(0).max(1_000_000).optional() }),
   z.strictObject({ action: z.literal('setCopyDetails'), open: z.boolean() }),
   z.strictObject({ action: z.literal('setGatewayDetails'), open: z.boolean() }),
   z.strictObject({ action: z.literal('setRowMenu'), path: path.nullable() }),
@@ -130,6 +136,11 @@ const assistanceAction = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('answer'), path, questionId, overrideConfirmed: z.literal(true).optional(), status: z.enum(['migrate-now', 'last-moment', 'redownload', 'erase', 'on-external', 'manual-pending', 'manual-confirmed']) }),
 ]);
 register('get_assisted_review', 'Read the next migration interview question', 'Read the saved interview scope, inventory phase and any displayed question. In local mode, bounded read_folder context and a separate suggest_decision may help. In External model mode send only get_adaptive_question_packet.packet to the model; use propose_adaptive_question and keep paths, notes and other app output local. Review the refreshed question before any explicit user answer.', {}, 'get_assisted_review', () => ({}));
+register('set_inventory_priority', 'Choose the order of the metadata scan', 'Only on explicit user instruction. Marked branches scan last by default. Set deferMarked to false for equal priority. This keeps the existing queue and leaves the separate checksum audit alone.', {
+  ...write, deferMarked: z.boolean(),
+}, 'mutate', ({ deferMarked, ...metadata }) => ({
+  ...metadata, basis: 'user_instruction', operation: { type: 'inventoryPriority', deferMarked },
+}), false);
 register('control_assisted_review', 'Update the migration interview', 'Only on explicit user direction, choose a scope, review children, defer a question, restore deferred questions or save an exact answer. A question ID fences what was reviewed. Scope selection does not start inventory. Use inventory_control if the user requests a scan.', {
   ...write, command: assistanceAction,
 }, 'mutate', ({ command, ...metadata }) => {
@@ -227,6 +238,8 @@ function reviewMutation({ expectedInstanceId, expectedRevision, operationId, rea
 
 const reviewAction = z.discriminatedUnion('action', [
   z.strictObject({ action: z.literal('openMain'), path, selectedPath: path.nullable().optional() }),
+  z.strictObject({ action: z.literal('centerFolder'), path }),
+  z.strictObject({ action: z.literal('backFolder'), depth: previewDepth.optional() }),
   z.strictObject({ action: z.literal('openPreview'), path, depth: previewDepth }),
   z.strictObject({ action: z.literal('closePreview'), depth: previewDepth.min(1) }),
   z.strictObject({ action: z.literal('select'), path }),
@@ -255,7 +268,7 @@ const reviewAction = z.discriminatedUnion('action', [
   }),
 ]);
 
-register('control_review_view', 'Control the native review window', 'Commit a review action and observe its adoption with get_review_view. openPreview depth is the parent column (0 is main); closePreview depth is the preview to close with its dependent columns. select targets an existing column; reveal may open the target’s parent and can show a labeled row outside the current filter. setView controls search, filter, zero-based page and pixel scrolling. setLayout sets sidebar widths or collapse, toolbar mode, fillDepth (null restores the strip), and the width of a folder column by depth. Only an explicit filter change changes the filter. Use control_ui for the user-directed Follow AI preference.', {
+register('control_review_view', 'Control the native review window', 'Commit a review action and observe its adoption with get_review_view. centerFolder makes a folder the root and retains its open descendants. backFolder keeps the previous root and branch as previews; at drive home it closes the preview at the supplied depth. openPreview depth is the parent column (0 is main); closePreview depth is the preview to close with its dependent columns. select targets an existing column; reveal may open the target’s parent and can show a labeled row outside the current filter. setView controls search, filter, zero-based page and pixel scrolling. setLayout sets sidebar widths or collapse, toolbar mode, fillDepth (null restores the strip), and the width of a folder column by depth. Only an explicit filter change changes the filter. Use control_ui for the user-directed Follow AI preference.', {
   ...write,
   command: reviewAction,
 }, 'mutate', input => reviewMutation(input, input.command), false);
@@ -263,8 +276,9 @@ register('control_review_view', 'Control the native review window', 'Commit a re
 register('navigate_review', 'Open a folder in the review UI', 'Open a main folder and optionally select a child while retaining the active filter. Reopening the same location retains its previews; changing location closes the incompatible preview branch. Read get_review_view to observe the rendered result.', {
   ...write, path, selectedPath: path.nullable().default(null),
 }, 'mutate', input => reviewMutation(input, { action: 'openMain', path: input.path, selectedPath: input.selectedPath }), false);
-register('inventory_control', 'Control metadata inventory', 'Start a subtree/all-root metadata inventory only when requested; it can take substantial time. Pause/resume the durable queue. Never reads file bodies or changes source permissions.', {
+register('inventory_control', 'Control metadata inventory', 'Start a subtree or all-root inventory when requested. Known generated folders are skipped by default. Set includeGenerated to true only when explicitly requested for a new current or all scan. Pause/resume retains the durable queue and its scan policy.', {
   mode: z.enum(['current', 'all', 'pause', 'resume']), path, expectedInstanceId: write.expectedInstanceId,
+  includeGenerated: z.boolean().optional(),
 }, 'scan', input => input, false);
 
 register('checksum_status', 'Source sizes and checksum progress', 'Read allocated and logical sizes, discovered/counted/hashed file leaves, scan phase and coverage gaps. Discovery has no fixed percentage until enumeration finishes. Source SHA-256 hashes compare against an earlier source baseline; they do not verify F: or a backup.', {}, 'audit_status', () => ({}));

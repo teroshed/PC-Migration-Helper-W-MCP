@@ -36,11 +36,17 @@ The bridge defaults to the checkout’s `runtime/mcp-gateway.json`. If you launc
 
 `get_review_view` returns the saved position separately from the rendered surface. Its surface state indicates whether the report is current, updating, stale, or waiting. The rendered report is bounded to visible rows. Read an exact folder page when you need entries beyond the viewport.
 
-`control_review_view` takes an action such as `openMain`, `openPreview`, `closePreview`, `select`, `reveal`, `setView` or `setLayout`. Depth zero is the main column. Preview depth is relative to that column, page numbers start at zero, and scroll offsets are pixels. Reveal can display a labeled row outside the current results while retaining the filter. Use `get_review_view` to observe adoption after the operation returns.
+`control_review_view` takes an action such as `openMain`, `centerFolder`, `backFolder`, `openPreview`, `closePreview`, `select`, `reveal`, `setView` or `setLayout`. Centering an open preview keeps the columns to its right. Back opens the parent and keeps the previous root and branch as previews. At drive home, Back from a preview closes that layer. Depth zero is the main column. Preview depth is relative to that column, page numbers start at zero, and scroll offsets are pixels. Reveal can display a labeled row outside the current results while retaining the filter. Use `get_review_view` to observe adoption after the operation returns.
 
 `setLayout` accepts sidebar widths or collapsed state, toolbar mode, `fillDepth` and a column width by depth. A null `fillDepth` restores the preview strip. `get_assisted_review` returns the current scan phase, question ID, pending manual-backup count, deferrals and coverage gaps. Interview answers must reference the current question ID, path, journal revision and app instance.
 
-The decision IDs include `manual-pending` for **Marked for Manual Backup** and `manual-confirmed` for **Confirmed Manual Backup**. Use `save_decision` or an interview answer for a confirmation only when the user explicitly confirms it. `suggest_decision` keeps proposals separate from user decisions. Pending intent can inherit. Confirmation applies to the selected path and retains child review states. A manual confirmation records a user assertion and source snapshot; actual destination checksum and restore verification remain separate evidence. Both manual states are excluded from automated copy batches.
+`inventory_control` skips known generated folders for new `all` and `current` scans by default. Pass `includeGenerated: true` when the user specifically requests those folders. Resume keeps the existing queue and its policy. `inventory_status` reports the number skipped and a bounded sample of coverage gaps. Use the separate checksum controls for source SHA-256.
+
+`set_inventory_priority` saves the **Scan marked folders last** setting and keeps the active queue. The default puts marked branches at the end. An explicit Needs attention decision can restore normal priority beneath a marked folder. Setting `deferMarked: false` gives all folders equal priority. Read `get_assisted_review.deferMarked` for the saved setting.
+
+AI Assistance is inline with the folder explorer. During an active inventory, `get_assisted_review` can report an `earlyBranch` once the selected folder or a direct child has a complete, bounded observation. It can offer keep or manual-backup decisions while siblings are still queued. The adaptive packet uses only that branch, and proposal submission and answer application recheck its evidence. Use the existing packet and question IDs and keep paths and notes local.
+
+Use `manual-pending` for the **Manual backup** choice. On a complete SHA-256 mirror match with uninterrupted live monitoring, explicitly marked entries in scope report effective status `manual-confirmed` with `manualEvidence: "mirror-verified"`. Their saved decision stays `manual-pending`, so coverage can return to pending after changes or restart. Existing `manual-confirmed` records represent historical user assertions. `suggest_decision` keeps proposals separate from user decisions. Both manual states stay outside automated copy batches.
 
 The desktop’s **Follow AI’s movement** checkbox controls automatic following. Reads and marks can leave a one-second glow on the exact row. The **Viewed by MCP** age remains visible for up to 60 seconds after a read. Explicit view operations are saved, while automatic following changes the visible review temporarily. An active text edit or dialog can defer adoption.
 
@@ -149,6 +155,13 @@ saved question reopened in a new app session needs a fresh inventory and
 explicit revalidation. `control_adaptive_interview` exposes External model,
 Local questions and revalidation. The app does not measure usage billed by
 an independently configured client.
+
+The Assistance screen shows its live folder columns in `get_ui_state`.
+Use `control_ui` with `setAssistanceScanDetails` to expand or collapse
+the background inventory details. `navigateAssistance` supports previewing
+or centering a displayed folder and returning to the current question.
+Centering a folder changes the displayed view. Use the separate assisted
+review scope action to change which folder the interview covers.
 
 ## Manual mirror evidence
 

@@ -2,12 +2,12 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Check, ChevronLeft, ChevronRight, File, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, Square, SquareCheck, TriangleAlert, X } from 'lucide-react';
-import { baseName, parentPath, parseEntry, STATUSES } from './model';
+import { ArrowLeft, Check, ChevronLeft, ChevronRight, File, Focus, Folder, FolderOpen, Link2, LoaderCircle, MoreHorizontal, RefreshCw, Search, Sparkles, Square, SquareCheck, TriangleAlert, X } from 'lucide-react';
+import { baseName, parentPath, parseEntry } from './model';
 import type { Entry, Listing, PreviewColumn, Status } from './model';
-import type { FolderReadCache } from './folder-read-cache';
+import type { FolderReadCache, FolderReadContext } from './folder-read-cache';
 import { isStaleRead } from './read-cache';
-import { DESCRIPTIONS, ICONS, LABELS, reviewStatusLabel, StatusBadge } from './classifications';
+import { DECISION_CHOICES, DESCRIPTIONS, ICONS, decisionChoiceLabel, isDecisionChoiceSelected, reviewStatusLabel, StatusBadge } from './classifications';
 import { focusAdjacentRow } from './ReviewKeyboard';
 import { OverflowIndicators } from './OverflowIndicators';
 import { MAX_COLUMN, MIN_COLUMN, ResizeGrip } from './ReviewLayout';
@@ -16,6 +16,19 @@ import { isRestoredScroll, restoreReviewScroll, reviewActivityLabel, reviewPathK
 import type { ActivityRow, ReviewActivitySnapshot } from './ReviewActivity';
 
 export interface RowMenuTarget { id: string; entry: Entry; x: number; y: number; invoker: HTMLElement | null }
+export interface RowSuggestion { label: string; reason: string; source: 'ai' | 'local' }
+export function localRowSuggestion(entry: Entry): RowSuggestion {
+  if (entry.problem || !['file', 'folder'].includes(entry.kind)) {
+    return { source: 'local', label: 'Review access', reason: 'Check this entry separately before relying on its coverage.' };
+  }
+  if (entry.effective.stale) {
+    return { source: 'local', label: 'Review changes', reason: 'The entry changed since its saved decision.' };
+  }
+  if (entry.kind === 'folder' && /^(?:node_modules|_cacache|\.npm-cache|\.pnpm-store|__pycache__|\.next|\.nuxt|\.svelte-kit)$/i.test(entry.name)) {
+    return { source: 'local', label: 'Check if rebuildable', reason: 'Inspect generated data for files you cannot recreate.' };
+  }
+  return { source: 'local', label: 'Keep for review', reason: 'Preserve this entry unless you can verify that you can recreate it.' };
+}
 export interface ColumnActions {
   selectedPath: string | null;
   menuPath: string | null;
@@ -39,6 +52,8 @@ export interface ColumnActions {
   reviewActivity: ReviewActivitySnapshot;
   revealPath: string | null;
   revealVersion: number;
+  suggestionFor?: (entry: Entry) => RowSuggestion;
+  previewPath?: string | null;
 }
 interface DirectoryColumnProps extends ColumnActions {
   path: string;
@@ -55,6 +70,8 @@ interface DirectoryColumnProps extends ColumnActions {
   onScroll: (scrollTop: number) => void;
   onPage: (page: number) => void;
   onClose?: () => void;
+  onBack?: () => void;
+  backPreservesBranch?: boolean;
   onRefresh: () => void;
 }
 
@@ -76,6 +93,7 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
   const entries = pinned ? [pinned, ...(listing?.entries ?? [])] : listing?.entries ?? [];
   const revealedVersion = useRef<number | null>(null);
   const headingRef = useRef<HTMLButtonElement>(null);
+  const columnId = 'review-folder-column-' + props.depth;
   const pinErrorRef = useRef<HTMLDivElement>(null);
   const folderActivity = props.reviewActivity.paths.get(columnKey);
   const folderActivityLabel = reviewActivityLabel(folderActivity, props.reviewActivity.nowMs);
@@ -127,6 +145,13 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
     if (!(target instanceof HTMLElement)) return;
     const row = target.closest<HTMLElement>('.entry-row');
     const known = target.closest<HTMLButtonElement>('.known-result');
+    if (target.classList.contains('column-back')) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        listRef.current?.querySelector<HTMLButtonElement>('.entry-select, .known-result')?.focus();
+      }
+      return;
+    }
     if (!row && !known) return;
     const entry = entries.find(entry => entry.path === row?.dataset.entryPath);
     const accept = (): void => { event.preventDefault(); event.stopPropagation(); };
@@ -154,6 +179,7 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       const current = row?.querySelector<HTMLButtonElement>('.entry-select') ?? known;
       if (!current) return;
       const button = focusAdjacentRow(listRef.current, current, event.key === 'ArrowDown' ? 1 : -1);
+      if (!button && event.key === 'ArrowUp') listRef.current?.querySelector<HTMLButtonElement>('.column-back')?.focus();
       const next = entries.find(item => item.path === button?.dataset.entryPath);
       if (next) props.onSelect(next);
     }
@@ -171,11 +197,15 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
       if (!event.repeat) props.onCloseByKey(props.depth);
     }
   }
-  return <section ref={columnRef} id={'review-folder-column-' + props.depth} className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-fill={props.fillDepth === props.depth ? 'true' : undefined} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${props.width}px` } as React.CSSProperties}>
+  return <section ref={columnRef} id={columnId} className={`folder-column ${props.depth === 0 ? 'root-column' : 'preview-column'}`} data-column-depth={props.depth} data-fill={props.fillDepth === props.depth ? 'true' : undefined} data-column-path={props.path} data-column-page={props.page} data-column-total={props.knownSearch ? props.knownResults?.length ?? 0 : listing?.total ?? 0} aria-label={props.depth ? `Preview folder ${props.path}` : `Current folder ${props.path}`} style={{ '--column-width': `${props.width}px` } as React.CSSProperties}>
     <div className="column-heading"><button ref={headingRef} className="column-review" onKeyDown={headingKey} aria-label={`Review folder ${props.path}`} data-review-activity={folderActivity?.pulse?.kind} title={`Review this folder: ${props.path}${folderActivityLabel ? ` · ${folderActivityLabel}` : ''}`} onClick={() => props.onReviewFolder(props.path)}><FolderOpen size={15}/><span><small>{props.depth ? `PREVIEW ${props.depth}` : 'CURRENT LOCATION'}{folderActivityLabel && ` · ${folderActivityLabel}`}</small><strong>{baseName(props.path)}</strong></span>{folderActivity?.pulse && <i key={folderActivity.pulse.sequence} className="review-activity-pulse" aria-hidden="true"/>}</button>{props.loading && <LoaderCircle size={14} className="spin" aria-label="Reading folder"/>}<button className="column-icon" title="Refresh immediate contents" aria-label={`Refresh column ${props.path}`} disabled={props.loading} onClick={props.onRefresh}><RefreshCw size={14}/></button>{props.onClose && <button className="column-icon" aria-label={`Close preview ${props.depth} and deeper previews`} onClick={props.onClose}><X size={15}/></button>}</div>
     <div className="column-path" title={props.path}>{props.path}</div>
-    <div className="column-labels"><span>{props.knownSearch ? 'KNOWN FOLDERS' : 'FOLDER / FILE'}</span><span>DECISION · ⋯ TO MARK</span></div>
+    <div className="column-labels"><span>{props.knownSearch ? 'KNOWN FOLDERS' : 'FOLDER / FILE'}</span><span>{props.suggestionFor ? 'DECISION / SUGGESTION' : 'DECISION · ⋯ TO MARK'}</span></div>
     <div className="column-scroll-frame"><div className={`entry-list column-entry-list ${props.loading ? 'is-loading' : ''}`} ref={listRef} aria-label={`Contents of ${props.path}`} aria-busy={props.loading} onKeyDown={key} onScroll={event => { if (!isRestoredScroll(event.currentTarget, 'scrollTop')) props.onScroll(event.currentTarget.scrollTop); }}>
+      {props.onBack && <button className="column-back" onClick={props.onBack}
+        aria-label={props.depth && !props.backPreservesBranch ? 'Back from this preview' : 'Back to parent folder'}>
+        <ArrowLeft size={15} aria-hidden="true"/><strong>Back</strong><span>{props.depth && !props.backPreservesBranch ? 'Close this preview' : 'Keep open folders'}</span>
+      </button>}
       {props.loading && !listing && <div className="empty-state"><LoaderCircle size={24} className="spin"/><h3>Reading this folder…</h3><p>Loading immediate contents only.</p></div>}
       {props.knownSearch && props.knownResults ? props.knownResults.length ? props.knownResults.map(path => <button key={path} className="known-result" data-entry-path={path} data-entry-kind="folder" onClick={() => props.onOpen(path)}><Folder size={16}/><span>{path}</span><ChevronRight size={14}/></button>) : <div className="empty-state"><Search size={25}/><h3>No known folders match</h3></div> : entries.map(entry => {
         const entryKey = reviewPathKey(entry.path);
@@ -183,7 +213,9 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
           groupSelected={props.isGroupSelected(entry)} canGroupSelect={props.canGroupSelect(entry)}
           menuOpen={props.menuPath === entry.path} pinned={entry === pinned} activity={props.reviewActivity.paths.get(entryKey)}
           nowMs={props.reviewActivity.nowMs} onSelect={() => props.onSelect(entry)} onGroupToggle={() => props.onToggleSelect(entry)}
-          onOpen={() => props.onOpen(entry.path)} onPreview={() => props.onPreview(entry, props.depth)} onMenu={props.onMenu}/>;
+          onOpen={() => props.onOpen(entry.path)} onPreview={() => props.onPreview(entry, props.depth)} onMenu={props.onMenu}
+          suggestion={props.suggestionFor?.(entry)}
+          previewing={reviewPathKey(props.previewPath ?? '') === entryKey}/>;
       })}
       {showPin && !pinned && pin?.path === revealPath && <div className="review-pin-error" ref={pinErrorRef}><strong>Revealed path unavailable</strong><span title={revealPath ?? ''}>{revealPath}</span></div>}
       {!props.knownSearch && listing && !listing.entries.length && <div className="empty-state"><FolderOpen size={25}/><h3>No matching entries</h3><p>This folder may be empty, or the current search and filter hide its entries.</p></div>}
@@ -191,8 +223,8 @@ export function DirectoryColumn(props: DirectoryColumnProps) {
     </div><OverflowIndicators targetRef={listRef} axis="vertical" refreshKey={pinned ?? listing}/></div>
     <div className="column-footer"><span>{props.loading ? 'Reading…' : `${(listing?.total ?? 0).toLocaleString()} items`}</span>{!props.knownSearch && <div className="pagination"><button aria-label={`Previous page in ${props.path}`} disabled={!props.page || props.loading} onClick={() => props.onPage(Math.max(0, props.page - 1))}><ChevronLeft size={15}/></button><span>{props.page + 1} / {pages}</span><button aria-label={`Next page in ${props.path}`} disabled={props.page + 1 >= pages || props.loading} onClick={() => props.onPage(props.page + 1)}><ChevronRight size={15}/></button></div>}</div>
     {props.fillDepth !== props.depth && <ResizeGrip label={`Resize folder column ${props.depth + 1}`}
-      controls={'review-folder-column-' + props.depth} min={MIN_COLUMN} max={MAX_COLUMN} size={() => columnRef.current?.getBoundingClientRect().width ?? props.width}
-      target={() => columnRef.current} variable="--drag-column-width" edgeLabel="Release to fill the folder pane" edgeShortcut
+      controls={columnId} min={MIN_COLUMN} max={MAX_COLUMN} size={() => columnRef.current?.getBoundingClientRect().width ?? props.width}
+      target={() => columnRef.current} variable="--drag-column-width" edgeLabel="Release to fill the folder pane"
       edge={(event, raw) => {
         const frame = columnRef.current?.closest('.folder-strip-frame')?.getBoundingClientRect();
         return Boolean(frame && raw > props.width + 6 && event.clientX >= frame.right - 46);
@@ -206,12 +238,17 @@ interface PreviewFolderProps extends ColumnActions {
   depth: number;
   refreshToken: string;
   cache: FolderReadCache;
+  cacheContext: FolderReadContext;
   onChange: (patch: Partial<PreviewColumn>) => void;
-  onClose: () => void;
+  onClose?: () => void;
+  onBack: () => void;
+  backPreservesBranch: boolean;
 }
 export function PreviewFolderColumn(props: PreviewFolderProps) {
-  const [listing, setListing] = useState<Listing | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [listing, setListing] = useState<Listing | null>(() => props.cache.peekRecentListing({
+    path: props.column.path, search: '', filter: 'all', page: props.column.page,
+  }, props.cacheContext) ?? null);
+  const [loading, setLoading] = useState(listing === null);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
   const loadedContext = useRef<string | null>(null);
@@ -225,7 +262,9 @@ export function PreviewFolderColumn(props: PreviewFolderProps) {
     const force = forceRefresh.current;
     const cached = !force ? props.cache.peekListing(query) : undefined;
     if (cached) { loadedContext.current = contextKey; setListing(cached); setLoading(false); setError(null); return; }
-    if (foreground) { setLoading(true); setError(null); }
+    const recent = !force ? props.cache.peekRecentListing(query) : undefined;
+    if (recent) { setListing(recent); setLoading(false); setError(null); }
+    else if (foreground) { setLoading(true); setError(null); }
     forceRefresh.current = false;
     props.onReadPendingChange(1);
     void props.cache.listing(query, force).then(result => {
@@ -246,17 +285,20 @@ interface EntryRowProps {
   pinned: boolean;
   activity?: ActivityRow;
   nowMs: number;
+  suggestion?: RowSuggestion;
+  previewing: boolean;
   onSelect: () => void;
   onGroupToggle: () => void;
   onOpen: () => void;
   onPreview: () => void;
   onMenu: (target: RowMenuTarget) => void;
 }
-function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pinned, activity, nowMs,
+function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pinned, activity, nowMs, suggestion, previewing,
   onSelect, onGroupToggle, onOpen, onPreview, onMenu }: EntryRowProps) {
   const Icon = entry.kind === 'folder' ? Folder : entry.kind === 'link' ? Link2 : entry.kind === 'unavailable' ? TriangleAlert : File;
   const activityLabel = reviewActivityLabel(activity, nowMs);
   const reviewLabel = [pinned ? 'Revealed · outside current results' : null, activityLabel].filter(Boolean).join(' · ');
+  const suggestionLabel = suggestion ? (suggestion.source === 'ai' ? 'AI suggestion' : 'Local suggestion') : null;
   function menu(invoker: HTMLElement, x?: number, y?: number): void {
     const rectangle = invoker.getBoundingClientRect();
     onMenu({ id: crypto.randomUUID(), entry, x: x ?? rectangle.right, y: y ?? rectangle.bottom, invoker });
@@ -274,16 +316,28 @@ function EntryRow({ entry, selected, groupSelected, canGroupSelect, menuOpen, pi
       aria-label={`Select ${entry.name} for group marking`}
       title={canGroupSelect ? 'Toggle group selection (Ctrl+Space)' : 'This entry cannot be added to a group'}
       onClick={onGroupToggle}>{groupSelected ? <SquareCheck size={15} aria-hidden="true"/> : <Square size={15} aria-hidden="true"/>}</button>
-    <button className="entry-select" data-entry-path={entry.path} aria-current={selected ? 'true' : undefined} aria-label={`${entry.kind === 'folder' ? 'Open folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${reviewLabel ? `, ${reviewLabel}` : ''}`} title={`${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`} onClick={entry.kind === 'folder' ? onOpen : onSelect}>
-      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span><span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
+    <button className="entry-select" data-entry-path={entry.path} aria-current={selected ? 'true' : undefined}
+      aria-expanded={entry.kind === 'folder' ? previewing : undefined}
+      aria-label={`${entry.kind === 'folder' ? 'Preview folder' : 'Review file'} ${entry.name}, ${reviewStatusLabel(entry.effective)}${suggestion ? `, ${suggestionLabel}: ${suggestion.label}` : ''}${reviewLabel ? `, ${reviewLabel}` : ''}`}
+      title={suggestion ? `${entry.path}\n${suggestionLabel}: ${suggestion.reason}` : `${entry.path}\n${auditDescription(entry.audit, entry.kind === 'file' ? entry.size : undefined)}${reviewLabel ? `\n${reviewLabel}` : ''}`}
+      onClick={entry.kind === 'folder' ? onPreview : onSelect}>
+      <span className="entry-icon"><AuditProgress stats={entry.audit} size={27}><Icon size={14}/></AuditProgress></span><span className="entry-name"><strong>{entry.name}</strong><small className="entry-allocation">{entry.problem ?? `Disk ${allocatedLabel(entry.audit)}`}{entry.effective.inheritedFrom ? entry.effective.originalStatus === 'on-external' ? ' · parent F: claim' : entry.effective.originalStatus === 'manual-confirmed' ? ' · parent manual claim' : ' · inherited' : ''}{entry.effective.stale ? ' · changed' : ''}</small>{pinned && <small className="review-row-label">Revealed · outside current results</small>}</span>
+      {suggestion && <span className="assistance-row-suggestion" data-source={suggestion.source} title={suggestion.reason}>
+        {suggestion.source === 'ai' && <Sparkles size={11} aria-hidden="true"/>}
+        <span>{suggestionLabel} · {suggestion.label}</span>
+      </span>}
+      <span className="review-row-status"><StatusBadge effective={entry.effective} compact/>{activityLabel && <small className="review-row-label">{activityLabel}</small>}</span>
     </button>
-    {entry.kind === 'folder' && <button className="entry-preview" title={`Preview ${entry.name} in the next column`} aria-label={`Preview folder ${entry.name}`} onClick={onPreview}><ChevronRight size={17}/></button>}
+    {entry.kind === 'folder' && <button className="entry-preview" disabled={Boolean(entry.problem)} title={`Center on ${entry.name}`} aria-label={`Center on folder ${entry.name}`} onClick={onOpen}><Focus size={17}/></button>}
     <button className="entry-more" title={`Mark ${entry.name}`} aria-label={`Mark ${entry.name}: more actions`} aria-haspopup="menu" aria-expanded={menuOpen} aria-controls={menuOpen ? 'row-classification-menu' : undefined} onClick={event => menu(event.currentTarget)}><MoreHorizontal size={17}/></button>
     {activity?.pulse && <i key={activity.pulse.sequence} className="review-activity-pulse" aria-hidden="true"/>}
   </div>;
 }
 
-export function RowClassificationMenu({ target, disabledReason, onChoose, onDismiss }: { target: RowMenuTarget; disabledReason: string | null; onChoose: (status: Status) => void; onDismiss: (restoreFocus: boolean) => void }) {
+export function RowClassificationMenu({ target, disabledReason, onChoose, onDismiss, onCenterFolder, portalRoot }: {
+  target: RowMenuTarget; disabledReason: string | null; onChoose: (status: Status) => void;
+  onDismiss: (restoreFocus: boolean) => void; onCenterFolder?: () => void; portalRoot?: HTMLElement;
+}) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
   useLayoutEffect(() => {
@@ -297,7 +351,7 @@ export function RowClassificationMenu({ target, disabledReason, onChoose, onDism
     const menu = menuRef.current;
     const checked = menu?.querySelector<HTMLButtonElement>('button[aria-checked="true"]:not(:disabled)');
     const first = menu?.querySelector<HTMLButtonElement>('button:not(:disabled)');
-    (checked ?? first ?? menu)?.focus();
+    (checked ?? first ?? menu)?.focus({ preventScroll: true });
     function pointer(event: PointerEvent): void { if (event.target instanceof Node && !menu?.contains(event.target)) onDismiss(false); }
     function outsideScroll(event: Event): void { if (event.target instanceof Node && !menu?.contains(event.target)) onDismiss(false); }
     function resized(): void { onDismiss(true); }
@@ -316,5 +370,23 @@ export function RowClassificationMenu({ target, disabledReason, onChoose, onDism
     const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
     items[next]?.focus();
   }
-  return createPortal(<div id="row-classification-menu" ref={menuRef} role="menu" tabIndex={-1} aria-label={`Mark ${target.entry.name}`} className="row-classification-menu" style={{ position: 'fixed', left: position?.left ?? 0, top: position?.top ?? 0, visibility: position ? 'visible' : 'hidden' }} onKeyDown={key}><div className="row-menu-title"><strong>Mark {target.entry.name}</strong><span title={target.entry.path}>{target.entry.path}</span></div>{STATUSES.map(status => { const Icon = ICONS[status]; return <button key={status} role="menuitemradio" aria-checked={target.entry.effective.own && target.entry.effective.status === status} tabIndex={-1} disabled={disabledReason !== null} className={`row-menu-item status-${status}`} title={DESCRIPTIONS[status]} onClick={() => onChoose(status)}><Icon size={17}/><span>{LABELS[status]}{status === 'migrate-now' ? ' · pending' : ''}</span>{target.entry.effective.own && target.entry.effective.status === status && <Check size={15}/>}</button>; })}<p className="row-menu-help">{disabledReason ?? 'Saved mark · copy runs follow the queue settings'}</p></div>, window.document.body);
+  return createPortal(<div id="row-classification-menu" ref={menuRef} role="menu" tabIndex={-1}
+    aria-label={`Actions for ${target.entry.name}`} className="row-classification-menu"
+    style={{ position: 'fixed', left: position?.left ?? 0, top: position?.top ?? 0, visibility: position ? 'visible' : 'hidden' }} onKeyDown={key}>
+    <div className="row-menu-title"><strong>{target.entry.name}</strong><span title={target.entry.path}>{target.entry.path}</span></div>
+    {onCenterFolder && <button role="menuitem" tabIndex={-1} className="row-menu-item" onClick={onCenterFolder}>
+      <Focus size={17}/><span>Center on this folder</span>
+    </button>}
+    {DECISION_CHOICES.map(status => {
+      const Icon = ICONS[status];
+      const chosen = isDecisionChoiceSelected(target.entry.effective, status);
+      return <button key={status} role="menuitemradio" aria-checked={chosen} tabIndex={-1}
+        disabled={disabledReason !== null} className={`row-menu-item status-${status}`} title={DESCRIPTIONS[status]}
+        onClick={() => { if (chosen) onDismiss(true); else onChoose(status); }}>
+        <Icon size={17}/><span>{decisionChoiceLabel(status)}{status === 'migrate-now' ? ' · pending' : ''}</span>
+        {chosen && <Check size={15}/>}
+      </button>;
+    })}
+    <p className="row-menu-help">{disabledReason ?? 'Saved mark · copy runs follow the queue settings'}</p>
+  </div>, portalRoot ?? window.document.body);
 }

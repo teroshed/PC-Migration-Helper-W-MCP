@@ -11,9 +11,17 @@ export const DESCRIPTIONS: Record<Status, string> = {
   attention: 'No migration decision yet', 'migrate-now': 'Pending · ready for an early copy',
   'last-moment': 'Capture again before the final shutdown', redownload: 'Keep the decision to download it again',
   erase: 'Saved decision only · never deletes anything', 'on-external': 'Your manual assertion · not a verified backup',
-  'manual-pending': 'Manual copy still pending · confirm after you finish copying',
+  'manual-pending': 'Plan a manual backup. A current matching mirror comparison can verify it.',
   'manual-confirmed': 'Your confirmation for this path · review children separately · checksum verification is separate',
 };
+export const DECISION_CHOICES = STATUSES.filter(status => status !== 'manual-confirmed');
+export function decisionChoiceLabel(status: Status): string {
+  return status === 'manual-pending' ? 'Manual backup' : LABELS[status];
+}
+export function isDecisionChoiceSelected(effective: Effective, status: Status): boolean {
+  return effective.own && (effective.status === status ||
+    (status === 'manual-pending' && effective.status === 'manual-confirmed'));
+}
 export const ICONS = {
   attention: CircleHelp, 'migrate-now': ArrowDownToLine, 'last-moment': Clock3,
   redownload: Download, erase: Trash2, 'on-external': CheckCircle2,
@@ -21,6 +29,7 @@ export const ICONS = {
 };
 export const EMPTY_EFFECTIVE: Effective = { status: 'attention', own: false, inheritedFrom: null, stale: false, mixed: 0, originalStatus: null };
 export function reviewStatusLabel(effective: Effective): string {
+  if (effective.manualEvidence === 'mirror-verified') return 'Verified manual backup';
   const summary = effective.rollup;
   if (summary?.kind === 'mixed') return 'Mixed child decisions';
   if (summary?.kind === 'unanimous') return `Children · ${LABELS[summary.status]}`;

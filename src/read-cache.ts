@@ -5,7 +5,7 @@ export class StaleReadError extends Error {
 export function isStaleRead(cause: unknown): cause is StaleReadError { return cause instanceof StaleReadError; }
 
 export class ReadCache<T> {
-  private values = new Map<string, { value: T; expires: number; bytes: number }>();
+  private values = new Map<string, { value: T; expires: number; bytes: number; retention: number }>();
   private pending = new Map<string, Promise<T>>();
   private generation = 0;
   private retentionGeneration = 0;
@@ -36,14 +36,16 @@ export class ReadCache<T> {
     // Progress counters can supersede cached derived statistics without making
     // an already-running source observation invalid for its current caller.
     this.retentionGeneration += 1;
-    this.values.clear();
-    this.bytes = 0;
   }
   invalidate(matches: (key: string) => boolean): void {
     this.evictValues(matches);
     for (const key of this.pending.keys()) if (matches(key)) this.pending.delete(key);
   }
   peek(key: string): T | undefined {
+    if (this.values.get(key)?.retention !== this.retentionGeneration) return undefined;
+    return this.peekRecent(key);
+  }
+  peekRecent(key: string): T | undefined {
     const entry = this.values.get(key);
     if (!entry) return undefined;
     this.values.delete(key);
@@ -63,11 +65,12 @@ export class ReadCache<T> {
       return loader();
     }).then(value => {
       if (generation !== this.generation || this.pending.get(key) !== promise) throw new StaleReadError();
-      if (retentionGeneration !== this.retentionGeneration) return value;
       // UTF-16 estimate bounds retained payloads as well as page count.
       const bytes = JSON.stringify(value).length * 2;
       if (bytes <= this.maxBytes) {
-        this.values.set(key, { value, bytes, expires: this.now() + this.ttlMs });
+        this.bytes -= this.values.get(key)?.bytes ?? 0;
+        this.values.delete(key);
+        this.values.set(key, { value, bytes, expires: this.now() + this.ttlMs, retention: retentionGeneration });
         this.bytes += bytes;
         while (this.values.size > this.maxEntries || this.bytes > this.maxBytes) {
           const oldest = this.values.keys().next().value;

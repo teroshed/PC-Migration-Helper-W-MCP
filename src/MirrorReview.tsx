@@ -244,7 +244,7 @@ export function MirrorReview({ currentPath, instanceId, enabled, controlRef, onN
     {snapshot && <CoverageSummary coverage={snapshot.coverage}/>}
     <div className="mirror-pane" key={tab} aria-label={tab === 'binding' ? 'Binding details' : tab === 'comparison' ? 'Comparison evidence' : 'Confirmation details'}>
     {tab === 'binding' && <>
-    <p className="modal-intro">Compare an existing manual mirror with an exact source scope. Both folders are read-only during verification. Saved selected-path manual marks stay separate from confirmed mirror membership.</p>
+    <p className="modal-intro">Compare an existing manual mirror with a source folder. A complete, currently monitored match verifies manual backup marks in that folder. Both folders are read-only during verification.</p>
     <section className="mirror-box" aria-label="Bind source and mirror folders">
       <h3><Folder size={15} aria-hidden="true"/> Bind source and mirror folders</h3>
       <div className="mirror-path-fields">

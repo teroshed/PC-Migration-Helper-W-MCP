@@ -581,6 +581,7 @@ mod tests {
                 vec![root.to_string_lossy().into_owned()],
                 s.volumes.clone(),
                 false,
+                false,
             )
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);

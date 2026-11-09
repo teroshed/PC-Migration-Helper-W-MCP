@@ -36,6 +36,10 @@ export class FolderReadCache extends ReadCache<Listing> {
   peekListing(query: FolderQuery): Listing | undefined {
     return this.observations.fresh(query.path) ? this.peek(folderQueryKey(query)) : undefined;
   }
+  peekRecentListing(query: FolderQuery, context?: FolderReadContext): Listing | undefined {
+    if (context && (context.source !== this.sourceScope || context.derived !== this.derivedScope)) return undefined;
+    return this.observations.fresh(query.path) ? this.peekRecent(folderQueryKey(query)) : undefined;
+  }
   listing(query: FolderQuery, force = false): Promise<Listing> {
     // Refresh this directory without canceling independent preview columns.
     if (force) {

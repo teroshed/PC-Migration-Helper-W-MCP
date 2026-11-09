@@ -1251,7 +1251,7 @@ impl Audit {
         touch_watcher(&tx)?;
         tx.commit().map_err(error)
     }
-    fn watch_changed(&self, path: &str, since: &str) -> Result<bool, String> {
+    pub(crate) fn watch_changed(&self, path: &str, since: &str) -> Result<bool, String> {
         let db = self.connect()?;
         let (low, high) = prefix_range(path);
         if db.query_row("SELECT 1 FROM watch_changes WHERE changed_at>?1 AND (path=?2 OR (path>=?3 COLLATE NOCASE AND path<?4 COLLATE NOCASE)) LIMIT 1",params![since,path,low,high],|r|r.get::<_,i64>(0)).optional().map_err(error)?.is_some(){return Ok(true);}
