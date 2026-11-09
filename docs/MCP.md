@@ -86,6 +86,15 @@ The native coordinator records durable intent, prepares the worker, saves the ac
 
 Queue entry arrays are bounded and long path previews are labeled. Use `list_decisions` with status filters and `limit` 1–100 for the complete saved mark set. `recordId` plus `read_review_text` retrieves a full path or note. Sources are preserved, different destination content is refused, and the API exposes no source deletion or wipe action.
 
+For one file whose original destination is occupied, use
+`preview_copy_conflict` to review the source, existing destination and proposed
+new name. Only an explicit `control_copy_queue` command with action
+`startSeparate`, the exact reviewed paths and conflict fingerprint, current
+queue/volume fences and confirmation can write a separately named copy.
+Different existing bytes stay intact, including if another process claims
+the new name before publication. This does not complete the ordinary
+original-path queue. Close the review to leave the conflict unresolved.
+
 ## Grouped marking and Undo
 
 Use `read_folder` for each reviewed entry and `get_review_state` for the
@@ -112,6 +121,29 @@ count and fingerprint. `control_ui` actions `setEntrySelection`,
 `clearEntrySelection` and `openSelectionReview` bind that fingerprint and the
 current UI session. Changing the selection or opening its review does not save
 a decision. Use the exact grouped operation to save a reviewed selection.
+
+## Manual mirror evidence
+
+Review the exact source and mirror roots with `preview_mirror_binding`.
+`save_mirror_binding` records independently identified volumes and maps the
+same relative entry below each root after explicit confirmation. Use
+`start_mirror_comparison` for the separate read-only comparison. Cancel by
+exact active operation ID. Retrying an accepted start returns its receipt
+instead of launching another comparison.
+
+`get_mirror_comparison` separates saved intent, progress, observed outcome,
+and historical or monitored evidence. `read_mirror_evidence` returns bounded
+pages from the digest-checked manifest. Missing or unsupported entries stay
+visible. Checksums cover supported unnamed streams. Mirror reads do not
+hydrate links or offline data, and they do not verify ACLs, application
+consistency or restores. Keep the app evidence directory outside both scopes.
+
+Use `prepare_mirror_confirmation` to revalidate the exact reviewed membership
+and exceptions. Only current monitored evidence can prepare a confirmation.
+`confirm_mirror_membership` records the user's assertion for that short-lived
+frozen membership. New members never inherit it. Reopen, replacement or
+monitoring failure requires reconciliation. Selected-path manual marks retain
+their own scope and provenance.
 
 ## Acknowledged window controls and retained work
 

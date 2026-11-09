@@ -39,7 +39,7 @@ pub fn volumes(fixture: Option<&Path>) -> Vec<Volume> {
     }
     [r"C:\", r"E:\"].iter().map(|root| volume(root)).collect()
 }
-fn volume(root: &str) -> Volume {
+pub(crate) fn volume(root: &str) -> Volume {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
@@ -64,7 +64,7 @@ fn volume(root: &str) -> Volume {
             problem: Some(error(std::io::Error::last_os_error())),
         };
     }
-    unsafe {
+    let metadata = unsafe {
         GetVolumeInformationW(
             wide.as_ptr(),
             label.as_mut_ptr(),
@@ -76,6 +76,15 @@ fn volume(root: &str) -> Volume {
             0,
         )
     };
+    if metadata == 0 {
+        return Volume {
+            root: root.into(),
+            id: format!("unavailable-{root}"),
+            label: root.into(),
+            available: false,
+            problem: Some(error(std::io::Error::last_os_error())),
+        };
+    }
     let decode = |a: &[u16]| {
         String::from_utf16_lossy(&a[..a.iter().position(|v| *v == 0).unwrap_or(a.len())])
     };

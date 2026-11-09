@@ -160,6 +160,25 @@ pub fn control(s: &AppState, request: &Value, origin: MutationOrigin) -> Result<
     control_inner(s, request, origin, || {})
 }
 
+pub(crate) fn preview_conflict(s: &AppState, request: &Value) -> Result<Value, String> {
+    let _observation = s.background.observe()?;
+    let doc = crate::document(s)?;
+    let destination = copy_destination(s);
+    let plan = s.copy_queue.preview_conflict(&doc, &s.volumes, &destination,
+        text(request, "sourcePath")?, text(request, "alternateName")?)?;
+    Ok(json!({"revision":doc["revision"],"destinationId":destination.id,"sourcePath":plan.source,
+        "existingPath":std::path::Path::new(&destination.root).join(&plan.original_relative),
+        "alternatePath":std::path::Path::new(&destination.root).join(&plan.separate_relative),
+        "alternateName":plan.name,"conflictFingerprint":plan.fingerprint,
+        "scope":"One eligible file. Existing destination bytes remain intact; the alternate name must still be absent."}))
+}
+
+#[tauri::command]
+pub(crate) async fn preview_copy_conflict(state: tauri::State<'_, crate::Shared>, request: Value) -> Result<Value, String> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || preview_conflict(&s, &request)).await.map_err(error)?
+}
+
 fn control_inner(
     s: &AppState,
     request: &Value,
@@ -183,6 +202,7 @@ fn control_inner(
                 | "mode"
                 | "scope"
                 | "expectedJobId"
+                | "sourcePath" | "alternateName" | "expectedConflictFingerprint"
         )
     }) {
         return Err("Unsupported copy control field".into());
@@ -195,8 +215,12 @@ fn control_inner(
         return Err("Explicit confirmation is required for copy control.".into());
     }
     let action = text(request, "action")?;
-    if !matches!(action, "start" | "resume" | "pause") {
+    if !matches!(action, "start" | "resume" | "pause" | "startSeparate") {
         return Err("Unknown copy control action".into());
+    }
+    if action != "startSeparate" && ["sourcePath","alternateName","expectedConflictFingerprint"].iter()
+        .any(|field| request.get(*field).is_some()) {
+        return Err("Alternate filename fields require a separate-file request.".into());
     }
     let _admission = if action == "pause" { s.background.edit_guard()? } else { s.background.start_guard()? };
     let operation_id = text(request, "operationId")?;
@@ -251,21 +275,13 @@ fn control_inner(
         }
         return response(s, saved.clone(), store.revision(), true, &current_instance);
     }
-    if store.doc["agentOperations"].get(operation_id).is_some()
-        || store.doc["recoveryOperations"].get(operation_id).is_some()
-        || store.doc["recentOperations"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|id| id == operation_id))
-        || store.doc["history"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|event| event["id"] == operation_id))
-    {
+    if crate::operation_id_used(&store.doc, operation_id) {
         return Err("This operationId already belongs to another saved action. Choose an unused identifier after reconciling state.".into());
     }
     let destination = copy_destination(s);
     checked_queue(s, request, &store.doc, &current_instance, &destination)?;
     let current_job = s.copy_queue.status()?;
-    let previous_job = if action == "start" {
+    let previous_job = if matches!(action, "start" | "startSeparate") {
         None
     } else {
         Some(text(request, "expectedJobId")?)
@@ -273,7 +289,23 @@ fn control_inner(
     if previous_job.is_some_and(|id| current_job["jobId"].as_str() != Some(id)) {
         return Err("The copy job changed. Inspect its current status before continuing.".into());
     }
-    let (mode, scope) = if action == "start" {
+    let conflict = if action == "startSeparate" {
+        if ["mode","scope","expectedJobId"].iter().any(|field| request.get(*field).is_some())
+            || current_job["running"] == true {
+            return Err("Separate-file copy needs one exact file and an idle queue.".into());
+        }
+        let plan = s.copy_queue.preview_conflict(&store.doc, &s.volumes, &destination,
+            text(request, "sourcePath")?, text(request, "alternateName")?)?;
+        if plan.fingerprint != text(request, "expectedConflictFingerprint")? {
+            return Err("The source or destination conflict changed. Review the proposed new name again.".into());
+        }
+        Some(plan)
+    } else {
+        None
+    };
+    let (mode, scope) = if let Some(plan) = &conflict {
+        (Some("separate-file".into()), Some(plan.source.clone()))
+    } else if action == "start" {
         if request.get("expectedJobId").is_some_and(|v| !v.is_null()) {
             return Err("A new start cannot target an earlier job".into());
         }
@@ -307,6 +339,9 @@ fn control_inner(
                 .as_str()
                 .ok_or("Paused job mode unavailable")?
                 .to_owned();
+            if mode == "separate-file" {
+                return Err("Review the exact source and alternate filename again before another separate copy.".into());
+            }
             let scope = s.copy_queue.validate_start_request(
                 &s.volumes,
                 &destination,
@@ -336,6 +371,10 @@ fn control_inner(
         "phase":"starting","requestedAt":now(),"mode":mode,"scope":scope,
         "queueSignature":expected_queue,"sourceVolumeSignature":expected_sources,
         "destinationId":expected_destination,"provenance":origin.provenance(s.fixture)});
+    if let Some(plan) = &conflict {
+        receipt["separateFile"] = json!({"sourcePath":plan.source,"originalRelative":plan.original_relative,
+            "alternateRelative":plan.separate_relative,"reviewedFingerprint":plan.fingerprint});
+    }
     let source_document = store.doc.clone();
     let mut saved = source_document.clone();
     if saved.get("copyOperations").is_none() {
@@ -349,6 +388,8 @@ fn control_inner(
     let (release, launch) = std::sync::mpsc::channel();
     let effect = if action == "pause" {
         s.copy_queue.pause_job(&job_id)
+    } else if let Some(plan) = conflict {
+        s.copy_queue.start_conflict_job(source_document, s.volumes.clone(), destination, &job_id, launch, plan)
     } else {
         s.copy_queue.start_with_job(
             source_document,
@@ -457,6 +498,45 @@ mod tests {
         );
         *s.gateway.get_mut().unwrap() =
             json!({"state":"running","instanceId":"replacement-fixture-instance"});
+    }
+
+    #[test]
+    fn separate_conflict_copy_preserves_both_originals_and_refuses_racing_name() {
+        let s = fixture();
+        let source = file(&s, "Work\\keep.txt");
+        mark(&s, &source, "migrate-now", "mark-separate-file");
+        let destination = s.data_path.parent().unwrap().join("destination/Work");
+        fs::create_dir_all(&destination).unwrap();
+        let original = destination.join("keep.txt");
+        fs::write(&original, b"earlier destination bytes").unwrap();
+        let separate = |id: &str, name: &str| {
+            let preview = preview_conflict(&s, &json!({"sourcePath":source,"alternateName":name})).unwrap();
+            let mut req = request(&s, id, "start");
+            req.as_object_mut().unwrap().remove("mode");
+            req["action"] = json!("startSeparate");
+            req["sourcePath"] = json!(source);
+            req["alternateName"] = json!(name);
+            req["expectedConflictFingerprint"] = preview["conflictFingerprint"].clone();
+            req
+        };
+        let raced = separate("raced-separate-copy", "keep-raced.txt");
+        let raced_file = destination.join("keep-raced.txt");
+        control_inner(&s, &raced, MutationOrigin::ManualUi, || {
+            fs::write(&raced_file, b"another process owns this name").unwrap();
+        }).unwrap();
+        assert_eq!(wait(&s)["phase"], "failed");
+        assert_eq!(fs::read(&raced_file).unwrap(), b"another process owns this name");
+        assert_eq!(fs::read(&original).unwrap(), b"earlier destination bytes");
+        assert_eq!(control(&s, &raced, MutationOrigin::ManualUi).unwrap()["replayed"], true);
+        let req = separate("approved-separate-copy", "keep-backup.txt");
+        control(&s, &req, MutationOrigin::ManualUi).unwrap();
+        let finished = wait(&s);
+        assert_eq!(finished["phase"], "complete", "{finished}");
+        assert_eq!(fs::read(destination.join("keep-backup.txt")).unwrap(), b"fixture payload");
+        assert_eq!(fs::read(source).unwrap(), b"fixture payload");
+        assert_eq!(fs::read(original).unwrap(), b"earlier destination bytes");
+        assert_eq!(snapshot(&s).unwrap()["pendingMigrateNow"], 1,
+            "a separately named copy does not complete the ordinary original-path queue");
     }
 
     #[test]

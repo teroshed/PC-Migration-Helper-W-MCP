@@ -60,6 +60,23 @@
 .copy-queue-status span,
 .copy-queue-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .copy-queue-problem { color: #ffd894; }
+.copy-queue-problem > svg { flex-shrink: 0; }
+.copy-queue-problem > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.copy-queue-problem > button, .copy-issue button { padding: 4px 6px; font-size: 11px; }
+.copy-issue { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 0; }
+.copy-issue p { min-width: 0; overflow-wrap: anywhere; }
+.copy-issue button { flex-shrink: 0; }
+.separate-copy-review .modal-body { overflow: auto; }
+.separate-copy-review p, .separate-copy-review dd { overflow-wrap: anywhere; }
+.separate-copy-review p, .separate-copy-review label, .separate-copy-review dl { margin: 7px 0; font-size: 12px; }
+.separate-copy-review label { display: grid; gap: 4px; }
+.separate-copy-review input { min-width: 0; padding: 6px; }
+.separate-copy-review dl { display: grid; gap: 8px; }
+.separate-copy-review dt { color: #b8cdec; font-weight: 600; }
+.separate-copy-review dd { margin: 4px 0 0; }
+.separate-copy-review p[role=alert] { color: #ffbdbb; }
+.separate-copy-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; padding: 9px 17px; border-top: 1px solid #334b6a; }
+.separate-copy-actions button { padding: 6px 8px; font-size: 11px; }
 
 .copy-queue-popover {
   position: absolute;

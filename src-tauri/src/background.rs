@@ -72,7 +72,8 @@ impl Drop for Observation<'_> {
 
 fn activity_at(s: &AppState, observations: usize) -> Result<Value, String> {
     Ok(
-        json!({"inventory":s.index.running.load(Ordering::SeqCst), "hash":s.audit.is_running(), "copy":s.copy_queue.status()?["running"] == true,"observations":observations}),
+        json!({"inventory":s.index.running.load(Ordering::SeqCst), "hash":s.audit.is_running(), "copy":s.copy_queue.status()?["running"] == true,
+            "mirror":s.mirrors.active()?,"observations":observations}),
     )
 }
 pub fn activity(s: &AppState) -> Result<Value, String> {
@@ -281,6 +282,7 @@ pub fn drain_exit(
         s.index.cancel.store(true, Ordering::SeqCst);
         s.audit.pause();
         s.copy_queue.pause();
+        s.mirrors.cancel();
     }
     let result: Result<Value, String> = (|| {
         let deadline = std::time::Instant::now() + timeout;
@@ -290,6 +292,7 @@ pub fn drain_exit(
                 && current["hash"] == false
                 && current["copy"] == false
                 && current["observations"] == 0
+                && s.mirrors.stopped()?
             {
                 break;
             }

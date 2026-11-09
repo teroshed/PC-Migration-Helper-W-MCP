@@ -1,0 +1,66 @@
+.mirror-review {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  gap: 8px;
+  font-size: 12px;
+}
+.mirror-navigation, .mirror-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.mirror-navigation button, .mirror-actions button { min-height: 31px; padding: 5px 9px; font-size: 11px; }
+.mirror-navigation button[aria-pressed=true] { background: #2b4569; border-color: #85a7d2; color: #e4efff; }
+.mirror-actions { justify-content: flex-end; }
+.mirror-coverage { flex-shrink: 0; border: 1px solid #3b5373; border-radius: 6px; padding: 6px 8px; }
+.mirror-coverage > div { max-height: 108px; overflow: auto; padding-top: 4px; color: #c0d1e7; }
+.mirror-coverage p { margin: 2px 0; }
+.mirror-pane { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 2px 3px; }
+.mirror-pane > * + * { margin-top: 8px; }
+.mirror-box { padding: 10px; border: 1px solid #364a66; border-radius: 7px; background: #17263a; }
+.mirror-box h3 { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.mirror-box p { margin-top: 5px; overflow-wrap: anywhere; line-height: 1.45; }
+.mirror-path-fields { display: grid; gap: 8px; margin-top: 10px; }
+.mirror-path-fields label { display: grid; gap: 4px; color: #bfd3ef; }
+.mirror-path-fields input { min-width: 0; padding: 7px 8px; }
+.mirror-identities { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 5px 0; }
+.mirror-identities > div { min-width: 0; padding: 7px; border: 1px solid #3a5274; border-radius: 6px; }
+.mirror-identities dt { color: #b5d2f4; font-weight: 600; }
+.mirror-identities dd, .mirror-confirmation-list { margin: 4px 0 0; overflow-wrap: anywhere; }
+.mirror-identities small { display: block; margin-top: 4px; color: #a3b6d0; }
+.mirror-binding-list { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; max-height: 165px; overflow: auto; }
+.mirror-binding-list button { padding: 6px; text-align: left; overflow-wrap: anywhere; }
+.mirror-binding-list button[aria-pressed=true] { border-color: #86afd7; }
+.mirror-freshness { color: #f1cc86; }
+.mirror-freshness.monitored { color: #b9dfb3; }
+.mirror-note { color: #b8c8de; }
+.mirror-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px 10px; margin: 8px 0; }
+.mirror-counts > div { display: flex; justify-content: space-between; gap: 5px; border-bottom: 1px solid #33475f; }
+.mirror-counts dd { margin: 0; font-variant-numeric: tabular-nums; }
+.mirror-evidence-head, .mirror-evidence-pages { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
+.mirror-evidence-pages button { display: inline-flex; align-items: center; gap: 4px; padding: 5px; font-size: 11px; }
+.mirror-evidence { max-height: 280px; overflow: auto; margin: 7px 0; padding: 0; list-style: none; }
+.mirror-evidence li { padding: 7px; border: 1px solid #334960; border-radius: 4px; overflow-wrap: anywhere; }
+.mirror-evidence li + li { margin-top: 4px; }
+.mirror-evidence li > div { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 8px; }
+.mirror-evidence li > div span { color: #abc4e3; }
+.mirror-evidence label { display: inline-flex; align-items: flex-start; gap: 6px; margin-top: 5px; }
+.mirror-review input[type=checkbox] { flex-shrink: 0; }
+.mirror-review summary { cursor: pointer; color: #bdd6f5; }
+.mirror-review code, .mirror-exceptions li, .mirror-confirmation-list li { overflow-wrap: anywhere; }
+.mirror-exceptions { margin-top: 8px; }
+.mirror-exceptions ul, .mirror-prepared ul, .mirror-confirmation-list { padding-left: 18px; max-height: 155px; overflow: auto; }
+.mirror-exceptions li button { margin-left: 6px; padding: 3px 5px; font-size: 10px; }
+.mirror-error { color: #ffbcba; overflow-wrap: anywhere; }
+.mirror-review > .mirror-error { max-height: 70px; overflow: auto; }
+.mirror-error svg { vertical-align: middle; margin-right: 5px; }
+@media (max-width: 700px) {
+  .mirror-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (forced-colors: active) {
+  .mirror-navigation button[aria-pressed=true], .mirror-binding-list button[aria-pressed=true] { border-color: Highlight; }
+}

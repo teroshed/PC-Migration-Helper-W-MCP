@@ -9,7 +9,7 @@ use std::{
     },
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -19,7 +19,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         ERROR_IO_PENDING, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED, WAIT_FAILED,
-        WAIT_OBJECT_0,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
         ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -29,7 +29,7 @@ use windows_sys::Win32::{
         FILE_SHARE_WRITE,
     },
     System::{
-        Threading::{CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, INFINITE},
+        Threading::{CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE},
         IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
     },
 };
@@ -82,6 +82,17 @@ struct RootSignals {
     root: String,
     overflow: AtomicBool,
     unavailable: Mutex<Option<String>>,
+    sequence: AtomicU64,
+    continuous: AtomicBool,
+    active: AtomicBool,
+    completion: Mutex<Option<Arc<OwnedHandle>>>,
+}
+impl RootSignals {
+    fn new(root: String) -> Self {
+        Self { root, overflow: AtomicBool::new(false), unavailable: Mutex::new(None),
+            sequence: AtomicU64::new(0), continuous: AtomicBool::new(true),
+            active: AtomicBool::new(false), completion: Mutex::new(None) }
+    }
 }
 enum Message {
     Changed {
@@ -106,8 +117,29 @@ pub struct WatchHandle {
     dispatcher_stopped: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     dispatcher: Option<JoinHandle<()>>,
+    tracking: Arc<Vec<RootSignals>>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EvidencePosition {
+    pub(crate) sequence: u64,
+    pub(crate) continuous: bool,
+}
+
 impl WatchHandle {
+    /// Read the kernel reader's position, not the debounced UI event queue.
+    /// A signaled completion is unsettled even before its reader processes it.
+    pub(crate) fn evidence_position(&self, index: usize) -> Option<EvidencePosition> {
+        let root = self.tracking.get(index)?;
+        let sequence = root.sequence.load(Ordering::SeqCst);
+        let settled = root.completion.lock().ok()?.as_ref().is_some_and(|handle| {
+            unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+        });
+        let continuous = settled && root.active.load(Ordering::SeqCst)
+            && root.continuous.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst)
+            && root.sequence.load(Ordering::SeqCst) == sequence;
+        Some(EvidencePosition { sequence, continuous })
+    }
     pub fn request_stop(&self) {
         if !self.stopped.swap(true, Ordering::SeqCst) {
             unsafe { SetEvent(self.stop.as_raw_handle()) };
@@ -236,11 +268,7 @@ pub fn start(
     let signals: Arc<Vec<RootSignals>> = Arc::new(
         roots
             .iter()
-            .map(|root| RootSignals {
-                root: root.clone(),
-                overflow: AtomicBool::new(false),
-                unavailable: Mutex::new(None),
-            })
+            .map(|root| RootSignals::new(root.clone()))
             .collect(),
     );
     let stop = Arc::new(event()?);
@@ -303,6 +331,7 @@ pub fn start(
         dispatcher_stopped,
         threads: Vec::new(),
         dispatcher: Some(dispatcher),
+        tracking: signals.clone(),
     };
     for (index, root) in roots.into_iter().enumerate() {
         if excluded(&root, &exclusions) {
@@ -318,7 +347,8 @@ pub fn start(
                 continue;
             }
         };
-        let completion = event()?;
+        let completion = Arc::new(event()?);
+        *signals[index].completion.lock().map_err(|e| e.to_string())? = Some(completion.clone());
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let worker_stop = stop.clone();
         let worker_stopped = stopped.clone();
@@ -345,6 +375,7 @@ pub fn start(
         handle.threads.push(worker);
         if ready_receiver.recv_timeout(Duration::from_secs(2)).is_err() {
             signals[index].overflow.store(true, Ordering::SeqCst);
+            signals[index].continuous.store(false, Ordering::SeqCst);
         }
     }
     Ok(handle)
@@ -356,6 +387,8 @@ fn mark_rescan(
     root: usize,
     reason: impl Into<String>,
 ) {
+    signals[root].continuous.store(false, Ordering::SeqCst);
+    signals[root].sequence.fetch_add(1, Ordering::SeqCst);
     if sender
         .try_send(Message::Rescan {
             root,
@@ -373,8 +406,10 @@ fn send_change(
     path: String,
     kind: ChangeKind,
 ) {
+    signals[root].sequence.fetch_add(1, Ordering::SeqCst);
     if let Err(TrySendError::Full(_)) = sender.try_send(Message::Changed { root, path, kind }) {
         signals[root].overflow.store(true, Ordering::SeqCst);
+        signals[root].continuous.store(false, Ordering::SeqCst);
     }
 }
 fn cancel_and_drain(directory: &File, operation: &mut OVERLAPPED) {
@@ -391,7 +426,7 @@ fn watch_directory(
     index: usize,
     root: String,
     directory: File,
-    completion: OwnedHandle,
+    completion: Arc<OwnedHandle>,
     stop: Arc<OwnedHandle>,
     stopped: Arc<AtomicBool>,
     sender: SyncSender<Message>,
@@ -403,6 +438,7 @@ fn watch_directory(
     let mut buffer = vec![0u32; BUFFER_BYTES / 4];
     let mut first = true;
     while !stopped.load(Ordering::SeqCst) {
+        signals[index].active.store(false, Ordering::SeqCst);
         let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
         operation.hEvent = completion.as_raw_handle();
         unsafe {
@@ -437,12 +473,14 @@ fn watch_directory(
             let _ = ready.try_send(());
             break;
         }
+        signals[index].active.store(true, Ordering::SeqCst);
         if first {
             let _ = ready.try_send(());
             first = false;
         }
         let waits = [stop.as_raw_handle(), completion.as_raw_handle()];
         let outcome = unsafe { WaitForMultipleObjects(2, waits.as_ptr(), 0, INFINITE) };
+        signals[index].active.store(false, Ordering::SeqCst);
         if outcome == WAIT_OBJECT_0 || stopped.load(Ordering::SeqCst) {
             cancel_and_drain(&directory, &mut operation);
             break;
@@ -534,6 +572,7 @@ fn watch_directory(
             Err(reason) => mark_rescan(&sender, &signals, index, reason),
         }
     }
+    signals[index].active.store(false, Ordering::SeqCst);
 }
 
 fn ancestors_safe(path: &str, root: &str) -> Result<bool, String> {
@@ -725,11 +764,7 @@ mod tests {
 
     #[test]
     fn a_full_bounded_channel_sets_a_durable_rescan_signal() {
-        let signals = vec![RootSignals {
-            root: r"E:\fixture".into(),
-            overflow: AtomicBool::new(false),
-            unavailable: Mutex::new(None),
-        }];
+        let signals = vec![RootSignals::new(r"E:\fixture".into())];
         let (sender, _receiver) = mpsc::sync_channel(1);
         send_change(
             &sender,
@@ -747,6 +782,8 @@ mod tests {
             ChangeKind::Modified,
         );
         assert!(signals[0].overflow.load(Ordering::SeqCst));
+        assert!(!signals[0].continuous.load(Ordering::SeqCst));
+        assert_eq!(signals[0].sequence.load(Ordering::SeqCst), 2);
         signals[0].overflow.store(false, Ordering::SeqCst);
         mark_rescan(&sender, &signals, 0, "Kernel notification buffer overflow");
         assert!(signals[0].overflow.load(Ordering::SeqCst));

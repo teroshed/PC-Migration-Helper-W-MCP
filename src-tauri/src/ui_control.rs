@@ -175,6 +175,7 @@ fn validate_command_structure(command: &Value) -> Result<(), String> {
                         | "gaps"
                         | "gateway"
                         | "conflict"
+                        | "mirror"
                 )
             ) =>
         {

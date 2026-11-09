@@ -77,9 +77,7 @@ pub fn control(s: &Shared, request: &Value, origin: MutationOrigin) -> Result<Va
         return Ok(json!({"receipt":receipt,"revision":store.revision(),"replayed":true,
             "recoveryState":snapshot_locked(s,store,&instance)?}));
     }
-    if store.doc["copyOperations"].get(operation_id).is_some() || store.doc["agentOperations"].get(operation_id).is_some()
-        || store.doc["recentOperations"].as_array().is_some_and(|items|items.iter().any(|id|id==operation_id))
-        || store.doc["history"].as_array().is_some_and(|items|items.iter().any(|event|event["id"]==operation_id)) {
+    if crate::operation_id_used(&store.doc, operation_id) {
         return Err("Recovery operation ID already belongs to another application operation".into());
     }
     let receipt = json!({"operationId":operation_id,"payloadHash":payload_hash,"phase":"applied",

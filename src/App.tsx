@@ -45,6 +45,7 @@ import type { PendingSnapshot } from './pending-inspection';
 import { assertNewCloseAllowed, CloseSession } from './close-session';
 import type { CloseState } from './close-session';
 import { SelectionReview } from './SelectionReview';
+import { MirrorReview } from './MirrorReview';
 import type { GroupOperation, GroupReview } from './SelectionReview';
 import {
   changeSelection, EMPTY_SELECTION, latestUndoEvent, loadSelection, reportSelectionTarget, replaceSelection,
@@ -125,6 +126,7 @@ export default function App() {
   const [lifecycleSnapshot, setLifecycleSnapshot] = useState<Record<string, unknown> | null>(null);
   const [gatewayDetailsOpen, setGatewayDetailsOpen] = useState(false);
   const [showAssistance, setShowAssistance] = useState(false);
+  const [showMirror, setShowMirror] = useState(false);
   const [observedRevision, setObservedRevision] = useState(0);
   const [showConflict, setShowConflict] = useState(false);
   const [conflictLoading, setConflictLoading] = useState(false);
@@ -169,6 +171,7 @@ export default function App() {
   const copyControl = useRef<UiParticipant | null>(null);
   const notificationControl = useRef<UiParticipant | null>(null);
   const assistanceControl = useRef<UiParticipant | null>(null);
+  const mirrorControl = useRef<UiParticipant | null>(null);
   const documentRef = useRef<Document | null>(null);
   const conflictReviewOpen = useRef(false);
   const viewRef = useRef<ViewState | null>(null);
@@ -422,6 +425,10 @@ export default function App() {
   function edit(operation: Operation): Promise<Document> {
     if (!queue.current || readOnly) return Promise.reject(new Error('The saved data must be recovered before editing.'));
     return queue.current.request(operation);
+  }
+  function saveMirror(operation: Extract<Operation, { type: 'mirrorBind' | 'mirrorConfirm' }>,
+    expectedRevision: number, operationId: string): Promise<unknown> {
+    return runNativeWrite(() => invoke('mutate', { expectedRevision, operationId, operation }), parseDocument);
   }
   async function editAssistance(operation: Operation, reviewedRevision: number): Promise<void> {
     const writer = queue.current;
@@ -1125,7 +1132,7 @@ export default function App() {
     if (submittingGroup.current || attemptedGroup.current) throw new Error('Reconcile the submitted group before closing its review.');
     closeGroupReview();
     setShowGaps(false); setShowHistory(false); setShowDecisionPicker(false); setShowContext(false);
-    setShowMcp(false); setShowAssistance(false); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
+    setShowMcp(false); setShowAssistance(false); setShowMirror(false); setShowSaved(false); closeConflictReview(); dismissRowMenu(true);
     void notificationControl.current?.execute({ action: 'setNotifications', mode: 'closed' }, { command: { action: 'setNotifications' } });
     void copyControl.current?.execute({ action: 'setCopyDetails', open: false }, { command: { action: 'setCopyDetails' } });
   }
@@ -1137,7 +1144,7 @@ export default function App() {
     return {
       revision: documentRef.current?.revision, readOnly, followAi, close: { ...closeState, nativeAtRequest: lifecycleSnapshot },
       panels: { gaps: showGaps, history: showHistory, decision: showDecisionPicker, context: showContext,
-        gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict, selection: groupReview?.mode ?? null },
+        gateway: showMcp, assistance: showAssistance, saved: showSaved, conflict: showConflict, mirror: showMirror, selection: groupReview?.mode ?? null },
       selection: { rootId: selectionRoot?.id ?? null, total: groupTargets.length, visible: visibleGroupCount,
         hidden: groupTargets.length - visibleGroupCount, targets: groupTargets.map(reportSelectionTarget),
         review: groupReview ? { mode: groupReview.mode, revision: groupReview.revision, operationId: groupReview.operationId,
@@ -1157,6 +1164,7 @@ export default function App() {
       notifications: notificationControl.current?.read() ?? null,
       copy: copyControl.current?.read() ?? null,
       assistance: assistanceControl.current?.read() ?? null,
+      mirror: mirrorControl.current?.read() ?? null,
       feedback: { status: message, error, saveError: saveState.error },
     };
   }
@@ -1263,7 +1271,7 @@ export default function App() {
       }
       if (command.panel === 'decision' && (readOnly || !selectedPath || detailsLoading || !details || !details.exists || saveState.saving)) throw new Error('The selected decision is not available for editing.');
       const setters: Record<string, (open: boolean) => void> = { assistance: setShowAssistance, decision: setShowDecisionPicker,
-        context: setShowContext, history: setShowHistory, saved: setShowSaved, gaps: setShowGaps, gateway: setShowMcp };
+        context: setShowContext, history: setShowHistory, saved: setShowSaved, gaps: setShowGaps, gateway: setShowMcp, mirror: setShowMirror };
       const setter = setters[String(command.panel)];
       if (!setter) throw new Error('Unsupported panel');
       setter(true); return;
@@ -1442,6 +1450,9 @@ export default function App() {
         <div className="browser-heading">
           <div><span className="eyebrow">FOLDER REVIEW</span><h2>{baseName(view.path)}</h2></div>
           <section className="review-heading-actions" aria-label="Folder review actions">
+            <button className="assistance-trigger" aria-haspopup="dialog" onClick={() => setShowMirror(true)}>
+              <ShieldCheck size={16} aria-hidden="true"/> Manual mirror
+            </button>
             <button className="assistance-trigger" aria-haspopup="dialog" onClick={() => setShowAssistance(true)}>
               <Sparkles size={16} aria-hidden="true"/> AI Assistance
             </button>
@@ -1543,6 +1554,10 @@ export default function App() {
     {showGaps && <Modal title="Coverage gaps" onClose={() => setShowGaps(false)}><div className="audit-overview"><h3>Current or latest source audit</h3><p>Phase: {audit.status?.phase ?? 'unavailable'}{audit.status?.workers ? ` · ${audit.status.workers} workers` : ''}{audit.status?.coverageGaps ? ` · ${audit.status.coverageGaps.toLocaleString()} audit coverage gaps` : ''}</p>{audit.status?.currentPath && <p className="context-path">{audit.status.currentPath}</p>}{audit.problem && <p className="audit-detail-problem">{audit.problem}</p>}<AuditDetails stats={audit.status ?? undefined}/><AuditCoverageDetails status={audit.status}/></div><div className="legacy-index-tools"><h3>Directory index only</h3><p>This optional index discovers folder names for navigation. The Count & hash controls run the full allocation and source checksum audit.</p><div>{scanRunning ? <button onClick={() => void scan('pause')}><Pause size={13}/>Pause directory index</button> : appStatus.scan.pending > 0 ? <button onClick={() => void scan('resume')}><Play size={13}/>Resume directory index</button> : <button onClick={() => void scan('all')}><Play size={13}/>Index all roots</button>}{!scanRunning && <button onClick={() => void scan('current')}>Index this subtree</button>}</div></div><p className="inventory-detail-counts">Inventory: {(appStatus.scan.processed ?? 0).toLocaleString()} folders processed · {(appStatus.scan.files ?? 0).toLocaleString()} files · {readableBytes(appStatus.scan.bytes ?? 0)} counted · {appStatus.scan.pending.toLocaleString()} folders queued</p><p className="modal-intro">Protected paths, failed reads and links are recorded here. No ownership or permissions are changed. This shows the latest 200 gaps; the inventory may discover more.</p>{appStatus.scan.error && <div className="context-box warning"><TriangleAlert size={16}/><p>Inventory error: {appStatus.scan.error}</p></div>}{appStatus.scan.currentPath && <p className="context-path">Current or most recent inventory path: {appStatus.scan.currentPath}</p>}{appStatus.gaps.length ? appStatus.gaps.map((gap, index) => <article className="gap-row" key={`${gap.path}-${index}`}><TriangleAlert size={17}/><div><strong>{gap.path}</strong><p>{gap.problem}</p><small>{gap.observedAt ? new Date(gap.observedAt).toLocaleString() : 'Observation time unavailable'}</small></div><button onClick={() => { setShowGaps(false); const parent = parentPath(gap.path); navigate(parent ?? gap.path, parent ? gap.path : null); }}>Review</button></article>) : <div className="empty-state"><ShieldCheck size={28}/><h3>No gaps recorded yet</h3><p>This does not establish complete coverage. Inventory the drives to discover what can and cannot be read.</p></div>}</Modal>}
     {showHistory && <Modal title="Decision history" onClose={() => setShowHistory(false)}><p className="modal-intro">Changes for {selectedPath}. Earlier decisions stay in the saved journal, including undo events.</p>{details?.history.length ? details.history.slice(0, 100).map((item, index) => <HistoryEntry key={index} value={item} onGroupUndo={readOnly ? undefined : groupId => { void prepareGroupUndo(groupId, true).catch(report); }}/>) : <div className="empty-state"><History size={28}/><h3>No changes recorded for this path</h3></div>}</Modal>}
     {showSaved && <Modal title="Saved decisions & notes" onClose={() => setShowSaved(false)}><p className="modal-intro">Every saved record remains here, including paths that were moved, removed or belong to a previous volume. Availability is checked when you open a path. A previous disk’s decision is never applied to a different disk using the same drive letter.</p><div className="saved-tools"><input aria-label="Search saved decisions and notes" placeholder="Search saved paths and notes…" value={savedSearch} onChange={event => { setSavedSearch(event.target.value); setSavedPage(0); }}/><select aria-label="Filter saved records" value={savedFilter} onChange={event => { setSavedFilter(event.target.value); setSavedPage(0); }}><option value="all">All saved records</option>{STATUSES.map(status => <option value={status} key={status}>{LABELS[status]}</option>)}</select></div><p className="saved-result-count">{savedDecisions.length.toLocaleString()} matching saved records · current availability not yet checked</p>{savedDecisions.slice(savedPage * 100, (savedPage + 1) * 100).map((decision, index) => { const location = resolveDecisionPath(decision, boot.volumes); return <article className="saved-record" key={`${decision.path}-${index}`}><div><strong>{decision.path}</strong><StatusBadge effective={{ ...EMPTY_EFFECTIVE, status: decision.status, own: true }}/>{decision.noteOnly === true && <small>Note only · classification not set</small>}{decision.notes && <p>{decision.notes}</p>}{decision.decidedAt && <small>Recorded {new Date(decision.decidedAt).toLocaleString()}</small>}</div><div className="saved-review-action"><button disabled={!location.path} onClick={() => { if (!location.path) return; setShowSaved(false); const parent = parentPath(location.path); navigate(parent ?? location.path, parent ? location.path : null); }}>Review path</button>{location.explanation && <p className="unavailable-record">{location.explanation}</p>}{location.path && location.path.toLowerCase() !== decision.path.toLowerCase() && <small>Current location: {location.path}</small>}</div></article>; })}{!savedDecisions.length && <div className="empty-state"><Database size={28}/><h3>No matching saved records</h3><p>New decisions and notes are captured as you review folders.</p></div>}<div className="saved-pagination"><button disabled={savedPage === 0} onClick={() => setSavedPage(page => page - 1)}>Previous 100</button><span>Page {savedPage + 1} / {Math.max(1, Math.ceil(savedDecisions.length / 100))}</span><button disabled={(savedPage + 1) * 100 >= savedDecisions.length} onClick={() => setSavedPage(page => page + 1)}>Next 100</button></div></Modal>}
+    {showMirror && <Modal title="Manual mirror comparison" onClose={() => setShowMirror(false)}>
+      <MirrorReview currentPath={view.path} instanceId={gateway.instanceId} enabled={!readOnly}
+        controlRef={mirrorControl} onNativeWrite={runNativeWrite} onSave={saveMirror}/>
+    </Modal>}
     {groupReview && <Modal title={groupReview.mode === 'mark' ? 'Review selected entries' : 'Review group Undo'}
       closeDisabled={groupBusy || groupAttempt !== null} onClose={closeGroupReview}
       fallbackFocus={() => columnStripRef.current?.querySelector<HTMLButtonElement>('.root-column .column-review')?.focus()}>

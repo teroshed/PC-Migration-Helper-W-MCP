@@ -103,6 +103,8 @@ export type Operation =
   | { type: 'assistAnswer'; path: string; questionId: string; status: Status }
   | { type: 'bulkClassify'; targets: GroupTarget[]; status: Status; confirmed: true; acknowledgeFolderEffects?: true; acknowledgeQueueEffects: true }
   | { type: 'undoGroup'; groupId: string; confirmed: true; acknowledgeQueueEffects: true }
+  | { type: 'mirrorBind'; source: string; mirror: string; expectedBindingId: string; confirmed: true }
+  | { type: 'mirrorConfirm'; membershipDigest: string; confirmed: true }
   | { type: 'undo' };
 
 export function record(value: unknown): Record<string, unknown> {

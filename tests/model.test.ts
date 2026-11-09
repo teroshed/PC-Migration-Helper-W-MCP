@@ -5,12 +5,61 @@ import type { Document, Operation } from '../src/model.ts';
 import { changeSelection, latestUndoEvent, loadSelection, reportSelectionTarget, replaceSelection,
   resolvedSelection, rootForSelection, savedGroup, selectedFoldersWithDescendants, selectedFor,
   selectionKey, selectionSignature, selectionTarget } from '../src/review-selection.ts';
+import { currentPreparedMirror, parseMirrorPage, parseMirrorStatus, parsePreparedMirror } from '../src/mirror-model.ts';
 import { inspectPending, pendingFingerprint, pendingJSON, pendingMetadata, textChunk, textHash } from '../src/pending-inspection.ts';
 import type { PendingSnapshot } from '../src/pending-inspection.ts';
 
 function doc(revision = 1): Document {
   return parseDocument({ schemaVersion: 1, revision, history: [], decisions: {}, futureField: { preserved: true }, view: { path: 'E:\\', selectedPath: null, search: '', filter: 'all', page: 0, scrollTop: 0, recentPaths: [] } });
 }
+
+const mirrorBindingId = 'a'.repeat(64);
+const mirrorManifestDigest = 'b'.repeat(64);
+const observedMirrorReceipt = {
+  bindingId: mirrorBindingId, manifestDigest: mirrorManifestDigest, finishedAt: '2026-11-09T10:00:00Z',
+  checkedFiles: 4, checkedBytes: 40, coverageComplete: false, sourceMatches: false,
+  counts: { equal: 1, directories: 1, missing: 1, different: 1, extra: 0, changedDuringRead: 0, unreadable: 1, unsupported: 0, coverageGaps: 1 },
+};
+
+test('prepared mirror membership is usable only for the same monitored comparison, revision and time window', () => {
+  const operation = { operationId: 'comparison', bindingId: mirrorBindingId };
+  const result = { phase: 'complete', receipt: observedMirrorReceipt };
+  const comparison = { operation, outcome: result, active: false, freshness: 'monitored' };
+  const coverage = { savedManualPendingMarks: 2, deferredInterviewScopes: 1,
+    missing: null, different: null, unsupported: null, unreadable: null, coverageGaps: null,
+    comparisonHistorical: false, coverageScope: 'Separate saved and observed counts' };
+  const base = { revision: 7, bindings: [], confirmations: [], comparison, coverage, bindingCount: 0, confirmationCount: 0 };
+  const prepared = parsePreparedMirror({ revision: 7, operationId: 'comparison', validForMs: 60_000,
+    membership: { bindingId: mirrorBindingId, manifestDigest: mirrorManifestDigest, membershipDigest: 'c'.repeat(64),
+      coveredFiles: 1, coveredDirectories: 1, exceptions: ['exact\\excluded.txt'] } });
+  assert.equal(currentPreparedMirror(prepared, parseMirrorStatus(base), 61000, 60999), true);
+  const coverageBeforeCompare = parseMirrorStatus({ ...base, comparison: null }).coverage;
+  assert.equal(coverageBeforeCompare.savedManualPendingMarks, 2);
+  assert.equal(coverageBeforeCompare.missing, null);
+  assert.equal(currentPreparedMirror(prepared, parseMirrorStatus(base), 61000, 61000), false);
+  assert.equal(currentPreparedMirror(prepared, parseMirrorStatus({ ...base, revision: 8 }), 61000, 60999), false);
+  for (const stale of [
+    { ...comparison, freshness: 'historical-or-unknown' },
+    { ...comparison, operation: { ...operation, operationId: 'different-run' } },
+    { ...comparison, outcome: { ...result, receipt: { ...observedMirrorReceipt, manifestDigest: 'd'.repeat(64) } } },
+  ]) assert.equal(currentPreparedMirror(prepared, parseMirrorStatus({ ...base, comparison: stale }), 61000, 60999), false);
+  assert.throws(() => parsePreparedMirror({ ...prepared, validForMs: 60001 }), /expiration/);
+});
+
+test('paged mirror evidence retains source/mirror gaps and exact SHA-256 readback', () => {
+  const entries = [{ relative: 'nested\\both.txt', verdict: 'different', directory: false, coverageGap: false,
+    source: { sha256: 'a'.repeat(64), bytes: 4 }, mirror: { sha256: 'b'.repeat(64), bytes: 5 } },
+  { relative: 'inaccessible', verdict: 'unreadable', directory: true, coverageGap: true, sourceProblem: 'Source not readable', mirrorProblem: null }];
+  const result = parseMirrorPage({ receipt: observedMirrorReceipt, page: { matched: 4, nextOffset: 2, entries } });
+  assert.equal(result.receipt.coverageComplete, false);
+  assert.equal(result.nextOffset, 2);
+  assert.equal(result.entries[0]?.source?.sha256, 'a'.repeat(64));
+  assert.equal(result.entries[0]?.mirror?.bytes, 5);
+  assert.equal(result.entries[1]?.coverageGap, true);
+  assert.equal(result.entries[1]?.sourceProblem, 'Source not readable');
+  assert.equal(result.entries[1]?.mirror, null);
+  assert.throws(() => parseMirrorPage({ receipt: { ...observedMirrorReceipt, manifestDigest: 'invalid' }, page: { matched: 0, nextOffset: null, entries: [] } }), /identity/);
+});
 
 test('selection uses volume identity across locations, filters and alternate path casing', () => {
   const volume = { root: 'E:\\Fixture', id: 'volume-a', label: 'Synthetic', available: true, problem: null };

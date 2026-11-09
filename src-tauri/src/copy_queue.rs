@@ -75,6 +75,27 @@ pub struct CopyQueue {
     worker_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ConflictPlan {
+    pub(crate) source: String,
+    pub(crate) original_relative: String,
+    pub(crate) separate_relative: String,
+    pub(crate) name: String,
+    pub(crate) fingerprint: String,
+}
+
+struct ReviewedConflict {
+    plan: ConflictPlan,
+    _source_guards: Vec<File>,
+    _destination_guards: Vec<File>,
+    _original: File,
+}
+
+enum WorkPlan {
+    Ordinary { mode: Mode, scope: Option<String> },
+    Separate(ConflictPlan),
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Ordered,
@@ -289,6 +310,26 @@ impl CopyQueue {
         job_id: &str,
         launch: Option<mpsc::Receiver<()>>,
     ) -> Result<Value, String> {
+        let parsed_mode = Mode::parse(mode)?;
+        let scope = self.validate_start_request(&volumes, &destination, mode, scope)?;
+        self.start_work(document, volumes, destination, mode, scope.clone(), job_id, launch,
+            WorkPlan::Ordinary { mode: parsed_mode, scope })
+    }
+
+    pub(crate) fn preview_conflict(&self, document: &Value, volumes: &[Volume], destination: &Volume,
+        source: &str, name: &str) -> Result<ConflictPlan, String> {
+        self.review_conflict(document, volumes, destination, source, name).map(|review| review.plan)
+    }
+
+    pub(crate) fn start_conflict_job(self: &Arc<Self>, document: Value, volumes: Vec<Volume>,
+        destination: Volume, job_id: &str, launch: mpsc::Receiver<()>, plan: ConflictPlan) -> Result<Value, String> {
+        self.start_work(document, volumes, destination, "separate-file", Some(plan.source.clone()),
+            job_id, Some(launch), WorkPlan::Separate(plan))
+    }
+
+    fn start_work(self: &Arc<Self>, document: Value, volumes: Vec<Volume>, destination: Volume,
+        mode: &str, scope: Option<String>, job_id: &str, launch: Option<mpsc::Receiver<()>>,
+        plan: WorkPlan) -> Result<Value, String> {
         let mut coordinator = self.worker_handle.lock().map_err(error)?;
         if self.status()?["running"] == true {
             return Err("A copy pass is already running".into());
@@ -298,8 +339,6 @@ impl CopyQueue {
                 .join()
                 .map_err(|_| "Previous copy coordinator panicked".to_owned())?;
         }
-        let parsed_mode = Mode::parse(mode)?;
-        let scope = self.validate_start_request(&volumes, &destination, mode, scope)?;
         {
             let mut progress = self.progress.lock().map_err(error)?;
             if active(&progress.phase) {
@@ -335,13 +374,12 @@ impl CopyQueue {
                         barrier.wait();
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        queue.run(
-                            &document,
-                            &volumes,
-                            &destination,
-                            parsed_mode,
-                            scope.as_deref(),
-                        )
+                        match plan {
+                            WorkPlan::Ordinary { mode, scope } =>
+                                queue.run(&document, &volumes, &destination, mode, scope.as_deref()),
+                            WorkPlan::Separate(plan) =>
+                                queue.run_conflict(&document, &volumes, &destination, &plan),
+                        }
                     }))
                     .unwrap_or_else(|_| Err("The copy worker stopped unexpectedly".into()));
                     queue.finish(result);
@@ -354,6 +392,84 @@ impl CopyQueue {
             }
         }
         self.status()
+    }
+
+    fn review_conflict(&self, document: &Value, volumes: &[Volume], destination: &Volume,
+        source: &str, name: &str) -> Result<ReviewedConflict, String> {
+        validate_destination(destination, volumes, self.fixture)?;
+        let source = filesystem::normalize(source)?;
+        let (volume, original_relative, _) = filesystem::identify(&source, volumes)?;
+        validate_relative(&original_relative)?;
+        if name.is_empty() || name.contains(['\\','/']) {
+            return Err("Enter a new filename in the same destination directory.".into());
+        }
+        validate_relative(name)?;
+        let marks = decisions(document, volumes);
+        let by_key = marks.iter().enumerate().map(|(index, mark)| (mark.key.as_str(),index)).collect();
+        if nearest(&source, volumes, &by_key).is_none_or(|rank|
+            !matches!(marks[rank].status.as_str(), "migrate-now" | "last-moment"))
+        {
+            return Err("This source file is not marked for migration.".into());
+        }
+        let (checked, source_guards) = guard_source(&source, volume)?;
+        let input = open_read(&checked).map_err(error)?;
+        let metadata = regular_file(&input)?;
+        no_named_streams(&input)?;
+        let source_stamp = stamp(&input, &metadata).ok_or("Could not establish the source identity")?;
+        let original = Path::new(&original_relative);
+        let parent = original.parent().ok_or("Missing relative parent")?;
+        let original_name = original.file_name().ok_or("Choose a regular file")?;
+        if original_name.to_string_lossy().to_lowercase() == name.to_lowercase() {
+            return Err("The alternate filename must differ from the existing file.".into());
+        }
+        let (target_dir, destination_guards) = destination_directory_with_policy(
+            destination, &parent.to_string_lossy(), self.fixture, false)?;
+        let existing = open_read(&target_dir.join(original_name))
+            .map_err(|e| format!("The original destination file cannot be reviewed: {e}"))?;
+        let existing_meta = regular_file(&existing)?;
+        no_named_streams(&existing)?;
+        if same_file(&input, &existing) {
+            return Err("Source and destination resolve to the same file.".into());
+        }
+        let existing_stamp = stamp(&existing, &existing_meta).ok_or("Could not establish the existing destination identity")?;
+        match fs::symlink_metadata(target_dir.join(name)) {
+            Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("The alternate filename is already present or unavailable; it was left untouched.".into()),
+        }
+        let separate_relative = parent.join(name).to_string_lossy().into_owned();
+        let fingerprint = hash(serde_json::to_vec(&json!([source,destination.id,original_relative,
+            separate_relative,source_stamp,existing_stamp])).map_err(error)?.as_slice());
+        Ok(ReviewedConflict { plan:ConflictPlan {source, original_relative, separate_relative,
+            name:name.to_owned(),fingerprint}, _source_guards:source_guards,
+            _destination_guards:destination_guards, _original:existing })
+    }
+
+    fn run_conflict(&self, document: &Value, volumes: &[Volume], destination: &Volume,
+        expected: &ConflictPlan) -> Result<(), String> {
+        self.check_cancel()?;
+        let reviewed = self.review_conflict(document, volumes, destination, &expected.source, &expected.name)?;
+        if reviewed.plan.fingerprint != expected.fingerprint {
+            return Err("The reviewed source or collision changed before copying.".into());
+        }
+        {
+            let mut progress = self.progress.lock().map_err(error)?;
+            progress.phase = "copying".into();
+            progress.planned = 1;
+            progress.current_path = Some(expected.source.clone());
+        }
+        let db = self.connect()?;
+        let job = Job { rank:0, source:expected.source.clone(), relative:expected.separate_relative.clone(),
+            target:expected.separate_relative.to_uppercase(), directory:false };
+        match self.copy_one_with_policy(&db, &job, volumes, destination, true)? {
+            Outcome::Published(bytes) => {
+                let mut progress = self.progress.lock().map_err(error)?;
+                progress.copied = 1;
+                progress.bytes_copied = bytes;
+            }
+            _ => return Err("The reviewed alternate file was not published.".into()),
+        }
+        drop(reviewed);
+        Ok(())
     }
 
     fn finish(&self, result: Result<(), String>) {
@@ -687,6 +803,17 @@ impl CopyQueue {
         volumes: &[Volume],
         destination: &Volume,
     ) -> Result<Outcome, String> {
+        self.copy_one_with_policy(db, job, volumes, destination, false)
+    }
+
+    fn copy_one_with_policy(
+        &self,
+        db: &Connection,
+        job: &Job,
+        volumes: &[Volume],
+        destination: &Volume,
+        require_empty: bool,
+    ) -> Result<Outcome, String> {
         self.check_cancel()?;
         validate_destination(destination, volumes, self.fixture)?;
         let (volume, _, _) = filesystem::identify(&job.source, volumes)?;
@@ -718,11 +845,12 @@ impl CopyQueue {
         let gate = self.destination_gate.lock().map_err(error)?;
         self.check_cancel()?;
         let (target_parent, _target_guards) =
-            destination_directory(destination, &parent, self.fixture)?;
+            destination_directory_with_policy(destination, &parent, self.fixture, !require_empty)?;
         let strict_parent = hold_entry(&target_parent, false, true, true)?;
         let name = relative.file_name().ok_or("Missing destination filename")?;
         let target = target_parent.join(name);
         match open_read(&target) {
+            Ok(_) if require_empty => return Err("The alternate file already exists. It was not changed.".into()),
             Ok(mut existing) => {
                 drop(strict_parent);
                 drop(gate);
@@ -1056,7 +1184,7 @@ fn volume_id(root: &str) -> Result<(String, String), String> {
     Ok((format!("{}:{serial:08x}", decode(&guid)), decode(&label)))
 }
 
-fn verify_source_volume(volume: &Volume, guards: &[File]) -> Result<(), String> {
+pub(crate) fn verify_source_volume(volume: &Volume, guards: &[File]) -> Result<(), String> {
     if volume.id == "fixture-volume" {
         return Ok(());
     }
@@ -1131,6 +1259,15 @@ fn destination_directory(
     relative: &str,
     fixture: bool,
 ) -> Result<(PathBuf, Vec<File>), String> {
+    destination_directory_with_policy(dest, relative, fixture, true)
+}
+
+fn destination_directory_with_policy(
+    dest: &Volume,
+    relative: &str,
+    fixture: bool,
+    create: bool,
+) -> Result<(PathBuf, Vec<File>), String> {
     validate_relative(relative)?;
     let root = if fixture {
         PathBuf::from(&dest.root)
@@ -1159,7 +1296,7 @@ fn destination_directory(
         for component in relative.split('\\') {
             let _strict_parent = hold_entry(&target, false, true, true)?;
             target.push(component);
-            guards.push(hold_directory(&target, true)?);
+            guards.push(hold_directory(&target, create)?);
         }
     }
     Ok((target, guards))

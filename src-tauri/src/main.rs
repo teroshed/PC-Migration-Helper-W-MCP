@@ -9,6 +9,8 @@ mod filesystem;
 mod gateway;
 mod index;
 mod manual_backup;
+mod mirror;
+mod mirror_service;
 mod recovery_control;
 mod review;
 mod rollup;
@@ -46,6 +48,7 @@ struct AppState {
     copy_queue: Arc<copy_queue::CopyQueue>,
     copy_control: Mutex<()>,
     assistance: assistance::Cache,
+    mirrors: mirror_service::Runtime,
 }
 type Shared = Arc<AppState>;
 
@@ -544,6 +547,14 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
+fn operation_id_used(doc: &Value, id: &str) -> bool {
+    ["agentOperations","groupOperations","copyOperations","recoveryOperations",
+        "mirrorOperations","mirrorEditOperations"].iter()
+        .any(|field| doc[*field].get(id).is_some())
+        || doc["recentOperations"].as_array().is_some_and(|ids| ids.iter().any(|value| value == id))
+        || doc["history"].as_array().is_some_and(|history| history.iter().any(|event| event["id"] == id))
+}
+
 fn run_mutation(
     s: &AppState,
     expected_revision: u64,
@@ -695,8 +706,9 @@ fn run_mutation_as(
     let store = guard
         .as_mut()
         .ok_or("Data file is not writable in this instance")?;
-    if store.doc["copyOperations"].get(&operation_id).is_some() || store.doc["recoveryOperations"].get(&operation_id).is_some() {
-        return Err("This operationId belongs to a durable copy or recovery receipt and cannot be reused for an edit".into());
+    if ["copyOperations","recoveryOperations","mirrorOperations"].iter()
+        .any(|key| store.doc[*key].get(&operation_id).is_some()) {
+        return Err("This operationId belongs to a durable job or recovery receipt and cannot be reused for an edit".into());
     }
     let agent_hash = origin.payload_hash(&op)?;
     let group_hash = if matches!(operation_type, "bulkClassify" | "undoGroup") {
@@ -709,6 +721,23 @@ fn run_mutation_as(
     } else {
         None
     };
+    let mirror_hash = if matches!(operation_type, "mirrorBind" | "mirrorConfirm") {
+        Some(match &agent_hash {
+            Some(hash) => hash.clone(),
+            None => store::hash(&serde_json::to_vec(&canonical_json(
+                &json!({"origin":"manual-ui","operation":op})
+            )).map_err(error)?),
+        })
+    } else { None };
+    if let Some(receipt) = store.doc["mirrorEditOperations"].get(&operation_id) {
+        if mirror_hash.as_deref() != receipt["payloadHash"].as_str() || mirror_hash.is_none() {
+            return Err("This operation ID belongs to a different saved mirror edit.".into());
+        }
+        return Ok(store.doc.clone());
+    }
+    if mirror_hash.is_some() && operation_id_used(&store.doc, &operation_id) {
+        return Err("This operation ID belongs to another saved action.".into());
+    }
     if let Some(receipt) = store.doc["groupOperations"].get(&operation_id) {
         if group_hash.as_deref() != receipt["payloadHash"].as_str() || group_hash.is_none() {
             return Err("This operation ID belongs to a different grouped edit. No decisions were changed.".into());
@@ -780,6 +809,7 @@ fn run_mutation_as(
     let mut activity = None;
     let mut classification_changed = false;
     let mut group_targets = Vec::new();
+    let mut mirror_guard = None;
     if matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
         let path = filesystem::normalize(op["path"].as_str().ok_or("Missing suggestion path")?)?;
         let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
@@ -816,6 +846,12 @@ fn run_mutation_as(
                 }
             }
             "assist" => assistance::update(s, &mut doc, &op)?,
+            "mirrorBind" => mirror_service::apply_binding(s, &mut doc, &op)?,
+            "mirrorConfirm" => {
+                mirror_guard = Some(mirror_service::apply_confirmation(
+                    s, &mut doc, &op, &operation_id, &provenance,
+                )?);
+            }
             "bulkClassify" => {
                 let prepared = bulk_mark::prepare(s, &op)?;
                 let event = bulk_mark::group_event(
@@ -952,6 +988,14 @@ fn run_mutation_as(
     if ids.len() > 256 {
         ids.remove(0);
     }
+    if let Some(payload_hash) = mirror_hash {
+        if doc.get("mirrorEditOperations").is_none() {
+            doc["mirrorEditOperations"] = json!({});
+        }
+        doc["mirrorEditOperations"].as_object_mut().ok_or("Invalid saved mirror edit receipts")?
+            .insert(operation_id.clone(), json!({"payloadHash":payload_hash,"type":operation_type,
+                "recordedAt":now(),"provenance":provenance}));
+    }
     if let Some(payload_hash) = agent_hash {
         if doc.get("agentOperations").is_none() {
             doc["agentOperations"] = json!({});
@@ -980,7 +1024,13 @@ fn run_mutation_as(
             .ok_or("Invalid agent operation receipt map")?
             .insert(operation_id, receipt);
     }
-    let saved = store.commit_guarded(doc, || bulk_mark::ensure_current(&group_targets))?;
+    let saved = store.commit_guarded(doc, || {
+        bulk_mark::ensure_current(&group_targets)?;
+        if let Some(guard) = &mirror_guard {
+            guard.validate(s)?;
+        }
+        Ok(())
+    })?;
     if classification_changed {
         // A running pass owns the decision snapshot from its start. Stop further
         // queued work after an intent change, so the next pass uses the new marks.
@@ -1447,6 +1497,7 @@ fn main() {
         gateway_server: Mutex::new(None),
         review: review::ReviewBridge::default(),
         assistance: assistance::Cache::default(),
+        mirrors: mirror_service::Runtime::default(),
         copy_queue,
         copy_control: Mutex::new(()),
     });
@@ -1495,8 +1546,16 @@ fn main() {
             ui_control::begin_ui_session,
             get_boot,
             assistance::get_assisted_review,
+            mirror_service::preview_mirror_binding,
+            mirror_service::mirror_comparison_status,
+            mirror_service::start_mirror_comparison,
+            mirror_service::cancel_mirror_comparison,
+            mirror_service::read_mirror_evidence,
+            mirror_service::read_mirror_confirmation,
+            mirror_service::prepare_mirror_confirmation,
             copy_queue_snapshot,
             control_copy_queue,
+            copy_control::preview_copy_conflict,
             report_review_surface,
             poll_review_activity,
             plan_review_reveal,
@@ -1846,6 +1905,7 @@ mod tests {
             gateway_server: Mutex::new(None),
             review: review::ReviewBridge::default(),
             assistance: assistance::Cache::default(),
+            mirrors: mirror_service::Runtime::default(),
             copy_queue: copy_queue::CopyQueue::new(
                 root.join("copy-receipts.sqlite"),
                 Vec::new(),

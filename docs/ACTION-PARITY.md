@@ -59,6 +59,9 @@ confirmation, fencing, retries and asynchronous status.
 | Gracefully close the window, explicitly exit, or retry/cancel a waiting exit ticket | `control_ui`: `closeWindow` / `exitApp` / `retryExit` / `cancelExit` | `control_ui` |
 | Select or clear exact rows; open selection review | `control_ui`: `setEntrySelection` / `clearEntrySelection` / `openSelectionReview` | `control_ui` |
 | Review grouped history; atomically save or undo a reviewed group | `read_review_group` / `mark_review_selection` / `undo_review_group` | `get_review_group`; `mutate`: `bulkClassify` / `undoGroup` |
+| Review, save and open a manual mirror binding | `preview_mirror_binding`, `save_mirror_binding`, `control_ui`: open Mirror panel | `preview_mirror_binding`, `mutate`: `mirrorBind`, `control_ui` |
+| Compare source and mirror, cancel, inspect evidence, prepare and confirm exact membership | `get_mirror_comparison`, `start_mirror_comparison`, `cancel_mirror_comparison`, `read_mirror_evidence`, `prepare_mirror_confirmation`, `confirm_mirror_membership` | Mirror status, comparison and evidence methods; `mutate`: `mirrorConfirm` |
+| Review and explicitly copy one file beside an occupied original destination | `preview_copy_conflict`, `control_copy_queue`: `startSeparate` | `preview_copy_conflict`, `control_copy_queue` |
 | Inspect a damaged journal and a valid recovery backup | `get_recovery_state` | `get_recovery_state` |
 | Explicitly restore that reviewed backup, preserving the displaced original | `recover_review` | `recover_review` |
 
