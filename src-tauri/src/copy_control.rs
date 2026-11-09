@@ -247,6 +247,9 @@ pub(crate) fn reconcile_history(s: &AppState, request: &Value, origin: MutationO
     let provenance = origin.provenance(s.fixture);
     let mut doc = store.doc.clone();
     copy_effect_ledger::reconcile(store,&mut doc,expected_digest,&destination.id,provenance.clone())?;
+    if doc["reconciledCopyOperations"].get(id).is_some() {
+        return Err("This operation ID belongs to a reviewed copy receipt.".into());
+    }
     if doc.get("copyReconciliationOperations").is_none() { doc["copyReconciliationOperations"] = json!({}); }
     let receipt = json!({"operationId":id,"payloadHash":payload_hash,"ledgerDigest":expected_digest,
         "recordedAt":now(),"reviewedRevision":store.revision(),"destinationId":destination.id,
@@ -368,6 +371,14 @@ fn control_inner(
     if let Some(problem) = &store.problem {
         return Err(problem.clone());
     }
+    // A recovered journal may contain an earlier starting version of an
+    // admission whose definitive receipt was reconciled independently.
+    if let Some(previous) = store.doc["reconciledCopyOperations"].get(operation_id) {
+        if previous["payloadHash"] != payload_hash {
+            return Err("This operation ID belongs to a reconciled copy receipt.".into());
+        }
+        return response(s, previous.clone(), store.revision(), true, &current_instance);
+    }
     if let Some(saved) = operations(&store.doc)?.and_then(|items| items.get(operation_id)) {
         if saved["payloadHash"] != payload_hash {
             return Err(
@@ -375,12 +386,6 @@ fn control_inner(
             );
         }
         return response(s, saved.clone(), store.revision(), true, &current_instance);
-    }
-    if let Some(previous) = store.doc["reconciledCopyOperations"].get(operation_id) {
-        if previous["payloadHash"] != payload_hash {
-            return Err("This operation ID belongs to a reconciled copy receipt.".into());
-        }
-        return response(s, previous.clone(), store.revision(), true, &current_instance);
     }
     if crate::operation_id_used(&store.doc, operation_id) {
         return Err("This operationId already belongs to another saved action. Choose an unused identifier after reconciling state.".into());
@@ -501,8 +506,8 @@ fn control_inner(
     saved["copyOperations"][operation_id] = receipt.clone();
     store.commit(saved)?;
     // From this point a persisted intent exists. The prepared worker waits for
-    // its accepted receipt, so journal replacement cannot race source fencing.
-    // Losing either acknowledgement never permits replay to start another job.
+    // its independent admission and accepted journal receipt. Losing an
+    // acknowledgement never permits replay to start another job.
     let (release, launch) = std::sync::mpsc::channel();
     let effect = if action == "pause" {
         s.copy_queue.pause_job(&job_id)
@@ -532,15 +537,16 @@ fn control_inner(
         }
     }
     receipt["committedRevision"] = json!(store.revision() + 1);
+    let _authority_files = if store.doc["copyLedgerId"].is_null() {
+        None
+    } else {
+        Some(copy_effect_ledger::record_admission(store, &receipt).map_err(|problem|
+            format!("Copy intent {operation_id} was saved, but its independent effect history could not be recorded: {problem}. The prepared worker was not released."))?)
+    };
     let mut saved = store.doc.clone();
     saved["copyOperations"][operation_id] = receipt.clone();
     if let Err(problem) = store.commit(saved) {
-        return Err(format!("Copy intent {operation_id} was saved and may have taken effect, but its acknowledgement could not be saved: {problem}. Inspect the operation; retrying its original identifier will not start it again."));
-    }
-    if !store.doc["copyLedgerId"].is_null() {
-        if let Err(problem) = copy_effect_ledger::record_admission(store, &receipt) {
-            return Err(format!("Copy receipt {operation_id} was saved, but independent effect history could not be recorded: {problem}. The prepared worker was not released."));
-        }
+        return Err(format!("Copy intent {operation_id} was saved, but its journal acknowledgement could not be saved: {problem}. The prepared worker was not released; retrying its original identifier will not start it again."));
     }
     if release_worker {
         release.send(()).map_err(|_| "The accepted copy job lost its prepared worker. Inspect the saved receipt; retrying its identifier will not launch it again.".to_owned())?;
@@ -630,10 +636,10 @@ mod tests {
         mark(&s, &source,"migrate-now","review-protected");
         control(&s,&request(&s,"initial-copy-authority","start"),MutationOrigin::ManualUi).unwrap();
         assert_eq!(wait(&s)["phase"],"complete");
-        let ledger = s.data_path.with_extension("json.copy-effects.sqlite");
-        let db = rusqlite::Connection::open(&ledger).unwrap();
-        db.execute("DELETE FROM admissions WHERE operation_id='initial-copy-authority'",[]).unwrap();
-        drop(db);
+        let ledger = s.data_path.with_extension("json.copy-effects.log");
+        let mut damaged = fs::read(&ledger).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&ledger, damaged).unwrap();
         let added = file(&s,"Work\\blocked.txt");
         mark(&s,&added,"migrate-now","added-after-ledger-loss");
         let state = snapshot(&s).unwrap();
@@ -641,6 +647,118 @@ mod tests {
         assert!(control(&s,&request(&s,"blocked-copy-authority","start"),MutationOrigin::ManualUi).is_err());
         assert!(!s.data_path.parent().unwrap().join("destination/Work/blocked.txt").exists());
         assert_eq!(fs::read(added).unwrap(), b"fixture payload");
+    }
+
+    #[test]
+    fn rewinding_either_authority_or_substituting_a_different_lineage_blocks_admission() {
+        let mut s = fixture();
+        let first = file(&s, "Work\\first.txt");
+        mark(&s, first.parent().unwrap(), "migrate-now", "review-work");
+        control(&s, &request(&s, "first-admission", "start"), MutationOrigin::ManualUi).unwrap();
+        assert_eq!(wait(&s)["phase"], "complete");
+        let ledger = s.data_path.with_extension("json.copy-effects.log");
+        let witness = s.data_path.with_extension("json.copy-authority");
+        let prior_ledger = fs::read(&ledger).unwrap();
+        let prior_witness = fs::read(&witness).unwrap();
+        let old_main = fs::read(&s.data_path).unwrap();
+        let old_backup = fs::read(s.data_path.with_extension("json.bak")).unwrap();
+        control(&s, &request(&s, "second-admission", "start"), MutationOrigin::ManualUi).unwrap();
+        assert_eq!(wait(&s)["phase"], "complete");
+        let current_ledger = fs::read(&ledger).unwrap();
+        let current_witness = fs::read(&witness).unwrap();
+        fs::write(&ledger, &prior_ledger).unwrap();
+        assert_eq!(snapshot(&s).unwrap()["copyAuthority"]["phase"], "unavailable");
+        fs::write(&ledger, &current_ledger).unwrap();
+        fs::write(&witness, &prior_witness).unwrap();
+        assert_eq!(snapshot(&s).unwrap()["copyAuthority"]["phase"], "unavailable");
+        fs::write(&ledger, &prior_ledger).unwrap();
+        assert_eq!(snapshot(&s).unwrap()["copyAuthority"]["phase"], "unavailable",
+            "a newer finalized journal receipt detects both authority files being older");
+        fs::write(&witness, &current_witness).unwrap();
+        drop(s.store.get_mut().unwrap().take());
+        crate::store::atomic_write(&s.data_path, &old_main).unwrap();
+        crate::store::atomic_write(&s.data_path.with_extension("json.bak"), &old_backup).unwrap();
+        restart(&mut s);
+        file(&s, "Work\\must-stay-at-source.txt");
+        assert_eq!(snapshot(&s).unwrap()["copyAuthority"]["phase"], "unavailable",
+            "the surviving witness detects a ledger rewind even after a matching journal rewind");
+        assert!(control(&s, &request(&s, "blocked-start", "start"), MutationOrigin::ManualUi).is_err());
+        assert!(!s.data_path.parent().unwrap().join("destination/Work/must-stay-at-source.txt").exists());
+
+        let other = fixture();
+        let other_source = file(&other, "Other\\elsewhere.txt");
+        mark(&other, &other_source, "migrate-now", "review-other");
+        control(&other, &request(&other, "other-copy", "start"), MutationOrigin::ManualUi).unwrap();
+        assert_eq!(wait(&other)["phase"], "complete");
+        fs::copy(other.data_path.with_extension("json.copy-effects.log"), &ledger).unwrap();
+        fs::copy(other.data_path.with_extension("json.copy-authority"), &witness).unwrap();
+        assert_eq!(snapshot(&s).unwrap()["copyAuthority"]["phase"], "unavailable");
+    }
+
+    #[test]
+    fn normal_recovery_of_a_starting_receipt_cannot_acknowledge_an_accepted_effect() {
+        let mut s = fixture();
+        let first = file(&s, "Work\\first.txt");
+        mark(&s, first.parent().unwrap(), "migrate-now", "review-parent");
+        let mut original = request(&s, "recover-started-copy", "start");
+        let accepted = control(&s, &original, MutationOrigin::ManualUi).unwrap();
+        assert_eq!(wait(&s)["phase"], "complete");
+        let backup_path = s.data_path.with_extension("json.bak");
+        let backup = fs::read(&backup_path).unwrap();
+        let backup_doc: Value = serde_json::from_slice(&backup).unwrap();
+        assert_eq!(backup_doc["copyOperations"]["recover-started-copy"]["phase"], "starting");
+        let new_source = file(&s, "Work\\new.txt");
+        drop(s.store.get_mut().unwrap().take());
+        fs::write(&s.data_path, b"{fixture damaged main file").unwrap();
+        restart(&mut s);
+        let s = Arc::new(s);
+        let state = crate::recovery_control::snapshot(&s).unwrap();
+        assert_eq!(state["available"], true);
+        let recovered = crate::recovery_control::control(&s, &json!({
+            "operationId":"fixture-normal-recovery",
+            "expectedInstanceId":state["instanceId"],"expectedOriginalSha256":state["originalSha256"],
+            "expectedBackupSha256":state["backupSha256"],"confirmed":true
+        }), MutationOrigin::ManualUi).unwrap();
+        assert_eq!(recovered["revision"], accepted["revision"]);
+        let blocked = snapshot(&s).unwrap();
+        assert_eq!(blocked["copyAuthority"]["phase"], "review-required");
+        assert_eq!(blocked["copyAuthority"]["unreconciled"][0]["phase"], "accepted");
+        let fresh = request(&s, "fresh-after-recovering-starting", "start");
+        assert!(control(&s, &fresh, MutationOrigin::ManualUi).is_err());
+        assert!(validate_fences(&s, &fresh).is_err());
+        let mut review = request(&s, "review-recovered-history", "start");
+        review.as_object_mut().unwrap().remove("action");
+        review.as_object_mut().unwrap().remove("mode");
+        review["expectedLedgerDigest"] = blocked["copyAuthority"]["ledgerDigest"].clone();
+        assert_eq!(reconcile_history(&s, &review, MutationOrigin::ManualUi).unwrap()["copyAuthority"]["ready"], true);
+        original["expectedInstanceId"] = blocked["instanceId"].clone();
+        let replay = control(&s, &original, MutationOrigin::ManualUi).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["receipt"]["phase"], "accepted");
+        assert!(!s.data_path.parent().unwrap().join("destination/Work/new.txt").exists());
+        assert_eq!(fs::read(new_source).unwrap(), b"fixture payload");
+    }
+
+    #[test]
+    fn separate_copy_refuses_excluded_files_inside_a_marked_parent() {
+        let mut s = fixture();
+        let source = file(&s, "Work\\app-owned.json");
+        let destination = s.data_path.parent().unwrap().join("destination/Work");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("app-owned.json"), b"preexisting destination").unwrap();
+        s.copy_queue = CopyQueue::new(
+            s.data_path.parent().unwrap().join("copy-receipts.sqlite"),
+            vec![source.to_string_lossy().into_owned()],
+            true,
+        );
+        mark(&s, source.parent().unwrap(), "migrate-now", "mark-parent-of-exclusion");
+        let preview = preview_conflict(&s, &json!({
+            "sourcePath":source,"alternateName":"app-owned-alternate.json"
+        }));
+        assert!(preview.unwrap_err().contains("excluded"));
+        assert_eq!(fs::read(&source).unwrap(), b"fixture payload");
+        assert_eq!(fs::read(destination.join("app-owned.json")).unwrap(), b"preexisting destination");
+        assert!(!destination.join("app-owned-alternate.json").exists());
     }
 
     #[test]
@@ -1028,7 +1146,7 @@ mod tests {
             fs::write(&s.data_path, serde_json::to_vec_pretty(&external).unwrap()).unwrap();
         })
         .unwrap_err();
-        assert!(error.contains("may have taken effect"));
+        assert!(error.contains("prepared worker was not released"));
         assert_eq!(wait(&s)["phase"], "failed");
         assert!(!s
             .data_path
@@ -1039,6 +1157,9 @@ mod tests {
         file(&s, "Work\\must-not-replay.txt");
         restart(&mut s);
         prepared["expectedInstanceId"] = json!("replacement-fixture-instance");
+        let blocked = snapshot(&s).unwrap();
+        assert_eq!(blocked["copyAuthority"]["phase"], "review-required");
+        assert_eq!(blocked["copyAuthority"]["unreconciled"][0]["phase"], "accepted");
         let replay = control(&s, &prepared, MutationOrigin::ManualUi).unwrap();
         assert_eq!(replay["receipt"]["phase"], "starting");
         assert_eq!(replay["replayed"], true);

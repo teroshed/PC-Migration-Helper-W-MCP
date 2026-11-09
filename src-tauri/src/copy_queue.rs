@@ -398,6 +398,9 @@ impl CopyQueue {
         source: &str, name: &str) -> Result<ReviewedConflict, String> {
         validate_destination(destination, volumes, self.fixture)?;
         let source = filesystem::normalize(source)?;
+        if excluded(&source, &self.exclusions) {
+            return Err("This file is excluded from migration copying.".into());
+        }
         let (volume, original_relative, _) = filesystem::identify(&source, volumes)?;
         validate_relative(&original_relative)?;
         if name.is_empty() || name.contains(['\\','/']) {
@@ -815,6 +818,9 @@ impl CopyQueue {
         require_empty: bool,
     ) -> Result<Outcome, String> {
         self.check_cancel()?;
+        if excluded(&job.source, &self.exclusions) {
+            return Err("This entry is excluded from migration copying.".into());
+        }
         validate_destination(destination, volumes, self.fixture)?;
         let (volume, _, _) = filesystem::identify(&job.source, volumes)?;
         let (source_path, source_guards) = guard_source(&job.source, volume)?;
