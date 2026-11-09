@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 mod assistance;
+mod adaptive_review;
 mod background;
 mod audit;
 mod bulk_mark;
@@ -48,6 +49,7 @@ struct AppState {
     copy_queue: Arc<copy_queue::CopyQueue>,
     copy_control: Mutex<()>,
     assistance: assistance::Cache,
+    adaptive: adaptive_review::Runtime,
     mirrors: mirror_service::Runtime,
 }
 type Shared = Arc<AppState>;
@@ -522,8 +524,8 @@ impl MutationOrigin {
             {
                 return Err("Agent changes require a nonempty reason and basis user_instruction or assistant_suggestion".into());
             }
-            if basis == "assistant_suggestion" && operation != "classify" {
-                return Err("Assistant suggestions may propose a classification only; notes and undo require explicit user instructions".into());
+            if basis == "assistant_suggestion" && !matches!(operation, "classify" | "adaptiveProposal") {
+                return Err("Assistant suggestions may submit a separate recommendation or model question only.".into());
             }
         }
         Ok(())
@@ -680,6 +682,10 @@ fn run_mutation_as(
     let _admission = s.background.edit_guard()?;
     let operation_type = op["type"].as_str().ok_or("Missing operation type")?;
     origin.validate(operation_type)?;
+    if operation_type == "adaptiveProposal"
+        && !matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
+        return Err("An external model proposal must use the proposal-only MCP route.".into());
+    }
     if operation_id.len() > 200 || operation_id.is_empty() {
         return Err("Invalid operation identifier".into());
     }
@@ -810,7 +816,7 @@ fn run_mutation_as(
     let mut classification_changed = false;
     let mut group_targets = Vec::new();
     let mut mirror_guard = None;
-    if matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
+    if operation_type == "classify" && matches!(&origin,MutationOrigin::Agent{basis,..} if basis=="assistant_suggestion") {
         let path = filesystem::normalize(op["path"].as_str().ok_or("Missing suggestion path")?)?;
         let (volume, relative, key) = filesystem::identify(&path, &s.volumes)?;
         let status = op["status"]
@@ -846,6 +852,8 @@ fn run_mutation_as(
                 }
             }
             "assist" => assistance::update(s, &mut doc, &op)?,
+            "adaptiveControl" => adaptive_review::configure(s, &mut doc, &op)?,
+            "adaptiveProposal" => adaptive_review::submit(s, &mut doc, &op, &provenance)?,
             "mirrorBind" => mirror_service::apply_binding(s, &mut doc, &op)?,
             "mirrorConfirm" => {
                 mirror_guard = Some(mirror_service::apply_confirmation(
@@ -929,6 +937,7 @@ fn run_mutation_as(
                 doc["decisions"][&key] = after.clone();
                 let mut event = json!({"id":operation_id,"type":if operation_type == "note" {"note"} else {"classify"},"path":path,"key":key,"at":now(),"before":before,"after":after,"provenance":provenance});
                 if let Some(question) = question {
+                    adaptive_review::record_answer(&mut doc, &question, op["status"].as_str().unwrap_or("answered"))?;
                     event["assistanceQuestion"] = question;
                 }
                 doc["history"].as_array_mut().unwrap().push(event);
@@ -1497,6 +1506,7 @@ fn main() {
         gateway_server: Mutex::new(None),
         review: review::ReviewBridge::default(),
         assistance: assistance::Cache::default(),
+        adaptive: adaptive_review::Runtime::default(),
         mirrors: mirror_service::Runtime::default(),
         copy_queue,
         copy_control: Mutex::new(()),
@@ -1546,6 +1556,7 @@ fn main() {
             ui_control::begin_ui_session,
             get_boot,
             assistance::get_assisted_review,
+            adaptive_review::get_adaptive_question_packet,
             mirror_service::preview_mirror_binding,
             mirror_service::mirror_comparison_status,
             mirror_service::start_mirror_comparison,
@@ -1905,6 +1916,7 @@ mod tests {
             gateway_server: Mutex::new(None),
             review: review::ReviewBridge::default(),
             assistance: assistance::Cache::default(),
+            adaptive: adaptive_review::Runtime::default(),
             mirrors: mirror_service::Runtime::default(),
             copy_queue: copy_queue::CopyQueue::new(
                 root.join("copy-receipts.sqlite"),

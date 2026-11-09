@@ -62,6 +62,7 @@ confirmation, fencing, retries and asynchronous status.
 | Review, save and open a manual mirror binding | `preview_mirror_binding`, `save_mirror_binding`, `control_ui`: open Mirror panel | `preview_mirror_binding`, `mutate`: `mirrorBind`, `control_ui` |
 | Compare source and mirror, cancel, inspect evidence, prepare and confirm exact membership | `get_mirror_comparison`, `start_mirror_comparison`, `cancel_mirror_comparison`, `read_mirror_evidence`, `prepare_mirror_confirmation`, `confirm_mirror_membership` | Mirror status, comparison and evidence methods; `mutate`: `mirrorConfirm` |
 | Review and explicitly copy one file beside an occupied original destination | `preview_copy_conflict`, `control_copy_queue`: `startSeparate` | `preview_copy_conflict`, `control_copy_queue` |
+| Choose external or local assistance, revalidate, and submit one proposal | `control_adaptive_interview`, `get_adaptive_question_packet`, `propose_adaptive_question` | `get_adaptive_question_packet`; `mutate`: `adaptiveControl` / `adaptiveProposal` |
 | Inspect a damaged journal and a valid recovery backup | `get_recovery_state` | `get_recovery_state` |
 | Explicitly restore that reviewed backup, preserving the displaced original | `recover_review` | `recover_review` |
 

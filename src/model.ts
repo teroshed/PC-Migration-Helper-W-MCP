@@ -100,7 +100,9 @@ export type Operation =
   | { type: 'assist'; action: 'scope'; path: string }
   | { type: 'assist'; action: 'split' | 'defer'; path: string; questionId: string }
   | { type: 'assist'; action: 'restore' }
-  | { type: 'assistAnswer'; path: string; questionId: string; status: Status }
+  | { type: 'assistAnswer'; path: string; questionId: string; status: Status; overrideConfirmed?: true }
+  | { type: 'adaptiveControl'; action: 'external'; questionLimit: number }
+  | { type: 'adaptiveControl'; action: 'local' | 'resume' }
   | { type: 'bulkClassify'; targets: GroupTarget[]; status: Status; confirmed: true; acknowledgeFolderEffects?: true; acknowledgeQueueEffects: true }
   | { type: 'undoGroup'; groupId: string; confirmed: true; acknowledgeQueueEffects: true }
   | { type: 'mirrorBind'; source: string; mirror: string; expectedBindingId: string; confirmed: true }

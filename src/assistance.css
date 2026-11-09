@@ -48,6 +48,42 @@
   color: #e1edff;
 }
 
+.assistance-mode {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #3d5573;
+  border-radius: 8px;
+  background: #182941;
+  font-size: 12px;
+}
+
+.assistance-mode-heading,
+.assistance-mode-start {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 9px;
+}
+
+.assistance-mode-heading { justify-content: space-between; }
+.assistance-mode-heading strong { color: #e1edff; }
+.assistance-mode-start input { width: 63px; margin-left: 4px; padding: 4px; }
+.assistance-mode button { min-height: 28px; padding: 4px 7px; font-size: 11px; }
+.assistance-mode-usage { color: #aabdd8; }
+.assistance-mode summary { color: #bdd6f5; cursor: pointer; }
+.assistance-mode details > p { margin-top: 5px; overflow-wrap: anywhere; }
+.assistance-retained { border-top: 1px solid #3d5573; padding-top: 5px; }
+.assistance-confirm-override {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-basis: 100%;
+}
+.assistance-overrides button[aria-pressed=true] { border-color: #9ebcff; background: #2c4870; }
+
 .assistance-question {
   display: grid;
   gap: 8px;
@@ -155,6 +191,7 @@
   .assistance-question h3:focus-visible {
     outline-color: Highlight;
   }
+  .assistance-overrides button[aria-pressed=true] { border-color: Highlight; }
 }
 .browser-heading > div:first-child {
   min-width: 0;

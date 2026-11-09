@@ -156,7 +156,10 @@ pub(crate) fn publish_evidence_file(
     Ok(())
 }
 
-fn path(directory: &EvidenceDirectory, digest: &str) -> Result<PathBuf, String> {
+fn path(directory: &EvidenceDirectory, prefix: &str, digest: &str) -> Result<PathBuf, String> {
+    if !matches!(prefix, "mirror" | "source") {
+        return Err("Unsupported evidence manifest format.".into());
+    }
     if digest.len() != 64
         || !digest
             .bytes()
@@ -164,7 +167,7 @@ fn path(directory: &EvidenceDirectory, digest: &str) -> Result<PathBuf, String> 
     {
         return Err("The evidence digest is not a lowercase SHA-256 value.".into());
     }
-    Ok(directory.path.join(format!("mirror-{digest}.ndjson")))
+    Ok(directory.path.join(format!("{prefix}-{digest}.ndjson")))
 }
 
 fn write_line(file: &mut BufWriter<File>, digest: &mut Sha256, text: &[u8]) -> Result<(), String> {
@@ -184,7 +187,7 @@ pub(super) fn publish(
     progress: &Progress,
     started_at: String,
     cancel: &AtomicBool,
-    mut row: impl FnMut() -> Result<Option<String>, String>,
+    row: impl FnMut() -> Result<Option<String>, String>,
 ) -> Result<Receipt, String> {
     scan::check_cancel(cancel)?;
     let header = Header {
@@ -197,14 +200,25 @@ pub(super) fn publish(
         checked_files: progress.checked_files,
         checked_bytes: progress.checked_bytes,
     };
+    let header_line = serde_json::to_vec(&header).map_err(store::error)?;
+    let digest = publish_lines(directory, "mirror", &header_line, cancel, row)?;
+    let receipt = header.receipt(digest);
+    visit(directory, binding, &receipt, |_| Ok(()))?;
+    Ok(receipt)
+}
+
+pub(super) fn publish_lines(
+    directory: &EvidenceDirectory,
+    prefix: &str,
+    header_line: &[u8],
+    cancel: &AtomicBool,
+    mut row: impl FnMut() -> Result<Option<String>, String>,
+) -> Result<String, String> {
+    scan::check_cancel(cancel)?;
     let (staged, file) = StagedFile::create(directory)?;
     let mut writer = BufWriter::new(file);
     let mut digest = Sha256::new();
-    write_line(
-        &mut writer,
-        &mut digest,
-        &serde_json::to_vec(&header).map_err(store::error)?,
-    )?;
+    write_line(&mut writer, &mut digest, header_line)?;
     while let Some(row) = row()? {
         scan::check_cancel(cancel)?;
         write_line(&mut writer, &mut digest, row.as_bytes())?;
@@ -212,12 +226,11 @@ pub(super) fn publish(
     writer.flush().map_err(store::error)?;
     writer.get_ref().sync_all().map_err(store::error)?;
     drop(writer);
-    let receipt = header.receipt(format!("{:x}", digest.finalize()));
-    let destination = path(directory, &receipt.manifest_digest)?;
+    let digest = format!("{:x}", digest.finalize());
+    let destination = path(directory, prefix, &digest)?;
     scan::check_cancel(cancel)?;
     staged.move_to(&destination)?;
-    visit(directory, binding, &receipt, |_| Ok(()))?;
-    Ok(receipt)
+    Ok(digest)
 }
 
 fn read_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Result<bool, String> {
@@ -230,7 +243,7 @@ fn read_line(reader: &mut BufReader<File>, line: &mut Vec<u8>) -> Result<bool, S
         return Ok(false);
     }
     if count as u64 > LINE_MAX || line.last() != Some(&b'\n') {
-        return Err("Mirror evidence contains an incomplete or oversized record.".into());
+        return Err("The evidence manifest contains an incomplete or oversized record.".into());
     }
     Ok(true)
 }
@@ -241,45 +254,71 @@ fn visit(
     receipt: &Receipt,
     mut record: impl FnMut(&Record) -> Result<(), String>,
 ) -> Result<(), String> {
-    let path = path(directory, &receipt.manifest_digest)?;
+    let mut counts = Counts::default();
+    let mut checked_files = 0_u64;
+    let mut checked_bytes = 0_u64;
+    visit_lines(
+        directory,
+        "mirror",
+        &receipt.manifest_digest,
+        |line| {
+            let header: Header = serde_json::from_slice(line).map_err(store::error)?;
+            if header.format != FORMAT
+                || !matches!(header.schema, 1 | MANIFEST_SCHEMA)
+                || header.binding != *binding
+                || header.receipt(receipt.manifest_digest.clone()) != *receipt
+            {
+                return Err(
+                    "The mirror manifest does not match the saved binding and receipt.".into(),
+                );
+            }
+            Ok(())
+        },
+        |line| {
+            let entry: Record = serde_json::from_slice(line).map_err(store::error)?;
+            counts.record(entry.verdict);
+            counts.coverage_gaps += u64::from(entry.coverage_gap);
+            for digest in [&entry.source, &entry.mirror].into_iter().flatten() {
+                checked_files += 1;
+                checked_bytes = checked_bytes
+                    .checked_add(digest.bytes)
+                    .ok_or("Manifest byte count overflow.")?;
+            }
+            record(&entry)
+        },
+    )?;
+    if counts != receipt.counts
+        || checked_files != receipt.checked_files
+        || checked_bytes != receipt.checked_bytes
+    {
+        return Err("Mirror evidence counters do not match the saved receipt.".into());
+    }
+    Ok(())
+}
+
+pub(super) fn visit_lines(
+    directory: &EvidenceDirectory,
+    prefix: &str,
+    expected_digest: &str,
+    header: impl FnOnce(&[u8]) -> Result<(), String>,
+    mut row: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let path = path(directory, prefix, expected_digest)?;
     let file = windows::open_evidence(&path)?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut digest = Sha256::new();
     if !read_line(&mut reader, &mut line)? {
-        return Err("Mirror evidence is empty.".into());
+        return Err("The evidence manifest is empty.".into());
     }
-    let header: Header = serde_json::from_slice(&line).map_err(store::error)?;
-    if header.format != FORMAT
-        || !matches!(header.schema, 1 | MANIFEST_SCHEMA)
-        || header.binding != *binding
-        || header.receipt(receipt.manifest_digest.clone()) != *receipt
-    {
-        return Err("The mirror manifest does not match the saved binding and receipt.".into());
-    }
+    header(&line)?;
     digest.update(&line);
-    let mut counts = Counts::default();
-    let mut checked_files = 0_u64;
-    let mut checked_bytes = 0_u64;
     while read_line(&mut reader, &mut line)? {
         digest.update(&line);
-        let entry: Record = serde_json::from_slice(&line).map_err(store::error)?;
-        counts.record(entry.verdict);
-        counts.coverage_gaps += u64::from(entry.coverage_gap);
-        for digest in [&entry.source, &entry.mirror].into_iter().flatten() {
-            checked_files += 1;
-            checked_bytes = checked_bytes
-                .checked_add(digest.bytes)
-                .ok_or("Manifest byte count overflow.")?;
-        }
-        record(&entry)?;
+        row(&line)?;
     }
-    if format!("{:x}", digest.finalize()) != receipt.manifest_digest
-        || counts != receipt.counts
-        || checked_files != receipt.checked_files
-        || checked_bytes != receipt.checked_bytes
-    {
-        return Err("Mirror evidence bytes or counters do not match the saved receipt.".into());
+    if format!("{:x}", digest.finalize()) != expected_digest {
+        return Err("The evidence manifest bytes do not match the saved receipt.".into());
     }
     Ok(())
 }

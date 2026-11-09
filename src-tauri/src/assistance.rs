@@ -347,9 +347,13 @@ impl Question {
             )
             .as_bytes(),
         );
+        let child_exceptions = doc["decisions"].as_object().into_iter().flat_map(|marks| marks.values())
+            .filter(|mark| mark["noteOnly"] != true && mark["path"].as_str().is_some_and(|path|
+                !path.eq_ignore_ascii_case(&self.path) && filesystem::under(path, &self.path))).count();
         json!({"id":id,"path":self.path,"kind":self.kind,"files":self.files,"bytes":self.bytes,
             "prompt":prompt,"status":proposed,"agentStatus":agent_status,"reason":evidence,
             "source":if suggestion.is_some() {"codex"} else {"local"},"manualConfirmation":self.manual_confirmation,
+            "protected":self.protected,"rebuildableHint":self.reusable,"exceptions":child_exceptions,"coverageGaps":0,
             "sourceFingerprint":source_fingerprint})
     }
 }
@@ -358,7 +362,8 @@ fn pick_question(
     s: &AppState,
     doc: &Value,
     inventory: &Inventory,
-) -> Result<(Option<Question>, usize), String> {
+    limit: usize,
+) -> Result<(Vec<Question>, usize), String> {
     let split = saved_paths(doc, "split");
     let deferred = saved_paths(doc, "deferred");
     let blocked_ancestors = prefixes(split.iter().chain(&deferred));
@@ -435,26 +440,24 @@ fn pick_question(
         }
     }
     // Do not group a parent before offering likely exclusions anywhere beneath it.
-    let choose = |ids: Vec<usize>| -> Option<Question> {
-        ids.into_iter()
-            .max_by(|&left, &right| {
-                let a = &inventory.directories[left];
-                let b = &inventory.directories[right];
-                unresolved[left]
-                    .cmp(&unresolved[right])
-                    .then(a.bytes.cmp(&b.bytes))
-                    .then_with(|| b.path.cmp(&a.path))
-            })
-            .map(|id| Question::directory(&inventory.directories[id]))
+    let choose = |mut ids: Vec<usize>| -> Vec<Question> {
+        ids.sort_unstable_by(|&left, &right| {
+            let a = &inventory.directories[left];
+            let b = &inventory.directories[right];
+            unresolved[right].cmp(&unresolved[left]).then(b.bytes.cmp(&a.bytes))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        ids.into_iter().take(limit).map(|id| Question::directory(&inventory.directories[id])).collect()
     };
-    let branch = choose(protected_exceptions)
-        .or_else(|| choose(nested_exceptions))
-        .or_else(|| choose(candidates));
-    if branch.is_some() {
+    let branch = if !protected_exceptions.is_empty() { choose(protected_exceptions) }
+        else if !nested_exceptions.is_empty() { choose(nested_exceptions) }
+        else { choose(candidates) };
+    if !branch.is_empty() {
         return Ok((branch, 0));
     }
     let db = s.index.connect()?;
     let mut unavailable = 0;
+    let mut choices = Vec::new();
     file_parents.sort_by(|a, b| a.path.cmp(&b.path));
     for dir in file_parents {
         let observed: Option<String> = db
@@ -471,14 +474,13 @@ fn pick_question(
             unavailable += 1;
             continue;
         }
-        let mut candidate = None;
         s.index.each_entry(&dir.path, "", |entry| {
             if entry.kind == "file"
                 && entry.problem.is_none()
                 && !deferred.contains(&entry.path.to_lowercase())
                 && !resolved(s, doc, &entry.path, &confirmations)
             {
-                candidate = Some(Question {
+                choices.push(Question {
                     path: entry.path,
                     kind: "file",
                     files: 1,
@@ -488,15 +490,15 @@ fn pick_question(
                     manual_confirmation: false,
                     manual_basis: None,
                 });
-                return false;
+                return choices.len() < limit;
             }
             true
         })?;
-        if candidate.is_some() {
-            return Ok((candidate, unavailable));
+        if choices.len() == limit {
+            break;
         }
     }
-    Ok((None, unavailable))
+    Ok((choices, unavailable))
 }
 
 fn pending_manual(
@@ -609,7 +611,7 @@ fn pending_question(
     None
 }
 
-pub fn snapshot(s: &AppState, doc: &Value) -> Result<Value, String> {
+fn snapshot_inner(s: &AppState, doc: &Value, slate: &mut Vec<Value>, limit: usize) -> Result<Value, String> {
     let Some(scope) = doc["assistance"]["scope"].as_str() else {
         return Ok(json!({"phase":"idle","revision":doc["revision"]}));
     };
@@ -666,18 +668,31 @@ pub fn snapshot(s: &AppState, doc: &Value) -> Result<Value, String> {
             .cloned()
             .ok_or("Inventory snapshot unavailable")?
     };
-    let (question, unavailable) = pick_question(s, doc, &inventory)?;
-    let question = question.or_else(|| pending_question(s, doc, &inventory, &pending));
-    view["phase"] = json!(if question.is_some() {
+    let (mut questions, unavailable) = pick_question(s, doc, &inventory, limit)?;
+    if questions.is_empty() {
+        questions.extend(pending_question(s, doc, &inventory, &pending));
+    }
+    slate.extend(questions.into_iter().map(|question| question.display(s, doc, scope, stamp)));
+    view["phase"] = json!(if !slate.is_empty() {
         "question"
     } else {
         "complete"
     });
-    view["question"] = question
-        .map(|question| question.display(s, doc, scope, stamp))
-        .unwrap_or(Value::Null);
+    view["question"] = slate.first().cloned().unwrap_or(Value::Null);
     view["files"] = json!(inventory.directories[0].leaves);
     view["gaps"] = json!(inventory.gaps + unavailable);
+    Ok(view)
+}
+
+pub(crate) fn local_slate(s: &AppState, doc: &Value, limit: usize) -> Result<(Value,Vec<Value>), String> {
+    let mut slate = Vec::new();
+    let view = snapshot_inner(s, doc, &mut slate, limit.clamp(1,12))?;
+    Ok((view,slate))
+}
+
+pub fn snapshot(s: &AppState, doc: &Value) -> Result<Value, String> {
+    let (mut view, _) = local_slate(s, doc, 1)?;
+    crate::adaptive_review::decorate(s, doc, &mut view)?;
     Ok(view)
 }
 
@@ -690,6 +705,9 @@ pub fn validate_question(s: &AppState, doc: &Value, op: &Value) -> Result<Value,
             "The interview question changed. Read the current question before applying a decision."
                 .into(),
         );
+    }
+    if question["adaptive"] == true {
+        crate::adaptive_review::validate_saved_question(s, doc, op)?;
     }
     Ok(question)
 }
@@ -709,6 +727,7 @@ pub fn update(s: &AppState, doc: &mut Value, op: &Value) -> Result<(), String> {
                 doc["assistance"] =
                     json!({"scope":path,"volumeId":volume.id,"split":[],"deferred":[]});
             }
+            crate::adaptive_review::scope_changed(doc, &path);
         }
         Some("split" | "defer") => {
             let question = validate_question(s, doc, op)?;
@@ -727,6 +746,7 @@ pub fn update(s: &AppState, doc: &mut Value, op: &Value) -> Result<(), String> {
                 .as_array_mut()
                 .ok_or("The interview state needs recovery")?;
             items.push(question["path"].clone());
+            crate::adaptive_review::record_answer(doc, &question, action)?;
         }
         Some("restore") => {
             if doc["assistance"]["scope"].is_string() {

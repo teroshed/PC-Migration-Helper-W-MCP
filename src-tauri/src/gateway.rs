@@ -634,16 +634,18 @@ fn state_summary(state: &AppState) -> Result<Value, String> {
 }
 
 pub(crate) fn api_capabilities()->Value {
-    json!({"version":"0.6.0","transport":"authenticated-loopback-rpc","methods":[
+    json!({"version":"0.7.0","transport":"authenticated-loopback-rpc","methods":[
         "get_state","get_review_view","list_folder","get_details","list_decisions","list_suggestions",
         "read_review_text","get_review_group","get_status","get_assisted_review","next_attention","search_dirs","scan","mutate",
         "audit_status","audit_control","audit_notifications","audit_read_notifications",
         "copy_queue_snapshot","control_copy_queue","get_ui_state","control_ui","get_recovery_state","recover_review",
         "preview_mirror_binding","mirror_comparison_status","start_mirror_comparison","cancel_mirror_comparison",
-        "read_mirror_evidence","read_mirror_confirmation","prepare_mirror_confirmation","preview_copy_conflict"],
+        "read_mirror_evidence","read_mirror_confirmation","prepare_mirror_confirmation","preview_copy_conflict",
+        "get_adaptive_question_packet"],
         "recoveryModeMethods":["get_recovery_state","recover_review","get_ui_state","control_ui"],
         "copyControls":["start","pause","resume","startSeparate"],"groupOperations":["bulkClassify","undoGroup"],
         "mirrorOperations":["mirrorBind","mirrorConfirm"],
+        "adaptiveOperations":["adaptiveControl","adaptiveProposal"],
         "supportedJournalVersions":[1,2],"sourceDeletion":false,
         "uiControl":"registered native UI session; accepted commands require an applied/error acknowledgement",
         "textContinuation":"read_review_text for saved text; control_ui listPending/readPendingText for retained drafts",
@@ -875,6 +877,7 @@ fn dispatch(state: &Shared, method: &str, params: &Value) -> Result<Value, Strin
         },
         "get_status"=>status_service(state),
         "get_assisted_review"=>crate::assisted_review_service(state),
+        "get_adaptive_question_packet"=>crate::adaptive_review::context(state),
         "read_review_text"=>read_review_text(state,params),
         "get_review_group"=>review_group(state,params),
         "audit_status"=>crate::audit_status_service(state),

@@ -4,6 +4,7 @@
 mod manifest;
 mod membership;
 mod scan;
+mod source;
 mod windows;
 
 use crate::{filesystem::Volume, store};
@@ -17,6 +18,10 @@ pub(crate) use manifest::{
     check_receipt, confirm_membership, prepare_membership, publish_evidence_file,
     read_evidence_file, read_evidence_page, revalidate_membership, ConfirmationFence, EvidencePage,
     EvidenceWindow, FrozenMembership,
+};
+pub(crate) use source::{
+    create_source_evidence_directory, freeze_source, revalidate_source_scope, SourceCandidate,
+    SourceEnvironment, SourceProgress, SourceReceipt,
 };
 #[cfg(test)]
 mod tests;
@@ -185,7 +190,7 @@ pub(crate) fn create_mirror_evidence_directory(
     environment: Environment<'_>,
 ) -> Result<PathBuf, String> {
     let (source, mirror) = checked_binding(binding, environment)?;
-    windows::create_evidence_directory(parent, name, &source, &mirror)
+    windows::create_evidence_directory(parent, name, &[&source, &mirror])
 }
 
 fn checked_binding(

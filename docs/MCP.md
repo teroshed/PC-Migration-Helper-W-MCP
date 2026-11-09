@@ -122,6 +122,26 @@ count and fingerprint. `control_ui` actions `setEntrySelection`,
 current UI session. Changing the selection or opening its review does not save
 a decision. Use the exact grouped operation to save a reviewed selection.
 
+## External AI Assistance
+
+In AI Assistance, choose the review scope, run inventory, and choose
+**External model** with a question limit. The app waits for the selected scope.
+It does not make provider calls or open a chat. A connected MCP client calls
+`get_adaptive_question_packet` and passes only its `packet` to its model.
+The packet contains opaque IDs, bounded candidate statistics and choice
+categories. It does not contain paths, names, notes or file contents. The
+separate submission fence is for local validation.
+
+Call `propose_adaptive_question` with one eligible candidate and the exact
+request ID. A proposal does not mark, confirm or copy anything. A stale
+packet or a changed source requires fresh evidence. The user can approve
+retention, explicitly override an allowed decision, review children, or
+defer. Review children before excluding an adaptive folder scope. A
+saved question reopened in a new app session needs a fresh inventory and
+explicit revalidation. `control_adaptive_interview` exposes External model,
+Local questions and revalidation. The app does not measure usage billed by
+an independently configured client.
+
 ## Manual mirror evidence
 
 Review the exact source and mirror roots with `preview_mirror_binding`.

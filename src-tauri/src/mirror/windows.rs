@@ -370,6 +370,29 @@ fn side(
     ))
 }
 
+pub(super) fn open_source_scope(
+    path: &str,
+    review_volumes: Option<&[filesystem::Volume]>,
+    fixture_root: Option<&Path>,
+) -> Result<(Endpoint, Side), String> {
+    let path = normalize_absolute(path)?;
+    match (review_volumes, fixture_root) {
+        (Some(volumes), None) => {
+            let (volume, _, _) = filesystem::identify(&path, volumes)?;
+            side(&path, Some(volume), None)
+        }
+        (None, Some(root)) => {
+            if root.file_name() != Some(OsStr::new("source"))
+                || !filesystem::under(&path, &normalize_absolute(path_text(root)?)?)
+            {
+                return Err("Fixture observation is outside its fixed source root.".into());
+            }
+            side(&path, None, Some((root, "source")))
+        }
+        _ => Err("Invalid source observation environment.".into()),
+    }
+}
+
 pub(super) fn open_binding(
     source_path: &str,
     mirror_path: &str,
@@ -455,6 +478,10 @@ pub(super) fn guard_evidence(
     source: &Side,
     mirror: &Side,
 ) -> Result<EvidenceDirectory, String> {
+    guard_outside(path, &[source, mirror])
+}
+
+pub(super) fn guard_outside(path: &Path, scopes: &[&Side]) -> Result<EvidenceDirectory, String> {
     let output = guard_runtime(path)?;
     let canonical = path_text(&output.path)?;
     let directory = output
@@ -462,16 +489,21 @@ pub(super) fn guard_evidence(
         .last()
         .ok_or("Missing evidence directory handle")?;
     let guid = final_path(directory, VOLUME_NAME_GUID)?;
-    check_outside(canonical, &guid, source, mirror)?;
+    check_outside(canonical, &guid, scopes)?;
     Ok(output)
 }
 
-fn check_outside(canonical: &str, guid: &str, source: &Side, mirror: &Side) -> Result<(), String> {
-    if [source, mirror].iter().any(|side| {
+fn check_outside(canonical: &str, guid: &str, scopes: &[&Side]) -> Result<(), String> {
+    if scopes.iter().any(|side| {
         let scope = side.path.to_string_lossy();
         filesystem::under(canonical, &scope) || filesystem::under(guid, &scope)
     }) {
-        return Err("Use an app evidence directory outside both compared scopes.".into());
+        return Err(if scopes.len() == 2 {
+            "Use an app evidence directory outside both compared scopes."
+        } else {
+            "Use an app evidence directory outside the observed source scope."
+        }
+        .into());
     }
     Ok(())
 }
@@ -479,8 +511,7 @@ fn check_outside(canonical: &str, guid: &str, source: &Side, mirror: &Side) -> R
 pub(super) fn create_evidence_directory(
     parent: &Path,
     name: &str,
-    source: &Side,
-    mirror: &Side,
+    scopes: &[&Side],
 ) -> Result<PathBuf, String> {
     if !compatible_component(name) || name.len() > 255 {
         return Err("An evidence directory name must be one supported path component.".into());
@@ -492,18 +523,13 @@ pub(super) fn create_evidence_directory(
         .ok_or("Missing evidence parent handle")?;
     let target = guarded.path.join(name);
     let guid_target = PathBuf::from(final_path(parent, VOLUME_NAME_GUID)?).join(name);
-    check_outside(
-        path_text(&target)?,
-        path_text(&guid_target)?,
-        source,
-        mirror,
-    )?;
+    check_outside(path_text(&target)?, path_text(&guid_target)?, scopes)?;
     if let Err(error) = fs::create_dir(&target) {
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(store::error(error));
         }
     }
-    Ok(guard_evidence(&target, source, mirror)?.path)
+    Ok(guard_outside(&target, scopes)?.path)
 }
 
 pub(super) fn open_evidence(path: &Path) -> Result<File, String> {
